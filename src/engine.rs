@@ -319,6 +319,14 @@ impl HyperScaleEngine {
                 "lastNodeOutput": *last_output
             })
         } else {
+            let now_ms = Utc::now().timestamp_millis();
+            let start_time_ms = now_ms.saturating_sub(duration_ms as i64);
+            let node_status = if status == "success" {
+                "success"
+            } else {
+                "error"
+            };
+
             let mut run_data = serde_json::Map::new();
             for (idx, node) in graph.nodes.iter().enumerate() {
                 if let Some(out) = outputs.get(&(idx as u32)) {
@@ -331,6 +339,10 @@ impl HyperScaleEngine {
                         node.name.clone(),
                         json!([
                             {
+                                "startTime": start_time_ms,
+                                "executionTime": duration_ms.max(1),
+                                "executionStatus": node_status,
+                                "source": [],
                                 "data": {
                                     "main": [ main_items ]
                                 }
