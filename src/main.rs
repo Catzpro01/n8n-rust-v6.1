@@ -1,5 +1,5 @@
 use anyhow::Result;
-use n8n_rust_v5::{build_app, config::ServerConfig};
+use n8n_rust_v5::{build_app, config::ServerConfig, db::StorageEngine};
 use tracing::info;
 
 #[tokio::main]
@@ -19,12 +19,14 @@ async fn main() -> Result<()> {
         "Initializing n8n-rust-v5 native engine & UI server on {}",
         addr
     );
+    info!("Database path: {}", config.db_path.display());
     info!(
         "Serving frontend assets from: {}",
         config.ui_dist_path.display()
     );
 
-    let app = build_app(&config.ui_dist_path);
+    let db = StorageEngine::init(&config.db_path)?;
+    let app = build_app(&config.ui_dist_path, db);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
     info!(

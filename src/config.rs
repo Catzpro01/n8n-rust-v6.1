@@ -6,6 +6,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub ui_dist_path: PathBuf,
+    pub db_path: PathBuf,
 }
 
 impl Default for ServerConfig {
@@ -21,10 +22,15 @@ impl Default for ServerConfig {
             .map(PathBuf::from)
             .unwrap_or_else(|_| PathBuf::from("ui-dist"));
 
+        let db_path = std::env::var("N8N_DB_PATH")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("n8n_data.sqlite"));
+
         Self {
             host,
             port,
             ui_dist_path,
+            db_path,
         }
     }
 }
