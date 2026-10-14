@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 // ---------------------------------------------------------------------------
 // Flat Graph Arena Definitions (Zero-Copy & Flat Indexed)
@@ -222,12 +222,15 @@ impl HyperScaleEngine {
         }
 
         // Initialize atomic in-degrees
+        // Initialize atomic in-degrees
         let remaining_in_degree: Vec<AtomicU32> =
             graph.in_degree.iter().map(|&d| AtomicU32::new(d)).collect();
 
         let executed_count = AtomicU32::new(0);
         let outputs = DashMap::<u32, Arc<Value>>::new();
         let cancel_flag = cancel_token.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+        let timed_out = AtomicBool::new(false);
+        let timeout_duration = std::time::Duration::from_secs(60);
 
         // Hyper-scale throttling flag (for > 1000 nodes, throttle UI websocket messages)
         let is_hyperscale = total_nodes > 1000;
@@ -235,12 +238,27 @@ impl HyperScaleEngine {
 
         let last_output_holder = std::sync::Mutex::new(Arc::clone(&initial_input));
 
+        // Pre-allocate thread-safe accumulation buffers ONLY for nodes with multi-input fan-in (in_degree > 1)
+        let multi_inputs = DashMap::<u32, std::sync::Mutex<Vec<Arc<Value>>>>::new();
+        for (idx, &degree) in graph.in_degree.iter().enumerate() {
+            if degree > 1 {
+                multi_inputs.insert(
+                    idx as u32,
+                    std::sync::Mutex::new(Vec::with_capacity(degree as usize)),
+                );
+            }
+        }
+
         let ctx = TraversalContext {
             graph,
             remaining_in_degree: &remaining_in_degree,
             outputs: &outputs,
+            multi_inputs: &multi_inputs,
             executed_count: &executed_count,
             cancel_flag: &cancel_flag,
+            timed_out: &timed_out,
+            start_time,
+            timeout_duration,
             notifier: notifier.as_deref(),
             execution_id,
             last_output_holder: &last_output_holder,
@@ -271,6 +289,12 @@ impl HyperScaleEngine {
                 "Execution cancelled via cancellation token"
             );
             "canceled"
+        } else if timed_out.load(Ordering::Relaxed) {
+            warn!(
+                execution_id = %execution_id,
+                "Execution timed out by watchdog"
+            );
+            "timeout"
         } else {
             "success"
         };
@@ -298,14 +322,17 @@ impl HyperScaleEngine {
             let mut run_data = serde_json::Map::new();
             for (idx, node) in graph.nodes.iter().enumerate() {
                 if let Some(out) = outputs.get(&(idx as u32)) {
+                    let main_items: Vec<Value> = if let Some(arr) = out.value().as_array() {
+                        arr.iter().map(|item| json!({ "json": item })).collect()
+                    } else {
+                        vec![json!({ "json": *out.value() })]
+                    };
                     run_data.insert(
                         node.name.clone(),
                         json!([
                             {
                                 "data": {
-                                    "main": [
-                                        [ { "json": *out.value() } ]
-                                    ]
+                                    "main": [ main_items ]
                                 }
                             }
                         ]),
@@ -342,14 +369,43 @@ struct TraversalContext<'a> {
     graph: &'a CompiledGraph,
     remaining_in_degree: &'a [AtomicU32],
     outputs: &'a DashMap<u32, Arc<Value>>,
+    multi_inputs: &'a DashMap<u32, std::sync::Mutex<Vec<Arc<Value>>>>,
     executed_count: &'a AtomicU32,
     cancel_flag: &'a AtomicBool,
+    timed_out: &'a AtomicBool,
+    start_time: Instant,
+    timeout_duration: std::time::Duration,
     notifier: Option<&'a dyn ExecutionNotifier>,
     execution_id: &'a str,
     last_output_holder: &'a std::sync::Mutex<Arc<Value>>,
     is_hyperscale: bool,
     is_compact_logging: bool,
     total_nodes: usize,
+}
+
+fn prepare_target_input(
+    ctx: &TraversalContext,
+    target_idx: u32,
+    single_fallback: &Arc<Value>,
+) -> Arc<Value> {
+    if ctx.graph.in_degree[target_idx as usize] > 1 {
+        if let Some(entry) = ctx.multi_inputs.get(&target_idx) {
+            let items_guard = entry.value().lock().unwrap_or_else(|e| e.into_inner());
+            let mut flat_items = Vec::with_capacity(items_guard.len());
+            for item in items_guard.iter() {
+                if let Some(arr) = item.as_array() {
+                    flat_items.extend(arr.iter().cloned());
+                } else {
+                    flat_items.push((**item).clone());
+                }
+            }
+            Arc::new(Value::Array(flat_items))
+        } else {
+            Arc::clone(single_fallback)
+        }
+    } else {
+        Arc::clone(single_fallback)
+    }
 }
 
 fn traverse_node<'scope>(
@@ -360,6 +416,12 @@ fn traverse_node<'scope>(
 ) {
     loop {
         if ctx.cancel_flag.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if ctx.timed_out.load(Ordering::Relaxed) || ctx.start_time.elapsed() > ctx.timeout_duration
+        {
+            ctx.timed_out.store(true, Ordering::Relaxed);
             return;
         }
 
@@ -406,6 +468,15 @@ fn traverse_node<'scope>(
         // Check which targets are ready (in_degree reduced to 0)
         let mut ready_targets = Vec::new();
         for &target_idx in targets {
+            // Fan-in: jika target memiliki in_degree > 1, kumpulkan output parent ke multi_inputs buffer
+            if ctx.graph.in_degree[target_idx as usize] > 1 {
+                if let Some(entry) = ctx.multi_inputs.get(&target_idx) {
+                    if let Ok(mut lock) = entry.value().lock() {
+                        lock.push(Arc::clone(&result_payload));
+                    }
+                }
+            }
+
             if ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
                 ready_targets.push(target_idx);
             }
@@ -418,20 +489,20 @@ fn traverse_node<'scope>(
         // If exactly 1 ready target: continue immediately in current thread (zero-overhead loop)
         if ready_targets.len() == 1 {
             current_idx = ready_targets[0];
-            current_input = Arc::clone(&result_payload);
+            current_input = prepare_target_input(ctx, current_idx, &result_payload);
             continue;
         }
 
         // If multiple ready targets: spawn all but the first to other Rayon worker threads
         for &target_idx in &ready_targets[1..] {
-            let payload_clone = Arc::clone(&result_payload);
+            let target_input = prepare_target_input(ctx, target_idx, &result_payload);
             s.spawn(move |s| {
-                traverse_node(s, ctx, target_idx, payload_clone);
+                traverse_node(s, ctx, target_idx, target_input);
             });
         }
 
         current_idx = ready_targets[0];
-        current_input = Arc::clone(&result_payload);
+        current_input = prepare_target_input(ctx, current_idx, &result_payload);
     }
 }
 
@@ -452,16 +523,40 @@ fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
             "timestamp": Utc::now().to_rfc3339(),
             "triggeredBy": "schedule"
         })),
+        "n8n-nodes-base.merge" => {
+            // Full multi-branch fan-in array preservation
+            if input.is_array() {
+                input
+            } else {
+                Arc::new(json!([*input]))
+            }
+        }
         "n8n-nodes-base.set" => {
-            let mut merged = (*input).clone();
-            if let Some(obj) = merged.as_object_mut() {
-                if let Some(params) = node.parameters.as_object() {
-                    for (k, v) in params {
-                        obj.insert(k.clone(), v.clone());
+            if let Some(arr) = input.as_array() {
+                let mut new_arr = Vec::with_capacity(arr.len());
+                for elem in arr {
+                    let mut merged = elem.clone();
+                    if let Some(obj) = merged.as_object_mut() {
+                        if let Some(params) = node.parameters.as_object() {
+                            for (k, v) in params {
+                                obj.insert(k.clone(), v.clone());
+                            }
+                        }
+                    }
+                    new_arr.push(merged);
+                }
+                Arc::new(Value::Array(new_arr))
+            } else {
+                let mut merged = (*input).clone();
+                if let Some(obj) = merged.as_object_mut() {
+                    if let Some(params) = node.parameters.as_object() {
+                        for (k, v) in params {
+                            obj.insert(k.clone(), v.clone());
+                        }
                     }
                 }
+                Arc::new(merged)
             }
-            Arc::new(merged)
         }
         "n8n-nodes-base.if" => {
             // Evaluates conditional pass

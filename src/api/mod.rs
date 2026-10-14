@@ -9,7 +9,10 @@ use axum::{
         Path, State,
     },
     http::{header, StatusCode},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, patch, post},
     Json, Router,
 };
@@ -17,6 +20,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -1361,12 +1365,22 @@ pub async fn rest_push(
             ws.on_upgrade(move |socket| handle_websocket(socket, hub))
                 .into_response()
         }
-        Err(_) => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
-            "Push stream active",
-        )
-            .into_response(),
+        Err(_) => {
+            let rx = state.push_hub.subscribe();
+            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+                match rx.recv().await {
+                    Ok(msg) => Some((Ok::<Event, Infallible>(Event::default().data(msg)), rx)),
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((
+                        Ok::<Event, Infallible>(Event::default().comment("lagged")),
+                        rx,
+                    )),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+                }
+            });
+            Sse::new(stream)
+                .keep_alive(KeepAlive::default())
+                .into_response()
+        }
     }
 }
 
@@ -1545,7 +1559,11 @@ async fn execute_workflow_helper(
                 "status": exec_res.status,
                 "executedNodes": exec_res.executed_nodes,
                 "durationMs": exec_res.duration_ms,
-                "resultData": exec_res.payload
+                "resultData": exec_res
+                    .payload
+                    .get("resultData")
+                    .cloned()
+                    .unwrap_or_else(|| exec_res.payload.clone())
             }
         })),
     )

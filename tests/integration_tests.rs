@@ -8,8 +8,9 @@ use n8n_rust_v5::{
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -24,54 +25,58 @@ fn setup_test_engine() -> (StorageEngine, std::path::PathBuf) {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_spa_index_html_clean_placeholders() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let html = String::from_utf8(bytes.to_vec()).unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let html = String::from_utf8(bytes.to_vec()).unwrap();
 
-    // Verify zero raw template placeholders
-    assert!(
-        !html.contains("{{BASE_PATH}}"),
-        "Must not contain {{{{BASE_PATH}}}}"
-    );
-    assert!(
-        !html.contains("%CONFIG_TAGS%"),
-        "Must not contain %CONFIG_TAGS%"
-    );
-    assert!(
-        !html.contains("{{CSP_NONCE}}"),
-        "Must not contain {{{{CSP_NONCE}}}}"
-    );
-    assert!(
-        !html.contains("{{REST_ENDPOINT}}"),
-        "Must not contain {{{{REST_ENDPOINT}}}}"
-    );
+        // Verify zero raw template placeholders
+        assert!(
+            !html.contains("{{BASE_PATH}}"),
+            "Must not contain {{{{BASE_PATH}}}}"
+        );
+        assert!(
+            !html.contains("%CONFIG_TAGS%"),
+            "Must not contain %CONFIG_TAGS%"
+        );
+        assert!(
+            !html.contains("{{CSP_NONCE}}"),
+            "Must not contain {{{{CSP_NONCE}}}}"
+        );
+        assert!(
+            !html.contains("{{REST_ENDPOINT}}"),
+            "Must not contain {{{{REST_ENDPOINT}}}}"
+        );
 
-    // Verify correct replacements
-    assert!(
-        html.contains("href=\"/favicon.ico\""),
-        "Favicon path should be /favicon.ico"
-    );
-    assert!(
-        html.contains("n8n:config:rest-endpoint"),
-        "Must contain rest-endpoint config meta tag"
-    );
-    assert!(html.contains("id=\"app\""), "Must contain Vue root #app");
+        // Verify correct replacements
+        assert!(
+            html.contains("href=\"/favicon.ico\""),
+            "Favicon path should be /favicon.ico"
+        );
+        assert!(
+            html.contains("n8n:config:rest-endpoint"),
+            "Must contain rest-endpoint config meta tag"
+        );
+        assert!(html.contains("id=\"app\""), "Must contain Vue root #app");
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 1 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -79,64 +84,68 @@ async fn test_spa_index_html_clean_placeholders() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_settings_100_percent_enterprise_unlocked() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/settings")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/settings")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let data = &body["data"];
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &body["data"];
 
-    // Base settings
-    assert_eq!(data["settingsMode"], "authenticated");
-    assert_eq!(data["userManagement"]["showSetupOnFirstLoad"], false);
-    assert_eq!(data["folders"]["enabled"], true);
-    assert_eq!(data["variables"]["limit"], -1);
-    assert_eq!(data["aiAssistant"]["enabled"], true);
-    assert_eq!(data["aiBuilder"]["enabled"], true);
-    assert_eq!(data["askAi"]["enabled"], true);
-    assert_eq!(data["evaluation"]["quota"], -1);
+        // Base settings
+        assert_eq!(data["settingsMode"], "authenticated");
+        assert_eq!(data["userManagement"]["showSetupOnFirstLoad"], false);
+        assert_eq!(data["folders"]["enabled"], true);
+        assert_eq!(data["variables"]["limit"], -1);
+        assert_eq!(data["aiAssistant"]["enabled"], true);
+        assert_eq!(data["aiBuilder"]["enabled"], true);
+        assert_eq!(data["askAi"]["enabled"], true);
+        assert_eq!(data["evaluation"]["quota"], -1);
 
-    // 100% Enterprise Flags Assertion (All true except showNonProdBanner)
-    let ent = &data["enterprise"];
-    assert_eq!(ent["sharing"], true);
-    assert_eq!(ent["ldap"], true);
-    assert_eq!(ent["saml"], true);
-    assert_eq!(ent["oidc"], true);
-    assert_eq!(ent["mfaEnforcement"], true);
-    assert_eq!(ent["logStreaming"], true);
-    assert_eq!(ent["advancedExecutionFilters"], true);
-    assert_eq!(ent["variables"], true);
-    assert_eq!(ent["sourceControl"], true);
-    assert_eq!(ent["auditLogs"], true);
-    assert_eq!(ent["externalSecrets"], true);
-    assert_eq!(ent["showNonProdBanner"], false);
-    assert_eq!(ent["debugInEditor"], true);
-    assert_eq!(ent["binaryDataS3"], true);
-    assert_eq!(ent["workerView"], true);
-    assert_eq!(ent["advancedPermissions"], true);
-    assert_eq!(ent["workflowDiffs"], true);
-    assert_eq!(ent["namedVersions"], true);
-    assert_eq!(ent["provisioning"], true);
-    assert_eq!(ent["customRoles"], true);
-    assert_eq!(ent["personalSpacePolicy"], true);
-    assert_eq!(ent["dataRedaction"], true);
-    assert_eq!(ent["otelCustomSpanAttributes"], true);
-    assert_eq!(ent["workflowReviews"], true);
-    assert_eq!(ent["projects"]["team"]["limit"], -1);
+        // 100% Enterprise Flags Assertion (All true except showNonProdBanner)
+        let ent = &data["enterprise"];
+        assert_eq!(ent["sharing"], true);
+        assert_eq!(ent["ldap"], true);
+        assert_eq!(ent["saml"], true);
+        assert_eq!(ent["oidc"], true);
+        assert_eq!(ent["mfaEnforcement"], true);
+        assert_eq!(ent["logStreaming"], true);
+        assert_eq!(ent["advancedExecutionFilters"], true);
+        assert_eq!(ent["variables"], true);
+        assert_eq!(ent["sourceControl"], true);
+        assert_eq!(ent["auditLogs"], true);
+        assert_eq!(ent["externalSecrets"], true);
+        assert_eq!(ent["showNonProdBanner"], false);
+        assert_eq!(ent["debugInEditor"], true);
+        assert_eq!(ent["binaryDataS3"], true);
+        assert_eq!(ent["workerView"], true);
+        assert_eq!(ent["advancedPermissions"], true);
+        assert_eq!(ent["workflowDiffs"], true);
+        assert_eq!(ent["namedVersions"], true);
+        assert_eq!(ent["provisioning"], true);
+        assert_eq!(ent["customRoles"], true);
+        assert_eq!(ent["personalSpacePolicy"], true);
+        assert_eq!(ent["dataRedaction"], true);
+        assert_eq!(ent["otelCustomSpanAttributes"], true);
+        assert_eq!(ent["workflowReviews"], true);
+        assert_eq!(ent["projects"]["team"]["limit"], -1);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 2 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -144,92 +153,96 @@ async fn test_settings_100_percent_enterprise_unlocked() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_auto_auth_login_me_and_license() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    // Test GET /rest/login
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/login")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // Test GET /rest/login
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/login")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(body["data"]["role"], "global:owner");
-    assert_eq!(body["data"]["isOwner"], true);
-    assert_eq!(body["data"]["isPending"], false);
-    assert_eq!(body["data"]["email"], "admin@n8n-rust.local");
-    assert!(body["data"]["globalScopes"].as_array().unwrap().len() >= 20);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(body["data"]["role"], "global:owner");
+        assert_eq!(body["data"]["isOwner"], true);
+        assert_eq!(body["data"]["isPending"], false);
+        assert_eq!(body["data"]["email"], "admin@n8n-rust.local");
+        assert!(body["data"]["globalScopes"].as_array().unwrap().len() >= 20);
 
-    // Test POST /rest/login
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/login")
-                .method("POST")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // Test POST /rest/login
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/login")
+                    .method("POST")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // Test GET /rest/me
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/me")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // Test GET /rest/me
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/me")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // Test GET /rest/license
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/license")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let lic: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(lic["data"]["planName"], "Enterprise");
-    assert_eq!(lic["data"]["isPlanActive"], true);
+        // Test GET /rest/license
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/license")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let lic: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(lic["data"]["planName"], "Enterprise");
+        assert_eq!(lic["data"]["isPlanActive"], true);
 
-    // Test GET /rest/projects
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/projects")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let proj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(proj["data"].as_array().unwrap().len(), 1);
-    assert_eq!(proj["data"][0]["type"], "personal");
+        // Test GET /rest/projects
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/projects")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let proj: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(proj["data"].as_array().unwrap().len(), 1);
+        assert_eq!(proj["data"][0]["type"], "personal");
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 3 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -237,60 +250,64 @@ async fn test_auto_auth_login_me_and_license() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_node_types_and_credential_types_contracts() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    // Test GET /rest/node-types
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/node-types")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // Test GET /rest/node-types
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/node-types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let nodes = body["data"].as_array().expect("Node types must be array");
-    assert!(nodes.len() >= 9, "Must contain all core node definitions");
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nodes = body["data"].as_array().expect("Node types must be array");
+        assert!(nodes.len() >= 9, "Must contain all core node definitions");
 
-    let mut names = Vec::new();
-    for n in nodes {
-        assert!(n["name"].is_string());
-        assert!(n["displayName"].is_string());
-        assert!(n["properties"].is_array());
-        names.push(n["name"].as_str().unwrap().to_string());
-    }
-    assert!(names.contains(&"n8n-nodes-base.manualTrigger".to_string()));
-    assert!(names.contains(&"n8n-nodes-base.httpRequest".to_string()));
-    assert!(names.contains(&"n8n-nodes-base.webhook".to_string()));
-    assert!(names.contains(&"n8n-nodes-base.code".to_string()));
+        let mut names = Vec::new();
+        for n in nodes {
+            assert!(n["name"].is_string());
+            assert!(n["displayName"].is_string());
+            assert!(n["properties"].is_array());
+            names.push(n["name"].as_str().unwrap().to_string());
+        }
+        assert!(names.contains(&"n8n-nodes-base.manualTrigger".to_string()));
+        assert!(names.contains(&"n8n-nodes-base.httpRequest".to_string()));
+        assert!(names.contains(&"n8n-nodes-base.webhook".to_string()));
+        assert!(names.contains(&"n8n-nodes-base.code".to_string()));
 
-    // Test GET /rest/credential-types
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/credential-types")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // Test GET /rest/credential-types
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/credential-types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let creds = body["data"]
-        .as_array()
-        .expect("Credential types must be array");
-    assert!(creds.len() >= 3);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let creds = body["data"]
+            .as_array()
+            .expect("Credential types must be array");
+        assert!(creds.len() >= 3);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 4 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -298,170 +315,174 @@ async fn test_node_types_and_credential_types_contracts() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_workflow_full_crud_and_archive_lifecycle() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    // 1. Create Workflow
-    let create_payload = json!({
-        "name": "Integration Test Pipeline",
-        "nodes": [
-            {
-                "id": "node-1",
-                "name": "Manual Trigger",
-                "type": "n8n-nodes-base.manualTrigger",
-                "typeVersion": 1,
-                "position": [250, 300]
-            },
-            {
-                "id": "node-2",
-                "name": "HTTP Request",
-                "type": "n8n-nodes-base.httpRequest",
-                "typeVersion": 4.2,
-                "position": [450, 300]
-            }
-        ],
-        "connections": {
-            "Manual Trigger": {
-                "main": [
-                    [
-                        {
-                            "node": "HTTP Request",
-                            "type": "main",
-                            "index": 0
-                        }
+        // 1. Create Workflow
+        let create_payload = json!({
+            "name": "Integration Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-1",
+                    "name": "Manual Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "position": [250, 300]
+                },
+                {
+                    "id": "node-2",
+                    "name": "HTTP Request",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "typeVersion": 4.2,
+                    "position": [450, 300]
+                }
+            ],
+            "connections": {
+                "Manual Trigger": {
+                    "main": [
+                        [
+                            {
+                                "node": "HTTP Request",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
                     ]
-                ]
+                }
+            },
+            "settings": {
+                "executionOrder": "v1"
             }
-        },
-        "settings": {
-            "executionOrder": "v1"
-        }
-    });
+        });
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/workflows")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(create_payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(create_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let created_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let wf_id = created_wf["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(created_wf["data"]["name"], "Integration Test Pipeline");
-    assert_eq!(created_wf["data"]["nodes"].as_array().unwrap().len(), 2);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let created_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let wf_id = created_wf["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(created_wf["data"]["name"], "Integration Test Pipeline");
+        assert_eq!(created_wf["data"]["nodes"].as_array().unwrap().len(), 2);
 
-    // 2. Read Workflow by ID
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}"))
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // 2. Read Workflow by ID
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let fetched_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(fetched_wf["data"]["id"], wf_id);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let fetched_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(fetched_wf["data"]["id"], wf_id);
 
-    // 3. Update Workflow (PATCH)
-    let patch_payload = json!({
-        "name": "Updated Test Pipeline",
-        "active": true
-    });
+        // 3. Update Workflow (PATCH)
+        let patch_payload = json!({
+            "name": "Updated Test Pipeline",
+            "active": true
+        });
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}"))
-                .method("PATCH")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(patch_payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}"))
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(patch_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let updated_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(updated_wf["data"]["name"], "Updated Test Pipeline");
-    assert_eq!(updated_wf["data"]["active"], true);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let updated_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(updated_wf["data"]["name"], "Updated Test Pipeline");
+        assert_eq!(updated_wf["data"]["active"], true);
 
-    // 4. Archive Workflow
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}/archive"))
-                .method("POST")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let archived_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(archived_wf["data"]["isArchived"], true);
+        // 4. Archive Workflow
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}/archive"))
+                    .method("POST")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let archived_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(archived_wf["data"]["isArchived"], true);
 
-    // 5. Unarchive Workflow
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}/unarchive"))
-                .method("POST")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let unarchived_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(unarchived_wf["data"]["isArchived"], false);
+        // 5. Unarchive Workflow
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}/unarchive"))
+                    .method("POST")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let unarchived_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(unarchived_wf["data"]["isArchived"], false);
 
-    // 6. Delete Workflow
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}"))
-                .method("DELETE")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 6. Delete Workflow
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}"))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // Verify deletion returns 404
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}"))
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        // Verify deletion returns 404
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 5 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -469,148 +490,152 @@ async fn test_workflow_full_crud_and_archive_lifecycle() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_folders_and_variables_full_crud() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    // --- FOLDERS CRUD ---
-    // 1. Create Folder
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/folders")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Production Pipelines" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let folder_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let folder_id = folder_res["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(folder_res["data"]["name"], "Production Pipelines");
+        // --- FOLDERS CRUD ---
+        // 1. Create Folder
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/folders")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "name": "Production Pipelines" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let folder_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let folder_id = folder_res["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(folder_res["data"]["name"], "Production Pipelines");
 
-    // 2. List Folders
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/folders")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let f_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(f_list["data"].as_array().unwrap().len(), 1);
+        // 2. List Folders
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/folders")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let f_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(f_list["data"].as_array().unwrap().len(), 1);
 
-    // 3. Update Folder
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/folders/{folder_id}"))
-                .method("PATCH")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Core Automations" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 3. Update Folder
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/folders/{folder_id}"))
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "name": "Core Automations" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 4. Delete Folder
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/folders/{folder_id}"))
-                .method("DELETE")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 4. Delete Folder
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/folders/{folder_id}"))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // --- VARIABLES CRUD ---
-    // 1. Create Variable
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/variables")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "key": "API_BASE_URL", "value": "https://api.gateway.internal", "type": "string" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let var_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let var_id = var_res["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(var_res["data"]["key"], "API_BASE_URL");
+        // --- VARIABLES CRUD ---
+        // 1. Create Variable
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/variables")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "key": "API_BASE_URL", "value": "https://api.gateway.internal", "type": "string" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let var_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let var_id = var_res["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(var_res["data"]["key"], "API_BASE_URL");
 
-    // 2. List Variables
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/variables")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let v_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(v_list["data"].as_array().unwrap().len(), 1);
+        // 2. List Variables
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/variables")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let v_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(v_list["data"].as_array().unwrap().len(), 1);
 
-    // 3. Update Variable
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/variables/{var_id}"))
-                .method("PATCH")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "value": "https://api.gateway.v2.internal" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 3. Update Variable
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/variables/{var_id}"))
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "value": "https://api.gateway.v2.internal" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 4. Delete Variable
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/variables/{var_id}"))
-                .method("DELETE")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 4. Delete Variable
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/variables/{var_id}"))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 6 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -618,146 +643,150 @@ async fn test_folders_and_variables_full_crud() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_credentials_and_tags_full_crud() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db);
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
-    // --- TAGS CRUD ---
-    // 1. Create Tag
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/tags")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "name": "production" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let tag_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let tag_id = tag_res["data"]["id"].as_str().unwrap().to_string();
+        // --- TAGS CRUD ---
+        // 1. Create Tag
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/tags")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "name": "production" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let tag_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let tag_id = tag_res["data"]["id"].as_str().unwrap().to_string();
 
-    // 2. List Tags
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/tags")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 2. List Tags
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/tags")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 3. Update Tag
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/tags/{tag_id}"))
-                .method("PATCH")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "name": "production-core" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 3. Update Tag
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/tags/{tag_id}"))
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "name": "production-core" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 4. Delete Tag
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/tags/{tag_id}"))
-                .method("DELETE")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 4. Delete Tag
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/tags/{tag_id}"))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // --- CREDENTIALS CRUD ---
-    // 1. Create Credential
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/credentials")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({
-                        "name": "Stripe Live API",
-                        "type": "stripeApi",
-                        "data": { "apiKey": "sk_live_12345" }
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let cred_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let cred_id = cred_res["data"]["id"].as_str().unwrap().to_string();
-    assert_eq!(cred_res["data"]["name"], "Stripe Live API");
+        // --- CREDENTIALS CRUD ---
+        // 1. Create Credential
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/credentials")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({
+                            "name": "Stripe Live API",
+                            "type": "stripeApi",
+                            "data": { "apiKey": "sk_live_12345" }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let cred_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let cred_id = cred_res["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(cred_res["data"]["name"], "Stripe Live API");
 
-    // 2. Get Credential by ID
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/credentials/{cred_id}"))
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 2. Get Credential by ID
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/credentials/{cred_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 3. Update Credential
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/credentials/{cred_id}"))
-                .method("PATCH")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Stripe Live Primary" }).to_string(),
-                ))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 3. Update Credential
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/credentials/{cred_id}"))
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "name": "Stripe Live Primary" }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    // 4. Delete Credential
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/credentials/{cred_id}"))
-                .method("DELETE")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 4. Delete Credential
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/credentials/{cred_id}"))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 7 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -765,122 +794,126 @@ async fn test_credentials_and_tags_full_crud() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_write_behind_batch_zstd_executions() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
 
-    let total_items = 100;
+        let total_items = 100;
 
-    // Send 100 executions concurrently to the write-behind buffer
-    for i in 0..total_items {
-        let msg = ExecutionWriteMessage {
-            id: format!("exec-batch-{i:03}"),
-            workflow_id: Some("wf-bench-pipeline".into()),
-            status: if i % 2 == 0 {
-                "success".into()
-            } else {
-                "error".into()
-            },
-            mode: "integrated".into(),
-            started_at: "2026-10-14T22:00:00.000Z".into(),
-            stopped_at: Some("2026-10-14T22:00:01.000Z".into()),
-            data_json: json!({
-                "batchIndex": i,
-                "resultData": {
-                    "runData": {
-                        "Manual Trigger": [
-                            {
-                                "data": {
-                                    "main": [
-                                        [{ "json": { "item": i, "checksum": format!("crc32-{}", i * 13) } }]
-                                    ]
+        // Send 100 executions concurrently to the write-behind buffer
+        for i in 0..total_items {
+            let msg = ExecutionWriteMessage {
+                id: format!("exec-batch-{i:03}"),
+                workflow_id: Some("wf-bench-pipeline".into()),
+                status: if i % 2 == 0 {
+                    "success".into()
+                } else {
+                    "error".into()
+                },
+                mode: "integrated".into(),
+                started_at: "2026-10-14T22:00:00.000Z".into(),
+                stopped_at: Some("2026-10-14T22:00:01.000Z".into()),
+                data_json: json!({
+                    "batchIndex": i,
+                    "resultData": {
+                        "runData": {
+                            "Manual Trigger": [
+                                {
+                                    "data": {
+                                        "main": [
+                                            [{ "json": { "item": i, "checksum": format!("crc32-{}", i * 13) } }]
+                                        ]
+                                    }
                                 }
-                            }
-                        ]
+                            ]
+                        }
                     }
-                }
-            }),
-        };
+                }),
+            };
 
-        db.record_execution_async(msg)
-            .expect("Failed to enqueue execution message");
-    }
+            db.record_execution_async(msg)
+                .expect("Failed to enqueue execution message");
+        }
 
-    // Explicitly flush all queued executions to disk (0ms race condition proof)
-    db.flush_executions()
-        .await
-        .expect("Explicit flush executions failed");
+        // Explicitly flush all queued executions to disk (0ms race condition proof)
+        db.flush_executions()
+            .await
+            .expect("Explicit flush executions failed");
 
-    // 1. Verify via GET /rest/executions that 100 executions are returned
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/executions")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // 1. Verify via GET /rest/executions that 100 executions are returned
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/executions")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let exec_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let records = exec_list["data"].as_array().unwrap();
-    assert_eq!(
-        records.len(),
-        total_items,
-        "All 100 executions must be committed in SQLite"
-    );
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let exec_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let records = exec_list["data"].as_array().unwrap();
+        assert_eq!(
+            records.len(),
+            total_items,
+            "All 100 executions must be committed in SQLite"
+        );
 
-    // 2. Verify individual execution decompression with item 042
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/executions/exec-batch-042")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // 2. Verify individual execution decompression with item 042
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/executions/exec-batch-042")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let detail_42: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(detail_42["data"]["id"], "exec-batch-042");
-    assert_eq!(detail_42["data"]["status"], "success");
-    assert_eq!(detail_42["data"]["data"]["batchIndex"], 42);
-    assert_eq!(
-        detail_42["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
-            [0]["json"]["item"],
-        42
-    );
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let detail_42: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(detail_42["data"]["id"], "exec-batch-042");
+        assert_eq!(detail_42["data"]["status"], "success");
+        assert_eq!(detail_42["data"]["data"]["batchIndex"], 42);
+        assert_eq!(
+            detail_42["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
+                [0]["json"]["item"],
+            42
+        );
 
-    // 3. Verify individual execution decompression with item 099
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/executions/exec-batch-099")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // 3. Verify individual execution decompression with item 099
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/executions/exec-batch-099")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let detail_99: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(detail_99["data"]["id"], "exec-batch-099");
-    assert_eq!(detail_99["data"]["status"], "error");
-    assert_eq!(detail_99["data"]["data"]["batchIndex"], 99);
-    assert_eq!(
-        detail_99["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
-            [0]["json"]["checksum"],
-        "crc32-1287"
-    );
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let detail_99: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(detail_99["data"]["id"], "exec-batch-099");
+        assert_eq!(detail_99["data"]["status"], "error");
+        assert_eq!(detail_99["data"]["data"]["batchIndex"], 99);
+        assert_eq!(
+            detail_99["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
+                [0]["json"]["checksum"],
+            "crc32-1287"
+        );
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 8 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -888,136 +921,162 @@ async fn test_write_behind_batch_zstd_executions() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_engine_dag_execution_and_rest_run() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
 
-    // 1. Create a branching DAG workflow:
-    // Manual Trigger -> Branch A (Set) & Branch B (Set) -> Merge
-    let workflow_payload = json!({
-        "name": "Multi-Branch Pipeline",
-        "nodes": [
-            {
-                "id": "node-trigger",
-                "name": "Manual Trigger",
-                "type": "n8n-nodes-base.manualTrigger",
-                "typeVersion": 1,
-                "position": [100, 200]
+        // 1. Create a branching DAG workflow with parallel fan-in:
+        // Trigger -> Branch1 (Set { branch: 1 }) & Branch2 (Set { branch: 2 }) -> MergeNodes
+        let workflow_payload = json!({
+            "name": "Parallel Branching Fan-In Test",
+            "nodes": [
+                {
+                    "id": "node-trigger",
+                    "name": "Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "position": [100, 200]
+                },
+                {
+                    "id": "node-branch-1",
+                    "name": "Branch1",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 3.4,
+                    "position": [300, 100],
+                    "parameters": { "branch": 1 }
+                },
+                {
+                    "id": "node-branch-2",
+                    "name": "Branch2",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 3.4,
+                    "position": [300, 300],
+                    "parameters": { "branch": 2 }
+                },
+                {
+                    "id": "node-merge",
+                    "name": "MergeNodes",
+                    "type": "n8n-nodes-base.merge",
+                    "typeVersion": 3,
+                    "position": [500, 200]
+                }
+            ],
+            "connections": {
+                "Trigger": {
+                    "main": [
+                        [
+                            { "node": "Branch1", "type": "main", "index": 0 },
+                            { "node": "Branch2", "type": "main", "index": 0 }
+                        ]
+                    ]
+                },
+                "Branch1": {
+                    "main": [
+                        [
+                            { "node": "MergeNodes", "type": "main", "index": 0 }
+                        ]
+                    ]
+                },
+                "Branch2": {
+                    "main": [
+                        [
+                            { "node": "MergeNodes", "type": "main", "index": 1 }
+                        ]
+                    ]
+                }
             },
-            {
-                "id": "node-branch-a",
-                "name": "Branch Alpha",
-                "type": "n8n-nodes-base.set",
-                "typeVersion": 3.4,
-                "position": [300, 100],
-                "parameters": { "branch": "alpha" }
-            },
-            {
-                "id": "node-branch-b",
-                "name": "Branch Beta",
-                "type": "n8n-nodes-base.set",
-                "typeVersion": 3.4,
-                "position": [300, 300],
-                "parameters": { "branch": "beta" }
-            },
-            {
-                "id": "node-merge",
-                "name": "Merge",
-                "type": "n8n-nodes-base.merge",
-                "typeVersion": 3,
-                "position": [500, 200]
+            "settings": {
+                "executionOrder": "v1"
             }
-        ],
-        "connections": {
-            "Manual Trigger": {
-                "main": [
-                    [
-                        { "node": "Branch Alpha", "type": "main", "index": 0 },
-                        { "node": "Branch Beta", "type": "main", "index": 0 }
-                    ]
-                ]
-            },
-            "Branch Alpha": {
-                "main": [
-                    [
-                        { "node": "Merge", "type": "main", "index": 0 }
-                    ]
-                ]
-            },
-            "Branch Beta": {
-                "main": [
-                    [
-                        { "node": "Merge", "type": "main", "index": 1 }
-                    ]
-                ]
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(workflow_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let wf_id = created["data"]["id"].as_str().unwrap().to_string();
+
+        // 2. Execute workflow via POST /rest/workflows/:id/run with Vue UI payload format (workflowData wrap)
+        let run_body = json!({
+            "workflowData": {
+                "nodes": workflow_payload["nodes"],
+                "connections": workflow_payload["connections"]
             }
-        },
-        "settings": {
-            "executionOrder": "v1"
-        }
-    });
+        });
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/workflows")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(workflow_payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}/run"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let wf_id = created["data"]["id"].as_str().unwrap().to_string();
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let exec_id = run_res["data"]["executionId"].as_str().unwrap().to_string();
+        assert_eq!(run_res["data"]["status"], "success");
+        assert_eq!(run_res["data"]["executedNodes"], 4);
 
-    // 2. Execute workflow via POST /rest/workflows/:id/run
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/workflows/{wf_id}/run"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(json!({}).to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        // Flush write-behind executions buffer
+        db.flush_executions().await.expect("Flush failed");
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    let exec_id = run_res["data"]["executionId"].as_str().unwrap().to_string();
-    assert_eq!(run_res["data"]["status"], "success");
-    assert_eq!(run_res["data"]["executedNodes"], 4);
+        // 3. Verify execution was recorded to SQLite and multi-input fan-in merged correctly
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/executions/{exec_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    // Flush write-behind executions buffer
-    db.flush_executions().await.expect("Flush failed");
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let db_exec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(db_exec["data"]["id"], exec_id);
+        assert_eq!(db_exec["data"]["status"], "success");
 
-    // 3. Verify execution was recorded to SQLite and decompressed correctly
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/rest/executions/{exec_id}"))
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let merge_items = db_exec["data"]["data"]["resultData"]["runData"]["MergeNodes"][0]["data"]
+            ["main"][0]
+            .as_array()
+            .expect("MergeNodes main[0] must be an array");
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let db_exec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(db_exec["data"]["id"], exec_id);
-    assert_eq!(db_exec["data"]["status"], "success");
-    assert!(db_exec["data"]["data"]["resultData"]["runData"]["Merge"].is_array());
+        // Strictly verify that BOTH branch outputs are preserved!
+        assert_eq!(
+            merge_items.len(),
+            2,
+            "MergeNodes must contain items from both Branch1 and Branch2"
+        );
+        let b1_found = merge_items.iter().any(|item| item["json"]["branch"] == 1);
+        let b2_found = merge_items.iter().any(|item| item["json"]["branch"] == 2);
+        assert!(b1_found, "Branch 1 output must be preserved in MergeNodes");
+        assert!(b2_found, "Branch 2 output must be preserved in MergeNodes");
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 9 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -1025,71 +1084,87 @@ async fn test_engine_dag_execution_and_rest_run() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_websocket_push_realtime_events() {
-    let (db, db_path) = setup_test_engine();
-    let app = build_app(Path::new("ui-dist"), db.clone());
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
 
-    // 1. Verify /rest/push endpoint connects cleanly
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/push?pushRef=test-client-1")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(res.status(), StatusCode::OK);
+        // 1. Verify /rest/push endpoint connects cleanly as SSE
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/push?pushRef=test-client-1")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let ct = res
+            .headers()
+            .get(header::CONTENT_TYPE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            ct.contains("text/event-stream"),
+            "Expected text/event-stream, got {}",
+            ct
+        );
 
-    // 2. Direct run workflow via POST /rest/workflows/run
-    let run_direct_payload = json!({
-        "nodes": [
-            {
-                "id": "direct-node-1",
-                "name": "Direct Trigger",
-                "type": "n8n-nodes-base.manualTrigger",
-                "typeVersion": 1,
-                "position": [100, 200]
-            },
-            {
-                "id": "direct-node-2",
-                "name": "Direct Transform",
-                "type": "n8n-nodes-base.code",
-                "typeVersion": 2,
-                "position": [300, 200]
-            }
-        ],
-        "connections": {
-            "Direct Trigger": {
-                "main": [
-                    [
-                        { "node": "Direct Transform", "type": "main", "index": 0 }
+        // 2. Direct run workflow via POST /rest/workflows/run
+        let run_direct_payload = json!({
+            "nodes": [
+                {
+                    "id": "direct-node-1",
+                    "name": "Direct Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "position": [100, 200]
+                },
+                {
+                    "id": "direct-node-2",
+                    "name": "Direct Transform",
+                    "type": "n8n-nodes-base.code",
+                    "typeVersion": 2,
+                    "position": [300, 200]
+                }
+            ],
+            "connections": {
+                "Direct Trigger": {
+                    "main": [
+                        [
+                            { "node": "Direct Transform", "type": "main", "index": 0 }
+                        ]
                     ]
-                ]
+                }
             }
-        }
-    });
+        });
 
-    let res = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/rest/workflows/run")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(axum::body::Body::from(run_direct_payload.to_string()))
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_direct_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
-    assert_eq!(res.status(), StatusCode::OK);
-    let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-    assert_eq!(run_res["data"]["status"], "success");
-    assert_eq!(run_res["data"]["executedNodes"], 2);
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run_res["data"]["status"], "success");
+        assert_eq!(run_res["data"]["executedNodes"], 2);
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 10 timed out!");
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,128 +1172,201 @@ async fn test_websocket_push_realtime_events() {
 // ---------------------------------------------------------------------------
 #[tokio::test]
 async fn test_hyperscale_one_million_nodes_arena_execution() {
-    let (db, db_path) = setup_test_engine();
-    let engine = HyperScaleEngine::new(None).expect("Failed to initialize engine");
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let engine = HyperScaleEngine::new(None).expect("Failed to initialize engine");
 
-    let total_nodes = 1_000_000;
-    let chains_count = 1_000;
-    let nodes_per_chain = total_nodes / chains_count; // 1,000 nodes per chain
+        let total_nodes = 1_000_000;
+        let chains_count = 1_000;
+        let nodes_per_chain = total_nodes / chains_count; // 1,000 nodes per chain
 
-    println!("\n========================================================");
-    println!(">>> BUILDING 1,000,000 NODE FLAT ARENA DAG GRAPH <<<");
-    let build_start = Instant::now();
+        println!("\n========================================================");
+        println!(">>> BUILDING 1,000,000 NODE FLAT ARENA DAG GRAPH <<<");
+        let build_start = Instant::now();
 
-    let mut nodes = Vec::with_capacity(total_nodes);
-    let mut edges = vec![Vec::new(); total_nodes];
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut edges = vec![Vec::new(); total_nodes];
 
-    // Build 1,000 parallel independent transform chains
-    for c in 0..chains_count {
-        let base = c * nodes_per_chain;
-        for s in 0..nodes_per_chain {
-            let idx = base + s;
-            nodes.push(ArenaNode {
-                id: format!("n_{idx}"),
-                name: format!("Node_{idx}"),
-                node_type: "n8n-nodes-base.set".to_string(),
-                parameters: json!({ "chain": c, "step": s }),
-            });
+        // Build 1,000 parallel independent transform chains
+        for c in 0..chains_count {
+            let base = c * nodes_per_chain;
+            for s in 0..nodes_per_chain {
+                let idx = base + s;
+                nodes.push(ArenaNode {
+                    id: format!("n_{idx}"),
+                    name: format!("Node_{idx}"),
+                    node_type: "n8n-nodes-base.set".to_string(),
+                    parameters: json!({ "chain": c, "step": s }),
+                });
 
-            if s + 1 < nodes_per_chain {
-                edges[idx].push((idx + 1) as u32);
+                if s + 1 < nodes_per_chain {
+                    edges[idx].push((idx + 1) as u32);
+                }
             }
         }
-    }
 
-    let graph = CompiledGraph::programmatic(nodes, edges);
-    let build_duration = build_start.elapsed();
-    println!(
-        ">>> Graph Construction Completed in: {:?} <<<",
-        build_duration
-    );
-    println!(
-        ">>> Total Nodes: {} | Total Roots: {} <<<",
-        graph.nodes.len(),
-        graph.roots.len()
-    );
-    assert_eq!(graph.nodes.len(), 1_000_000);
-    assert_eq!(graph.roots.len(), 1_000);
+        let graph = CompiledGraph::programmatic(nodes, edges);
+        let build_duration = build_start.elapsed();
+        println!(
+            ">>> Graph Construction Completed in: {:?} <<<",
+            build_duration
+        );
+        println!(
+            ">>> Total Nodes: {} | Total Roots: {} <<<",
+            graph.nodes.len(),
+            graph.roots.len()
+        );
+        assert_eq!(graph.nodes.len(), 1_000_000);
+        assert_eq!(graph.roots.len(), 1_000);
 
-    // Initial zero-copy seed payload
-    let initial_payload = Arc::new(json!({
-        "benchmark": "1_000_000_nodes_execution",
-        "zeroCopy": true,
-        "mode": "hyperScale"
-    }));
+        // Initial zero-copy seed payload
+        let initial_payload = Arc::new(json!({
+            "benchmark": "1_000_000_nodes_execution",
+            "zeroCopy": true,
+            "mode": "hyperScale"
+        }));
 
-    println!(">>> STARTING ZERO-COPY MULTI-RUNNER EXECUTION <<<");
-    let exec_start = Instant::now();
-    let exec_id = format!("bench-1m-{}", Uuid::new_v4());
+        println!(">>> STARTING ZERO-COPY MULTI-RUNNER EXECUTION <<<");
+        let exec_start = Instant::now();
+        let exec_id = format!("bench-1m-{}", Uuid::new_v4());
 
-    let result = engine
-        .execute(
-            &exec_id,
-            Some("wf-benchmark-1m"),
-            &graph,
-            initial_payload,
-            None,
-            None,
-        )
-        .await
-        .expect("HyperScale execution failed");
+        let result = engine
+            .execute(
+                &exec_id,
+                Some("wf-benchmark-1m"),
+                &graph,
+                initial_payload,
+                None,
+                None,
+            )
+            .await
+            .expect("HyperScale execution failed");
 
-    let exec_duration = exec_start.elapsed();
-    let exec_ms = exec_duration.as_millis();
-    let throughput = (total_nodes as f64) / exec_duration.as_secs_f64();
+        let exec_duration = exec_start.elapsed();
+        let exec_ms = exec_duration.as_millis();
+        let throughput = (total_nodes as f64) / exec_duration.as_secs_f64();
 
-    println!("========================================================");
-    println!(">>> [HYPERSCALE VERIFICATION RESULT] <<<");
-    println!(">>> Executed Nodes Count: {}", result.executed_nodes);
-    println!(">>> Status: {}", result.status);
-    println!(">>> Duration: {} ms ({:?})", exec_ms, exec_duration);
-    println!(
-        ">>> Throughput: {:.2} nodes/sec ({:.2} million nodes/sec)",
-        throughput,
-        throughput / 1_000_000.0
-    );
-    println!("========================================================\n");
+        println!("========================================================");
+        println!(">>> [HYPERSCALE VERIFICATION RESULT] <<<");
+        println!(">>> Executed Nodes Count: {}", result.executed_nodes);
+        println!(">>> Status: {}", result.status);
+        println!(">>> Duration: {} ms ({:?})", exec_ms, exec_duration);
+        println!(
+            ">>> Throughput: {:.2} nodes/sec ({:.2} million nodes/sec)",
+            throughput,
+            throughput / 1_000_000.0
+        );
+        println!("========================================================\n");
 
-    // Strict asserts
-    assert_eq!(
-        result.executed_nodes, 1_000_000,
-        "Must execute exactly 1,000,000 nodes"
-    );
-    assert_eq!(result.status, "success", "Execution status must be success");
-    assert!(
-        exec_ms < 5000,
-        "Execution of 1,000,000 nodes took {} ms (must be under 5,000 ms)",
-        exec_ms
-    );
+        // Strict asserts
+        assert_eq!(
+            result.executed_nodes, 1_000_000,
+            "Must execute exactly 1,000,000 nodes"
+        );
+        assert_eq!(result.status, "success", "Execution status must be success");
+        assert!(
+            exec_ms < 5000,
+            "Execution of 1,000,000 nodes took {} ms (must be under 5,000 ms)",
+            exec_ms
+        );
 
-    // Save to SQLite via write-behind buffer and flush
-    let write_msg = ExecutionWriteMessage {
-        id: exec_id.clone(),
-        workflow_id: Some("wf-benchmark-1m".to_string()),
-        status: result.status.clone(),
-        mode: "hyperScaleCompact".to_string(),
-        started_at: Utc::now().to_rfc3339(),
-        stopped_at: Some(Utc::now().to_rfc3339()),
-        data_json: result.payload.clone(),
-    };
-    db.record_execution_async(write_msg)
-        .expect("Failed to enqueue 1M execution record");
-    db.flush_executions()
-        .await
-        .expect("Failed to flush 1M execution to disk");
+        // Save to SQLite via write-behind buffer and flush
+        let write_msg = ExecutionWriteMessage {
+            id: exec_id.clone(),
+            workflow_id: Some("wf-benchmark-1m".to_string()),
+            status: result.status.clone(),
+            mode: "hyperScaleCompact".to_string(),
+            started_at: Utc::now().to_rfc3339(),
+            stopped_at: Some(Utc::now().to_rfc3339()),
+            data_json: result.payload.clone(),
+        };
+        db.record_execution_async(write_msg)
+            .expect("Failed to enqueue 1M execution record");
+        db.flush_executions()
+            .await
+            .expect("Failed to flush 1M execution to disk");
 
-    // Verify persisted record in SQLite
-    let db_record = db
-        .get_execution(&exec_id)
-        .expect("Failed to query db")
-        .expect("1M execution record not found in SQLite");
-    assert_eq!(db_record.id, exec_id);
-    assert_eq!(db_record.status, "success");
-    assert_eq!(db_record.data["executedNodes"], 1_000_000);
-    assert_eq!(db_record.data["mode"], "hyperScaleCompact");
+        // Verify persisted record in SQLite
+        let db_record = db
+            .get_execution(&exec_id)
+            .expect("Failed to query db")
+            .expect("1M execution record not found in SQLite");
+        assert_eq!(db_record.id, exec_id);
+        assert_eq!(db_record.status, "success");
+        assert_eq!(db_record.data["executedNodes"], 1_000_000);
+        assert_eq!(db_record.data["mode"], "hyperScaleCompact");
 
-    let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 11 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 12. Engine Cancellation & Anti-Stuck Watchdog Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_engine_cancellation_and_watchdog_timeout() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let engine = HyperScaleEngine::new(Some(4)).expect("Engine init failed");
+
+        let nodes = vec![
+            ArenaNode {
+                id: "c1".to_string(),
+                name: "Trigger".to_string(),
+                node_type: "n8n-nodes-base.manualTrigger".to_string(),
+                parameters: json!({}),
+            },
+            ArenaNode {
+                id: "c2".to_string(),
+                name: "Step".to_string(),
+                node_type: "n8n-nodes-base.set".to_string(),
+                parameters: json!({ "v": 1 }),
+            },
+        ];
+        let edges = vec![vec![1], vec![]];
+        let graph = CompiledGraph::programmatic(nodes, edges);
+
+        let cancel_token = Arc::new(AtomicBool::new(true)); // Pre-cancelled
+        let exec_id = format!("exec-cancel-{}", Uuid::new_v4());
+
+        let res = engine
+            .execute(
+                &exec_id,
+                Some("wf-cancel"),
+                &graph,
+                Arc::new(json!({})),
+                None,
+                Some(cancel_token),
+            )
+            .await
+            .expect("Execute call failed");
+
+        assert_eq!(
+            res.status, "canceled",
+            "Pre-cancelled execution must return canceled status"
+        );
+
+        // Test API stop execution endpoint
+        let app = build_app(Path::new("ui-dist"), db);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/executions/{exec_id}/stop"))
+                    .method("POST")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // 404 since it's not active anymore, proving clean state handling
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 12 timed out!");
 }
