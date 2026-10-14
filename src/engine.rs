@@ -1,6 +1,6 @@
+use crate::expr::{self, ExprContext};
 use anyhow::{Context, Result};
 use chrono::Utc;
-use crate::expr::{self, ExprContext};
 use dashmap::DashMap;
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub struct ArenaNode {
     pub name: String,
     pub node_type: String,
     pub parameters: Value,
+    pub has_expressions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,6 +66,7 @@ impl CompiledGraph {
                 .unwrap_or("n8n-nodes-base.manualTrigger")
                 .to_string();
             let parameters = n.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            let has_expressions = crate::expr::has_potential_expression(&parameters);
 
             node_index.insert(name.clone(), idx as u32);
             if !id.is_empty() && id != name {
@@ -76,6 +78,7 @@ impl CompiledGraph {
                 name,
                 node_type,
                 parameters,
+                has_expressions,
             });
         }
 
@@ -526,7 +529,8 @@ fn traverse_node<'scope>(
                     }
                 }
 
-                if ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
+                if ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel) == 1
+                {
                     ready_targets.push(target_idx);
                 }
             } else {
@@ -573,6 +577,10 @@ fn prune_inactive_branch(ctx: &TraversalContext, target_idx: u32) {
 /// Helper to cleanly extract n8n Set node parameters into top-level json properties
 fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params: &Value) {
     if let Some(params_obj) = params.as_object() {
+        if params_obj.is_empty() {
+            return;
+        }
+
         // 1. Format n8n v1/v2: "values": { "string": [...], "number": [...], "boolean": [...] }
         if let Some(values_obj) = params_obj.get("values").and_then(|v| v.as_object()) {
             for type_arr in values_obj.values() {
@@ -750,11 +758,12 @@ fn execute_node_logic(
     expr_ctx: &ExprContext,
     is_hyperscale: bool,
 ) -> (Arc<Value>, Option<u16>) {
-    // Fast path: skip expression resolution for hyperscale benchmarks or empty parameters
-    let resolved_params = if !is_hyperscale && expr::has_potential_expression(&node.parameters) {
-        expr::resolve_parameters(&node.parameters, &input, expr_ctx)
+    let resolved_holder;
+    let params_ref = if !is_hyperscale && node.has_expressions {
+        resolved_holder = expr::resolve_parameters(&node.parameters, &input, expr_ctx);
+        &resolved_holder
     } else {
-        node.parameters.clone()
+        &node.parameters
     };
 
     match node.node_type.as_str() {
@@ -795,7 +804,7 @@ fn execute_node_logic(
                 for elem in arr {
                     let mut merged = elem.clone();
                     if let Some(obj) = merged.as_object_mut() {
-                        apply_set_parameters(obj, &resolved_params);
+                        apply_set_parameters(obj, params_ref);
                     }
                     new_arr.push(merged);
                 }
@@ -803,31 +812,31 @@ fn execute_node_logic(
             } else {
                 let mut merged = (*input).clone();
                 if let Some(obj) = merged.as_object_mut() {
-                    apply_set_parameters(obj, &resolved_params);
+                    apply_set_parameters(obj, params_ref);
                 }
                 Arc::new(merged)
             };
             (payload, None)
         }
         "n8n-nodes-base.if" => {
-            let is_true = evaluate_if_condition(&resolved_params, &input, expr_ctx);
+            let is_true = evaluate_if_condition(params_ref, &input, expr_ctx);
             let port = if is_true { 0 } else { 1 };
             (input, Some(port))
         }
         "n8n-nodes-base.switch" => {
-            let port = evaluate_switch_rule(&resolved_params, &input, expr_ctx);
+            let port = evaluate_switch_rule(params_ref, &input, expr_ctx);
             (input, Some(port))
         }
         "n8n-nodes-base.filter" => {
             let payload = if let Some(arr) = input.as_array() {
                 let mut filtered = Vec::new();
                 for item in arr {
-                    if evaluate_if_condition(&resolved_params, item, expr_ctx) {
+                    if evaluate_if_condition(params_ref, item, expr_ctx) {
                         filtered.push(item.clone());
                     }
                 }
                 Arc::new(Value::Array(filtered))
-            } else if evaluate_if_condition(&resolved_params, &input, expr_ctx) {
+            } else if evaluate_if_condition(params_ref, &input, expr_ctx) {
                 input
             } else {
                 Arc::new(Value::Array(vec![]))
@@ -835,7 +844,7 @@ fn execute_node_logic(
             (payload, None)
         }
         "n8n-nodes-base.limit" => {
-            let max_items = resolved_params
+            let max_items = params_ref
                 .get("maxItems")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(10) as usize;
@@ -848,7 +857,7 @@ fn execute_node_logic(
             (payload, None)
         }
         "n8n-nodes-base.sort" => {
-            let field_name = resolved_params
+            let field_name = params_ref
                 .get("fieldName")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
@@ -875,15 +884,15 @@ fn execute_node_logic(
             (Arc::new(val), None)
         }
         "n8n-nodes-base.httpRequest" => {
-            let url = resolved_params
+            let url = params_ref
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("https://api.example.com");
-            let method = resolved_params
+            let method = params_ref
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("GET");
-            let body = resolved_params.get("body").cloned().unwrap_or(json!({}));
+            let body = params_ref.get("body").cloned().unwrap_or(json!({}));
             let payload = Arc::new(json!({
                 "statusCode": 200,
                 "url": url,

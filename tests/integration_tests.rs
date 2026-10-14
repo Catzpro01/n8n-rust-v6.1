@@ -1212,6 +1212,7 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
                     name: format!("Node_{idx}"),
                     node_type: "n8n-nodes-base.set".to_string(),
                     parameters: json!({ "chain": c, "step": s }),
+                    has_expressions: false,
                 });
 
                 if s + 1 < nodes_per_chain {
@@ -1332,12 +1333,14 @@ async fn test_engine_cancellation_and_watchdog_timeout() {
                 name: "Trigger".to_string(),
                 node_type: "n8n-nodes-base.manualTrigger".to_string(),
                 parameters: json!({}),
+                has_expressions: false,
             },
             ArenaNode {
                 id: "c2".to_string(),
                 name: "Step".to_string(),
                 node_type: "n8n-nodes-base.set".to_string(),
                 parameters: json!({ "v": 1 }),
+                has_expressions: false,
             },
         ];
         let edges = vec![vec![1], vec![]];
@@ -1725,14 +1728,13 @@ async fn test_live_webhook_trigger_execution_end_to_end() {
         assert_eq!(hook_res["status"], "confirmed");
 
         // Flush write-behind executions and assert recorded mode == "webhook"
-        db.flush_executions().await.expect("Flush executions failed");
+        db.flush_executions()
+            .await
+            .expect("Flush executions failed");
         let exec_list = db.list_executions().expect("List executions failed");
         let hook_exec = exec_list
             .iter()
-            .find(|e| {
-                e.mode == "webhook"
-                    && e.workflow_id.as_deref() == Some(&wf_id)
-            })
+            .find(|e| e.mode == "webhook" && e.workflow_id.as_deref() == Some(&wf_id))
             .expect("Webhook execution must be persisted in SQLite with mode == 'webhook'");
 
         assert_eq!(hook_exec.status, "success");

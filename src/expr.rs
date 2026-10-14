@@ -169,8 +169,7 @@ pub fn evaluate_raw_expression(expr: &str, item_json: &Value, ctx: &ExprContext)
                         return Value::Number(num);
                     }
                 }
-            } else if let (Some(n1), Some(n2)) =
-                (value_to_f64(&left_val), value_to_f64(&right_val))
+            } else if let (Some(n1), Some(n2)) = (value_to_f64(&left_val), value_to_f64(&right_val))
             {
                 let res = n1 - n2;
                 if res.fract() == 0.0 && res.is_finite() {
@@ -486,11 +485,12 @@ fn split_by_operator<'a>(expr: &'a str, op: &str) -> Option<(&'a str, &'a str)> 
     None
 }
 
-/// Splits expression by an arithmetic operator (+, -, *, /)
+/// Splits expression by an arithmetic operator (+, -, *, /) respecting left-associativity
 fn split_by_arithmetic(expr: &str, target_op: char) -> Option<(&str, &str)> {
     let mut in_single_quote = false;
     let mut in_double_quote = false;
     let bytes = expr.as_bytes();
+    let mut last_split_idx = None;
 
     for (i, &b) in bytes.iter().enumerate() {
         if b == b'\'' && !in_double_quote {
@@ -498,16 +498,29 @@ fn split_by_arithmetic(expr: &str, target_op: char) -> Option<(&str, &str)> {
         } else if b == b'"' && !in_single_quote {
             in_double_quote = !in_double_quote;
         } else if !in_single_quote && !in_double_quote && b == target_op as u8 {
-            // Avoid interpreting leading negative sign as operator
-            if target_op == '-' && i == 0 {
-                continue;
+            // Avoid interpreting leading negative sign as binary operator
+            if target_op == '-' {
+                let prev_non_space = expr[..i].trim_end();
+                if prev_non_space.is_empty() {
+                    continue;
+                }
+                let last_ch = prev_non_space.chars().last().unwrap_or(' ');
+                if matches!(last_ch, '+' | '-' | '*' | '/' | '(' | '=') {
+                    continue;
+                }
             }
             let left = expr[..i].trim();
             let right = expr[i + 1..].trim();
             if !left.is_empty() && !right.is_empty() {
-                return Some((left, right));
+                last_split_idx = Some(i);
             }
         }
+    }
+
+    if let Some(i) = last_split_idx {
+        let left = expr[..i].trim();
+        let right = expr[i + 1..].trim();
+        return Some((left, right));
     }
     None
 }
@@ -572,8 +585,19 @@ mod tests {
         let res_str = resolve_expression_string("={{ $json.name.toUpperCase() }}", &item, &ctx);
         assert_eq!(res_str, json!("RUST"));
 
-        let res_interp = resolve_expression_string("Order for {{ $json.name }} total: {{ $json.price }}", &item, &ctx);
+        let res_interp = resolve_expression_string(
+            "Order for {{ $json.name }} total: {{ $json.price }}",
+            &item,
+            &ctx,
+        );
         assert_eq!(res_interp, json!("Order for rust total: 100"));
+
+        // Left-associativity tests
+        let res_sub = resolve_expression_string("={{ 10 - 3 - 2 }}", &item, &ctx);
+        assert_eq!(res_sub, json!(5));
+
+        let res_div = resolve_expression_string("={{ 20 / 2 / 2 }}", &item, &ctx);
+        assert_eq!(res_div, json!(5));
     }
 
     #[test]

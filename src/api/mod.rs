@@ -1671,7 +1671,9 @@ pub async fn handle_webhook(
         None => {
             return (
                 StatusCode::NOT_FOUND,
-                Json(json!({ "message": format!("Workflow with webhook path '{path}' not found") })),
+                Json(
+                    json!({ "message": format!("Workflow with webhook path '{path}' not found") }),
+                ),
             )
                 .into_response();
         }
