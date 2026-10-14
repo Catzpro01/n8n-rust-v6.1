@@ -286,6 +286,7 @@ fn owner_user_payload() -> Value {
             "firstName": "Admin",
             "lastName": "Owner",
             "isOwner": true,
+            "isPending": false,
             "role": "global:owner",
             "globalScopes": [
                 "workflow:create", "workflow:read", "workflow:update", "workflow:delete", "workflow:execute", "workflow:list", "workflow:publish",
@@ -319,7 +320,8 @@ pub async fn auth_logout() -> impl IntoResponse {
 pub async fn license_status() -> impl IntoResponse {
     Json(json!({
         "data": {
-            "planName": "Enterprise Unlimited",
+            "planName": "Enterprise",
+            "isPlanActive": true,
             "features": {
                 "sharing": true,
                 "variables": true,
@@ -376,9 +378,9 @@ pub async fn list_roles() -> impl IntoResponse {
     }))
 }
 
-pub async fn node_types_catalog() -> impl IntoResponse {
-    Json(json!({
-        "n8n-nodes-base.manualTrigger": {
+pub fn get_core_node_types_array() -> Value {
+    json!([
+        {
             "name": "n8n-nodes-base.manualTrigger",
             "displayName": "When clicking 'Test workflow'",
             "icon": "fa:play",
@@ -387,9 +389,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Starts workflow manually",
             "defaults": { "name": "When clicking ‘Test workflow’" },
             "inputs": [],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.scheduleTrigger": {
+        {
             "name": "n8n-nodes-base.scheduleTrigger",
             "displayName": "Schedule Trigger",
             "icon": "fa:clock",
@@ -398,9 +401,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Runs workflow on a recurring schedule",
             "defaults": { "name": "Schedule Trigger" },
             "inputs": [],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.webhook": {
+        {
             "name": "n8n-nodes-base.webhook",
             "displayName": "Webhook",
             "icon": "fa:plug",
@@ -409,9 +413,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Receives HTTP requests to start workflow",
             "defaults": { "name": "Webhook" },
             "inputs": [],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.httpRequest": {
+        {
             "name": "n8n-nodes-base.httpRequest",
             "displayName": "HTTP Request",
             "icon": "fa:globe",
@@ -420,9 +425,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Makes HTTP requests and returns data",
             "defaults": { "name": "HTTP Request" },
             "inputs": ["main"],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.code": {
+        {
             "name": "n8n-nodes-base.code",
             "displayName": "Code",
             "icon": "fa:code",
@@ -431,9 +437,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Runs custom JavaScript or Python code",
             "defaults": { "name": "Code" },
             "inputs": ["main"],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.set": {
+        {
             "name": "n8n-nodes-base.set",
             "displayName": "Edit Fields (Set)",
             "icon": "fa:pen",
@@ -442,9 +449,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Sets or modifies item values",
             "defaults": { "name": "Edit Fields" },
             "inputs": ["main"],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         },
-        "n8n-nodes-base.if": {
+        {
             "name": "n8n-nodes-base.if",
             "displayName": "If",
             "icon": "fa:code-branch",
@@ -453,9 +461,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Routes items to true or false paths",
             "defaults": { "name": "If" },
             "inputs": ["main"],
-            "outputs": ["main", "main"]
+            "outputs": ["main", "main"],
+            "properties": []
         },
-        "n8n-nodes-base.switch": {
+        {
             "name": "n8n-nodes-base.switch",
             "displayName": "Switch",
             "icon": "fa:directions",
@@ -464,9 +473,10 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Routes items across multiple rules",
             "defaults": { "name": "Switch" },
             "inputs": ["main"],
-            "outputs": ["main", "main", "main", "main"]
+            "outputs": ["main", "main", "main", "main"],
+            "properties": []
         },
-        "n8n-nodes-base.merge": {
+        {
             "name": "n8n-nodes-base.merge",
             "displayName": "Merge",
             "icon": "fa:compress-arrows-alt",
@@ -475,13 +485,38 @@ pub async fn node_types_catalog() -> impl IntoResponse {
             "description": "Merges data from multiple streams",
             "defaults": { "name": "Merge" },
             "inputs": ["main", "main"],
-            "outputs": ["main"]
+            "outputs": ["main"],
+            "properties": []
         }
+    ])
+}
+
+pub async fn node_types_catalog() -> impl IntoResponse {
+    Json(json!({
+        "data": get_core_node_types_array()
     }))
 }
 
 pub async fn credential_types_catalog() -> impl IntoResponse {
-    Json(json!([]))
+    Json(json!({
+        "data": [
+            {
+                "name": "stripeApi",
+                "displayName": "Stripe API",
+                "properties": []
+            },
+            {
+                "name": "httpHeaderAuth",
+                "displayName": "Header Auth",
+                "properties": []
+            },
+            {
+                "name": "httpBasicAuth",
+                "displayName": "Basic Auth",
+                "properties": []
+            }
+        ]
+    }))
 }
 
 pub async fn module_settings() -> impl IntoResponse {
@@ -668,7 +703,19 @@ pub async fn archive_workflow(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.archive_workflow(&id, true) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(true) => match state.db.get_workflow(&id) {
+            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Workflow not found" })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {}", e) })),
+            )
+                .into_response(),
+        },
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Workflow not found" })),
@@ -687,7 +734,19 @@ pub async fn unarchive_workflow(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.archive_workflow(&id, false) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(true) => match state.db.get_workflow(&id) {
+            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+            Ok(None) => (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Workflow not found" })),
+            )
+                .into_response(),
+            Err(e) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {}", e) })),
+            )
+                .into_response(),
+        },
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Workflow not found" })),
@@ -958,16 +1017,42 @@ pub async fn create_variable(
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub struct VariableUpdateDto {
+    pub key: Option<String>,
+    pub value: Option<String>,
+    #[serde(rename = "type")]
+    pub var_type: Option<String>,
+}
+
 pub async fn update_variable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(payload): Json<VariableInputDto>,
+    Json(payload): Json<VariableUpdateDto>,
 ) -> impl IntoResponse {
+    let existing = match state.db.get_variable(&id) {
+        Ok(Some(v)) => v,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Variable not found" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {}", e) })),
+            )
+                .into_response()
+        }
+    };
+
     let var = VariableRecord {
         id,
-        key: payload.key,
-        value: payload.value,
-        var_type: payload.var_type.unwrap_or_else(|| "string".to_string()),
+        key: payload.key.unwrap_or(existing.key),
+        value: payload.value.unwrap_or(existing.value),
+        var_type: payload.var_type.unwrap_or(existing.var_type),
     };
     match state.db.save_variable(&var) {
         Ok(()) => (StatusCode::OK, Json(json!({ "data": var }))).into_response(),
@@ -1009,6 +1094,13 @@ pub struct FolderInputDto {
     pub parent_folder_id: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FolderUpdateDto {
+    pub name: Option<String>,
+    pub parent_folder_id: Option<String>,
+}
+
 pub async fn list_folders(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.list_folders() {
         Ok(list) => (StatusCode::OK, Json(json!({ "data": list }))).into_response(),
@@ -1045,15 +1137,32 @@ pub async fn create_folder(
 pub async fn update_folder(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(payload): Json<FolderInputDto>,
+    Json(payload): Json<FolderUpdateDto>,
 ) -> impl IntoResponse {
-    let now = Utc::now().to_rfc3339();
+    let existing = match state.db.get_folder(&id) {
+        Ok(Some(f)) => f,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Folder not found" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {}", e) })),
+            )
+                .into_response()
+        }
+    };
+
     let folder = FolderRecord {
         id,
-        name: payload.name,
-        parent_folder_id: payload.parent_folder_id,
-        created_at: now.clone(),
-        updated_at: now,
+        name: payload.name.unwrap_or(existing.name),
+        parent_folder_id: payload.parent_folder_id.or(existing.parent_folder_id),
+        created_at: existing.created_at,
+        updated_at: Utc::now().to_rfc3339(),
     };
     match state.db.save_folder(&folder) {
         Ok(()) => (StatusCode::OK, Json(json!({ "data": folder }))).into_response(),

@@ -6,7 +6,7 @@ use serde_json::Value;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{error, info};
 use uuid::Uuid;
 
@@ -20,6 +20,13 @@ pub struct ExecutionWriteMessage {
     pub started_at: String,
     pub stopped_at: Option<String>,
     pub data_json: Value,
+}
+
+/// Channel message for write-behind buffer supporting records and explicit flush synchronization
+#[derive(Debug)]
+pub enum DbWriteMessage {
+    Record(ExecutionWriteMessage),
+    Flush(oneshot::Sender<()>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -111,7 +118,7 @@ pub struct ExecutionDetail {
 pub struct StorageEngine {
     conn: Arc<Mutex<Connection>>,
     db_path: PathBuf,
-    execution_tx: mpsc::UnboundedSender<ExecutionWriteMessage>,
+    execution_tx: mpsc::UnboundedSender<DbWriteMessage>,
 }
 
 impl StorageEngine {
@@ -209,59 +216,106 @@ impl StorageEngine {
         )?;
 
         let conn_arc = Arc::new(Mutex::new(conn));
-        let (tx, mut rx) = mpsc::unbounded_channel::<ExecutionWriteMessage>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<DbWriteMessage>();
 
-        // 3. Spawn lock-free background write-behind worker for execution writes
+        // 3. Spawn lock-free background true-batch write-behind worker for execution writes
         let worker_conn = Arc::clone(&conn_arc);
         tokio::spawn(async move {
-            info!("StorageEngine: Execution write-behind buffer worker started");
-            while let Some(msg) = rx.recv().await {
-                let serialized = match serde_json::to_vec(&msg.data_json) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        error!(error = ?e, "Failed to serialize execution data");
-                        continue;
-                    }
-                };
+            info!("StorageEngine: True batch write-behind buffer worker started");
+            while let Some(first_msg) = rx.recv().await {
+                let mut batch = Vec::new();
+                let mut flush_notifiers = Vec::new();
 
-                let compressed = match zstd::encode_all(&serialized[..], 3) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        error!(error = ?e, "Failed to compress execution data with zstd");
-                        continue;
-                    }
-                };
+                match first_msg {
+                    DbWriteMessage::Record(m) => batch.push(m),
+                    DbWriteMessage::Flush(notifier) => flush_notifiers.push(notifier),
+                }
 
-                let res = {
-                    let guard = worker_conn.lock();
-                    match guard {
-                        Ok(conn) => conn.execute(
-                            r#"
-                            INSERT OR REPLACE INTO executions (id, workflow_id, status, mode, started_at, stopped_at, data_zstd)
-                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                            "#,
-                            params![
-                                msg.id,
-                                msg.workflow_id,
-                                msg.status,
-                                msg.mode,
-                                msg.started_at,
-                                msg.stopped_at,
-                                compressed
-                            ],
-                        ),
-                        Err(e) => {
-                            error!(error = ?e, "Worker failed to acquire db lock");
-                            continue;
+                // Drain queued messages up to 1000 items in a single batch
+                while batch.len() < 1000 {
+                    match rx.try_recv() {
+                        Ok(DbWriteMessage::Record(m)) => batch.push(m),
+                        Ok(DbWriteMessage::Flush(notifier)) => flush_notifiers.push(notifier),
+                        Err(_) => break,
+                    }
+                }
+
+                if !batch.is_empty() {
+                    let mut prepared_records = Vec::with_capacity(batch.len());
+                    for msg in batch {
+                        let serialized = match serde_json::to_vec(&msg.data_json) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                error!(error = ?e, id = %msg.id, "Failed to serialize execution data");
+                                continue;
+                            }
+                        };
+
+                        let compressed = match zstd::encode_all(&serialized[..], 3) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!(error = ?e, id = %msg.id, "Failed to compress execution data with zstd");
+                                continue;
+                            }
+                        };
+
+                        prepared_records.push((
+                            msg.id,
+                            msg.workflow_id,
+                            msg.status,
+                            msg.mode,
+                            msg.started_at,
+                            msg.stopped_at,
+                            compressed,
+                        ));
+                    }
+
+                    if !prepared_records.is_empty() {
+                        let guard = worker_conn.lock();
+                        match guard {
+                            Ok(mut conn) => {
+                                let tx_res = (|| -> Result<()> {
+                                    let tx = conn.transaction_with_behavior(
+                                        rusqlite::TransactionBehavior::Immediate,
+                                    )?;
+                                    {
+                                        let mut stmt = tx.prepare_cached(
+                                            r#"
+                                            INSERT OR REPLACE INTO executions (id, workflow_id, status, mode, started_at, stopped_at, data_zstd)
+                                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                            "#,
+                                        )?;
+                                        for rec in &prepared_records {
+                                            stmt.execute(params![
+                                                rec.0, rec.1, rec.2, rec.3, rec.4, rec.5, rec.6
+                                            ])?;
+                                        }
+                                    }
+                                    tx.commit()?;
+                                    Ok(())
+                                })();
+
+                                if let Err(e) = tx_res {
+                                    error!(
+                                        error = ?e,
+                                        count = prepared_records.len(),
+                                        "Failed to commit batch executions transaction"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                error!(error = ?e, "Worker failed to acquire db lock for batch insert");
+                            }
                         }
                     }
-                };
+                }
 
-                if let Err(e) = res {
-                    error!(error = ?e, id = %msg.id, "Failed to persist execution via write-behind buffer");
+                // Notify all flush callers that preceding writes are fully committed
+                for notifier in flush_notifiers {
+                    let _ = notifier.send(());
                 }
             }
-            info!("StorageEngine: Execution write-behind buffer worker stopped");
+            info!("StorageEngine: True batch write-behind buffer worker stopped");
         });
 
         Ok(Self {
@@ -604,6 +658,26 @@ impl StorageEngine {
         Ok(list)
     }
 
+    pub fn get_variable(&self, id: &str) -> Result<Option<VariableRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let mut stmt =
+            conn.prepare("SELECT id, key, value, var_type FROM variables WHERE id = ?1")?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(VariableRecord {
+                id: row.get(0)?,
+                key: row.get(1)?,
+                value: row.get(2)?,
+                var_type: row.get(3)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn save_variable(&self, var: &VariableRecord) -> Result<()> {
         let conn = self
             .conn
@@ -652,6 +726,28 @@ impl StorageEngine {
         Ok(list)
     }
 
+    pub fn get_folder(&self, id: &str) -> Result<Option<FolderRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT id, name, parent_folder_id, created_at, updated_at FROM folders WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query(params![id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(FolderRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                parent_folder_id: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+
     pub fn save_folder(&self, folder: &FolderRecord) -> Result<()> {
         let conn = self
             .conn
@@ -678,8 +774,21 @@ impl StorageEngine {
     /// Asynchronous non-blocking log ingestion via unbounded write-behind channel
     pub fn record_execution_async(&self, msg: ExecutionWriteMessage) -> Result<()> {
         self.execution_tx
-            .send(msg)
+            .send(DbWriteMessage::Record(msg))
             .map_err(|e| anyhow::anyhow!("Failed to send execution to write-behind channel: {}", e))
+    }
+
+    /// Explicit flush ensuring all in-flight write-behind executions are committed to disk (0ms race condition)
+    pub async fn flush_executions(&self) -> Result<()> {
+        let (tx, rx) = oneshot::channel();
+        self.execution_tx
+            .send(DbWriteMessage::Flush(tx))
+            .map_err(|e| {
+                anyhow::anyhow!("Failed to send flush signal to write-behind channel: {}", e)
+            })?;
+        rx.await
+            .map_err(|e| anyhow::anyhow!("Flush channel dropped without response: {}", e))?;
+        Ok(())
     }
 
     /// Synchronous execution save (used in testing or explicit checkpoints)
