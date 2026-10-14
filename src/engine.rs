@@ -246,7 +246,6 @@ impl HyperScaleEngine {
         }
 
         // Initialize atomic in-degrees
-        // Initialize atomic in-degrees
         let remaining_in_degree: Vec<AtomicU32> =
             graph.in_degree.iter().map(|&d| AtomicU32::new(d)).collect();
 
@@ -703,8 +702,10 @@ fn check_op(left: &Value, right: &Value, op: &str) -> bool {
     match op {
         "equal" | "equals" | "==" => left == right,
         "notEqual" | "notEquals" | "!=" => left != right,
-        "larger" | "largerEqual" | ">" => expr::compare_values(left, right, ">"),
-        "smaller" | "smallerEqual" | "<" => expr::compare_values(left, right, "<"),
+        "larger" | ">" => expr::compare_values(left, right, ">"),
+        "largerEqual" | ">=" => expr::compare_values(left, right, ">="),
+        "smaller" | "<" => expr::compare_values(left, right, "<"),
+        "smallerEqual" | "<=" => expr::compare_values(left, right, "<="),
         "contains" => {
             let l_str = left
                 .as_str()
@@ -731,6 +732,29 @@ fn check_op(left: &Value, right: &Value, op: &str) -> bool {
             _ => true,
         },
         _ => left == right,
+    }
+}
+
+fn is_set_idempotent(obj: &serde_json::Map<String, Value>, params: &Value) -> bool {
+    if let Some(params_obj) = params.as_object() {
+        if params_obj.is_empty() {
+            return true;
+        }
+        if params_obj.contains_key("values") || params_obj.contains_key("assignments") {
+            return false;
+        }
+        let mut checked_any = false;
+        for (k, v) in params_obj {
+            if k != "options" && k != "keepOnlySet" {
+                checked_any = true;
+                if obj.get(k) != Some(v) {
+                    return false;
+                }
+            }
+        }
+        checked_any
+    } else {
+        false
     }
 }
 
@@ -804,11 +828,27 @@ fn execute_node_logic(
                 for elem in arr {
                     let mut merged = elem.clone();
                     if let Some(obj) = merged.as_object_mut() {
-                        apply_set_parameters(obj, params_ref);
+                        if !is_hyperscale && node.has_expressions {
+                            let item_resolved =
+                                expr::resolve_parameters(&node.parameters, elem, expr_ctx);
+                            apply_set_parameters(obj, &item_resolved);
+                        } else {
+                            apply_set_parameters(obj, params_ref);
+                        }
                     }
                     new_arr.push(merged);
                 }
                 Arc::new(Value::Array(new_arr))
+            } else if let Some(obj) = input.as_object() {
+                if is_set_idempotent(obj, params_ref) {
+                    Arc::clone(&input)
+                } else {
+                    let mut merged = (*input).clone();
+                    if let Some(obj_mut) = merged.as_object_mut() {
+                        apply_set_parameters(obj_mut, params_ref);
+                    }
+                    Arc::new(merged)
+                }
             } else {
                 let mut merged = (*input).clone();
                 if let Some(obj) = merged.as_object_mut() {
@@ -877,6 +917,11 @@ fn execute_node_logic(
             (payload, None)
         }
         "n8n-nodes-base.code" => {
+            if let Some(obj) = input.as_object() {
+                if obj.get("codeExecuted") == Some(&json!(true)) {
+                    return (Arc::clone(&input), None);
+                }
+            }
             let mut val = (*input).clone();
             if let Some(obj) = val.as_object_mut() {
                 obj.insert("codeExecuted".to_string(), json!(true));
