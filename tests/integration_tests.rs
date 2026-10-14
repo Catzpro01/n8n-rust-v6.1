@@ -959,6 +959,16 @@ async fn test_engine_dag_execution_and_rest_run() {
                     "type": "n8n-nodes-base.merge",
                     "typeVersion": 3,
                     "position": [500, 200]
+                },
+                {
+                    "id": "node-post-merge",
+                    "name": "PostMergeSet",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 1,
+                    "position": [700, 200],
+                    "parameters": {
+                        "multiplied": "={{ $json.branch * 10 }}"
+                    }
                 }
             ],
             "connections": {
@@ -981,6 +991,13 @@ async fn test_engine_dag_execution_and_rest_run() {
                     "main": [
                         [
                             { "node": "MergeNodes", "type": "main", "index": 1 }
+                        ]
+                    ]
+                },
+                "MergeNodes": {
+                    "main": [
+                        [
+                            { "node": "PostMergeSet", "type": "main", "index": 0 }
                         ]
                     ]
                 }
@@ -1034,7 +1051,7 @@ async fn test_engine_dag_execution_and_rest_run() {
         let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         let exec_id = run_res["data"]["executionId"].as_str().unwrap().to_string();
         assert_eq!(run_res["data"]["status"], "success");
-        assert_eq!(run_res["data"]["executedNodes"], 4);
+        assert_eq!(run_res["data"]["executedNodes"], 5);
 
         // Flush write-behind executions buffer
         db.flush_executions().await.expect("Flush failed");
@@ -1057,9 +1074,9 @@ async fn test_engine_dag_execution_and_rest_run() {
         assert_eq!(db_exec["data"]["id"], exec_id);
         assert_eq!(db_exec["data"]["status"], "success");
 
-        // Verify Vue Canvas full ITaskData contract across all 4 executed nodes
+        // Verify Vue Canvas full ITaskData contract across all 5 executed nodes
         let run_data = &db_exec["data"]["data"]["resultData"]["runData"];
-        for node_name in ["Trigger", "Branch1", "Branch2", "MergeNodes"] {
+        for node_name in ["Trigger", "Branch1", "Branch2", "MergeNodes", "PostMergeSet"] {
             let task_entry = &run_data[node_name][0];
             assert_eq!(task_entry["executionStatus"], "success");
             assert!(
@@ -1087,6 +1104,20 @@ async fn test_engine_dag_execution_and_rest_run() {
         let b2_found = merge_items.iter().any(|item| item["json"]["branch"] == 2);
         assert!(b1_found, "Branch 1 output must be preserved in MergeNodes");
         assert!(b2_found, "Branch 2 output must be preserved in MergeNodes");
+
+        // Strictly verify per-element array expression evaluation on PostMergeSet
+        let post_merge_items = run_data["PostMergeSet"][0]["data"]["main"][0]
+            .as_array()
+            .expect("PostMergeSet main[0] must be an array");
+        assert_eq!(post_merge_items.len(), 2);
+        let mult1_found = post_merge_items
+            .iter()
+            .any(|item| item["json"]["branch"] == 1 && item["json"]["multiplied"] == 10);
+        let mult2_found = post_merge_items
+            .iter()
+            .any(|item| item["json"]["branch"] == 2 && item["json"]["multiplied"] == 20);
+        assert!(mult1_found, "Per-element expr evaluation: branch 1 multiplied to 10");
+        assert!(mult2_found, "Per-element expr evaluation: branch 2 multiplied to 20");
 
         let _ = std::fs::remove_file(db_path);
     })
@@ -1202,16 +1233,32 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
         let mut nodes = Vec::with_capacity(total_nodes);
         let mut edges = vec![Vec::new(); total_nodes];
 
-        // Build 1,000 parallel independent transform chains
+        let static_set_params = json!({ "step": "processed", "verified": true });
+        let static_if_params = json!({ "value1": 10, "value2": 5, "operation": "largerEqual" });
+        let static_filter_params = json!({ "value1": 10, "value2": 5, "operation": "largerEqual" });
+
+        // Build 1,000 parallel independent real heterogeneous n8n pipelines
         for c in 0..chains_count {
             let base = c * nodes_per_chain;
             for s in 0..nodes_per_chain {
                 let idx = base + s;
+                let (node_type, params) = if s == 0 {
+                    ("n8n-nodes-base.manualTrigger", json!({}))
+                } else {
+                    match idx % 5 {
+                        1 => ("n8n-nodes-base.set", static_set_params.clone()),
+                        2 => ("n8n-nodes-base.if", static_if_params.clone()),
+                        3 => ("n8n-nodes-base.filter", static_filter_params.clone()),
+                        4 => ("n8n-nodes-base.code", json!({})),
+                        _ => ("n8n-nodes-base.set", static_set_params.clone()),
+                    }
+                };
+
                 nodes.push(ArenaNode {
                     id: format!("n_{idx}"),
                     name: format!("Node_{idx}"),
-                    node_type: "n8n-nodes-base.set".to_string(),
-                    parameters: json!({ "chain": c, "step": s }),
+                    node_type: node_type.to_string(),
+                    parameters: params,
                     has_expressions: false,
                 });
 
@@ -1237,7 +1284,7 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
 
         // Initial zero-copy seed payload
         let initial_payload = Arc::new(json!({
-            "benchmark": "1_000_000_nodes_execution",
+            "benchmark": "1_000_000_real_n8n_nodes_execution",
             "zeroCopy": true,
             "mode": "hyperScale"
         }));
@@ -1274,7 +1321,7 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
         );
         println!("========================================================\n");
 
-        // Strict asserts
+        // Strict asserts: 1M nodes and true transformations
         assert_eq!(
             result.executed_nodes, 1_000_000,
             "Must execute exactly 1,000,000 nodes"
@@ -1284,6 +1331,18 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
             exec_ms < 5000,
             "Execution of 1,000,000 nodes took {} ms (must be under 5,000 ms)",
             exec_ms
+        );
+        assert_eq!(
+            result.final_output["step"], "processed",
+            "Final output must contain step == processed"
+        );
+        assert_eq!(
+            result.final_output["verified"], true,
+            "Final output must contain verified == true"
+        );
+        assert_eq!(
+            result.final_output["codeExecuted"], true,
+            "Final output must contain codeExecuted == true"
         );
 
         // Save to SQLite via write-behind buffer and flush
@@ -1525,8 +1584,8 @@ async fn test_conditional_if_node_true_false_branch_routing() {
                         "position": [300, 200],
                         "parameters": {
                             "value1": if is_condition_true { 10 } else { 2 },
-                            "value2": 5,
-                            "operation": "larger"
+                            "value2": 10,
+                            "operation": "largerEqual"
                         }
                     },
                     {
