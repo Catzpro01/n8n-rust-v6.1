@@ -20,6 +20,7 @@ use chrono::Utc;
 use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1596,6 +1597,148 @@ pub async fn stop_execution(
 }
 
 // ---------------------------------------------------------------------------
+// Webhook Trigger Endpoints (/webhook/:path & /webhook-test/:path)
+// ---------------------------------------------------------------------------
+
+pub async fn handle_webhook(
+    State(state): State<Arc<AppState>>,
+    Path(path): Path<String>,
+    headers: axum::http::HeaderMap,
+    axum::extract::Query(query_params): axum::extract::Query<HashMap<String, String>>,
+    body_bytes: axum::body::Bytes,
+) -> impl IntoResponse {
+    let body_val: Value = if body_bytes.is_empty() {
+        json!({})
+    } else {
+        serde_json::from_slice(&body_bytes)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body_bytes).to_string()))
+    };
+
+    let mut headers_obj = serde_json::Map::new();
+    for (k, v) in headers.iter() {
+        if let Ok(v_str) = v.to_str() {
+            headers_obj.insert(k.as_str().to_string(), json!(v_str));
+        }
+    }
+
+    let query_obj = json!(query_params);
+
+    let initial_input = json!({
+        "body": body_val,
+        "headers": headers_obj,
+        "query": query_obj,
+        "webhookPath": path
+    });
+
+    let workflows = match state.db.list_workflows() {
+        Ok(w) => w,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut matched_wf = None;
+    for wf in workflows {
+        if let Some(nodes) = wf.nodes.as_array() {
+            for n in nodes {
+                let n_type = n.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if n_type == "n8n-nodes-base.webhook" {
+                    let n_path = n
+                        .get("parameters")
+                        .and_then(|p| p.get("path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    if n_path == path
+                        || n_path.trim_start_matches('/') == path.trim_start_matches('/')
+                    {
+                        matched_wf = Some(wf);
+                        break;
+                    }
+                }
+            }
+        }
+        if matched_wf.is_some() {
+            break;
+        }
+    }
+
+    let wf = match matched_wf {
+        Some(w) => w,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": format!("Workflow with webhook path '{path}' not found") })),
+            )
+                .into_response();
+        }
+    };
+
+    let graph = match CompiledGraph::compile(&wf.nodes, &wf.connections) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": format!("Failed to compile webhook workflow DAG: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let execution_id = format!("exec-{}", new_id());
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    state
+        .active_executions
+        .insert(execution_id.clone(), Arc::clone(&cancel_token));
+
+    let notifier: Arc<dyn ExecutionNotifier> =
+        Arc::new(PushHubNotifier::new(Arc::clone(&state.push_hub)));
+    let started_at = Utc::now().to_rfc3339();
+
+    let exec_res = match state
+        .engine
+        .execute(
+            &execution_id,
+            Some(&wf.id),
+            &graph,
+            Arc::new(initial_input),
+            Some(notifier),
+            Some(cancel_token),
+        )
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            state.active_executions.remove(&execution_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Webhook execution failure: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    let stopped_at = Utc::now().to_rfc3339();
+    state.active_executions.remove(&execution_id);
+
+    let write_msg = ExecutionWriteMessage {
+        id: execution_id.clone(),
+        workflow_id: Some(wf.id.clone()),
+        status: exec_res.status.clone(),
+        mode: "webhook".to_string(),
+        started_at,
+        stopped_at: Some(stopped_at),
+        data_json: exec_res.payload.clone(),
+    };
+    let _ = state.db.record_execution_async(write_msg);
+
+    (StatusCode::OK, Json(exec_res.final_output)).into_response()
+}
+
+// ---------------------------------------------------------------------------
 // Main Router Assembly
 // ---------------------------------------------------------------------------
 
@@ -1617,6 +1760,12 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/roles", get(list_roles))
         // Real-Time Push & Events
         .route("/rest/push", get(rest_push))
+        // Webhooks Trigger Engine
+        .route("/webhook/{path}", get(handle_webhook).post(handle_webhook))
+        .route(
+            "/webhook-test/{path}",
+            get(handle_webhook).post(handle_webhook),
+        )
         // Node & Credential Types Catalogs
         .route(
             "/rest/node-types",

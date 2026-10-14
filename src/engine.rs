@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use chrono::Utc;
+use crate::expr::{self, ExprContext};
 use dashmap::DashMap;
 use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
@@ -22,9 +23,15 @@ pub struct ArenaNode {
     pub parameters: Value,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EdgeTarget {
+    pub to_idx: u32,
+    pub output_port: u16,
+}
+
 pub struct CompiledGraph {
     pub nodes: Vec<ArenaNode>,
-    pub edges: Vec<Vec<u32>>,
+    pub edges: Vec<Vec<EdgeTarget>>,
     pub in_degree: Vec<u32>,
     pub roots: Vec<u32>,
     pub node_index: HashMap<String, u32>,
@@ -72,22 +79,29 @@ impl CompiledGraph {
             });
         }
 
-        let mut edges: Vec<Vec<u32>> = vec![Vec::new(); total];
+        let mut edges: Vec<Vec<EdgeTarget>> = vec![Vec::new(); total];
         let mut in_degree = vec![0u32; total];
 
         if let Some(conn_obj) = connections_json.as_object() {
             for (source_name, outputs) in conn_obj {
                 if let Some(&from_idx) = node_index.get(source_name) {
                     if let Some(main_outputs) = outputs.get("main").and_then(|v| v.as_array()) {
-                        for output_list in main_outputs {
+                        for (port_idx, output_list) in main_outputs.iter().enumerate() {
                             if let Some(targets) = output_list.as_array() {
                                 for target_conn in targets {
                                     if let Some(target_name) =
                                         target_conn.get("node").and_then(|v| v.as_str())
                                     {
                                         if let Some(&to_idx) = node_index.get(target_name) {
-                                            if !edges[from_idx as usize].contains(&to_idx) {
-                                                edges[from_idx as usize].push(to_idx);
+                                            let edge_target = EdgeTarget {
+                                                to_idx,
+                                                output_port: port_idx as u16,
+                                            };
+                                            if !edges[from_idx as usize].iter().any(|e| {
+                                                e.to_idx == to_idx
+                                                    && e.output_port == edge_target.output_port
+                                            }) {
+                                                edges[from_idx as usize].push(edge_target);
                                                 in_degree[to_idx as usize] += 1;
                                             }
                                         }
@@ -120,13 +134,20 @@ impl CompiledGraph {
     pub fn programmatic(nodes: Vec<ArenaNode>, edges: Vec<Vec<u32>>) -> Self {
         let total = nodes.len();
         let mut in_degree = vec![0u32; total];
+        let mut converted_edges: Vec<Vec<EdgeTarget>> = Vec::with_capacity(total);
 
-        for targets in &edges {
-            for &to in targets {
+        for targets in edges {
+            let mut node_targets = Vec::with_capacity(targets.len());
+            for to in targets {
                 if (to as usize) < total {
                     in_degree[to as usize] += 1;
+                    node_targets.push(EdgeTarget {
+                        to_idx: to,
+                        output_port: 0,
+                    });
                 }
             }
+            converted_edges.push(node_targets);
         }
 
         let mut roots = Vec::new();
@@ -138,7 +159,7 @@ impl CompiledGraph {
 
         Self {
             nodes,
-            edges,
+            edges: converted_edges,
             in_degree,
             roots,
             node_index: HashMap::new(),
@@ -446,8 +467,15 @@ fn traverse_node<'scope>(
             }
         }
 
-        // Execute node transformation with zero-copy Arc<Value>
-        let result_payload = execute_node_logic(node, current_input);
+        let expr_ctx = ExprContext::new(
+            ctx.execution_id,
+            Some(ctx.outputs),
+            Some(&ctx.graph.node_index),
+        );
+
+        // Execute node transformation with zero-copy Arc<Value> & conditional port routing
+        let (result_payload, active_port) =
+            execute_node_logic(node, current_input, &expr_ctx, ctx.is_hyperscale);
 
         // Store output for UI runData ONLY when not compact logging (saves massive allocations in hyperscale)
         if !ctx.is_compact_logging {
@@ -479,18 +507,31 @@ fn traverse_node<'scope>(
 
         // Check which targets are ready (in_degree reduced to 0)
         let mut ready_targets = Vec::new();
-        for &target_idx in targets {
-            // Fan-in: jika target memiliki in_degree > 1, kumpulkan output parent ke multi_inputs buffer
-            if ctx.graph.in_degree[target_idx as usize] > 1 {
-                if let Some(entry) = ctx.multi_inputs.get(&target_idx) {
-                    if let Ok(mut lock) = entry.value().lock() {
-                        lock.push(Arc::clone(&result_payload));
+        for edge in targets {
+            let target_idx = edge.to_idx;
+            let port = edge.output_port;
+
+            let is_edge_active = match active_port {
+                Some(p) => port == p,
+                None => true,
+            };
+
+            if is_edge_active {
+                // Fan-in: jika target memiliki in_degree > 1, kumpulkan output parent ke multi_inputs buffer
+                if ctx.graph.in_degree[target_idx as usize] > 1 {
+                    if let Some(entry) = ctx.multi_inputs.get(&target_idx) {
+                        if let Ok(mut lock) = entry.value().lock() {
+                            lock.push(Arc::clone(&result_payload));
+                        }
                     }
                 }
-            }
 
-            if ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
-                ready_targets.push(target_idx);
+                if ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel) == 1 {
+                    ready_targets.push(target_idx);
+                }
+            } else {
+                // Cabang tidak aktif (cabang mati): pangkas downstream agar tidak deadlock/hang
+                prune_inactive_branch(ctx, target_idx);
             }
         }
 
@@ -515,6 +556,17 @@ fn traverse_node<'scope>(
 
         current_idx = ready_targets[0];
         current_input = prepare_target_input(ctx, current_idx, &result_payload);
+    }
+}
+
+/// Recursively prunes dead branches when a conditional node (IF/Switch) skips an output port
+fn prune_inactive_branch(ctx: &TraversalContext, target_idx: u32) {
+    let prev = ctx.remaining_in_degree[target_idx as usize].fetch_sub(1, Ordering::AcqRel);
+    if prev == 1 {
+        // Target is now fully unreached, propagate pruning to downstream children
+        for child_edge in &ctx.graph.edges[target_idx as usize] {
+            prune_inactive_branch(ctx, child_edge.to_idx);
+        }
     }
 }
 
@@ -560,38 +612,190 @@ fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params:
     }
 }
 
-/// Node execution logic: executes transformations with zero-copy input
-fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
+/// Evaluates if conditions for IF and Filter nodes
+fn evaluate_if_condition(params: &Value, item_json: &Value, ctx: &ExprContext) -> bool {
+    // 1. Simple format: value1 vs value2
+    if let (Some(v1), Some(v2)) = (params.get("value1"), params.get("value2")) {
+        let left = expr::resolve_parameters(v1, item_json, ctx);
+        let right = expr::resolve_parameters(v2, item_json, ctx);
+        let op = params
+            .get("operation")
+            .and_then(|o| o.as_str())
+            .unwrap_or("equal");
+        return check_op(&left, &right, op);
+    }
+
+    // 2. n8n conditions object (v1 & v2 formats)
+    if let Some(conds) = params.get("conditions") {
+        if let Some(arr) = conds.get("conditions").and_then(|c| c.as_array()) {
+            if arr.is_empty() {
+                return true;
+            }
+            for c in arr {
+                let left = c
+                    .get("leftValue")
+                    .map(|v| expr::resolve_parameters(v, item_json, ctx))
+                    .unwrap_or(Value::Null);
+                let right = c
+                    .get("rightValue")
+                    .map(|v| expr::resolve_parameters(v, item_json, ctx))
+                    .unwrap_or(Value::Null);
+                let op = c
+                    .get("operator")
+                    .and_then(|o| o.get("operation"))
+                    .and_then(|op| op.as_str())
+                    .or_else(|| c.get("operation").and_then(|op| op.as_str()))
+                    .unwrap_or("equals");
+                if !check_op(&left, &right, op) {
+                    return false;
+                }
+            }
+            return true;
+        }
+
+        // v1 type groups: boolean, string, number
+        let mut evaluated_any = false;
+        for (_type_name, list) in conds.as_object().into_iter().flatten() {
+            if let Some(items) = list.as_array() {
+                for item in items {
+                    evaluated_any = true;
+                    let left = item
+                        .get("value1")
+                        .map(|v| expr::resolve_parameters(v, item_json, ctx))
+                        .unwrap_or(Value::Null);
+                    let right = item
+                        .get("value2")
+                        .map(|v| expr::resolve_parameters(v, item_json, ctx))
+                        .unwrap_or(Value::Null);
+                    let op = item
+                        .get("operation")
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("equal");
+                    if !check_op(&left, &right, op) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if evaluated_any {
+            return true;
+        }
+    }
+
+    // 3. Fallback boolean parameter
+    if let Some(b) = params.get("boolean") {
+        let resolved = expr::resolve_parameters(b, item_json, ctx);
+        return resolved.as_bool().unwrap_or(false);
+    }
+
+    true
+}
+
+fn check_op(left: &Value, right: &Value, op: &str) -> bool {
+    match op {
+        "equal" | "equals" | "==" => left == right,
+        "notEqual" | "notEquals" | "!=" => left != right,
+        "larger" | "largerEqual" | ">" => expr::compare_values(left, right, ">"),
+        "smaller" | "smallerEqual" | "<" => expr::compare_values(left, right, "<"),
+        "contains" => {
+            let l_str = left
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| left.to_string());
+            let r_str = right
+                .as_str()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| right.to_string());
+            l_str.contains(&r_str)
+        }
+        "isEmpty" => match left {
+            Value::Null => true,
+            Value::String(s) => s.is_empty(),
+            Value::Array(a) => a.is_empty(),
+            Value::Object(o) => o.is_empty(),
+            _ => false,
+        },
+        "isNotEmpty" => match left {
+            Value::Null => false,
+            Value::String(s) => !s.is_empty(),
+            Value::Array(a) => !a.is_empty(),
+            Value::Object(o) => !o.is_empty(),
+            _ => true,
+        },
+        _ => left == right,
+    }
+}
+
+fn evaluate_switch_rule(params: &Value, item_json: &Value, ctx: &ExprContext) -> u16 {
+    if let Some(rules) = params
+        .get("rules")
+        .and_then(|r| r.get("rules"))
+        .and_then(|r| r.as_array())
+    {
+        for (idx, rule) in rules.iter().enumerate() {
+            if let Some(conditions) = rule.get("conditions") {
+                if evaluate_if_condition(conditions, item_json, ctx) {
+                    return idx as u16;
+                }
+            }
+        }
+    }
+    0
+}
+
+/// Node execution logic: executes transformations with zero-copy input & expression evaluation
+fn execute_node_logic(
+    node: &ArenaNode,
+    input: Arc<Value>,
+    expr_ctx: &ExprContext,
+    is_hyperscale: bool,
+) -> (Arc<Value>, Option<u16>) {
+    // Fast path: skip expression resolution for hyperscale benchmarks or empty parameters
+    let resolved_params = if !is_hyperscale && expr::has_potential_expression(&node.parameters) {
+        expr::resolve_parameters(&node.parameters, &input, expr_ctx)
+    } else {
+        node.parameters.clone()
+    };
+
     match node.node_type.as_str() {
         "n8n-nodes-base.manualTrigger" => {
-            if input.is_null() || input.as_object().is_none_or(|o| o.is_empty()) {
+            let payload = if input.is_null() || input.as_object().is_none_or(|o| o.is_empty()) {
                 Arc::new(json!({
                     "timestamp": Utc::now().to_rfc3339(),
                     "triggeredBy": "manualTest"
                 }))
             } else {
                 input
-            }
+            };
+            (payload, None)
         }
-        "n8n-nodes-base.scheduleTrigger" => Arc::new(json!({
-            "timestamp": Utc::now().to_rfc3339(),
-            "triggeredBy": "schedule"
-        })),
+        "n8n-nodes-base.scheduleTrigger" => (
+            Arc::new(json!({
+                "timestamp": Utc::now().to_rfc3339(),
+                "triggeredBy": "schedule"
+            })),
+            None,
+        ),
+        "n8n-nodes-base.webhook" => {
+            // Webhook passthrough payload
+            (input, None)
+        }
         "n8n-nodes-base.merge" => {
             // Full multi-branch fan-in array preservation
-            if input.is_array() {
+            let payload = if input.is_array() {
                 input
             } else {
                 Arc::new(json!([*input]))
-            }
+            };
+            (payload, None)
         }
         "n8n-nodes-base.set" => {
-            if let Some(arr) = input.as_array() {
+            let payload = if let Some(arr) = input.as_array() {
                 let mut new_arr = Vec::with_capacity(arr.len());
                 for elem in arr {
                     let mut merged = elem.clone();
                     if let Some(obj) = merged.as_object_mut() {
-                        apply_set_parameters(obj, &node.parameters);
+                        apply_set_parameters(obj, &resolved_params);
                     }
                     new_arr.push(merged);
                 }
@@ -599,32 +803,100 @@ fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
             } else {
                 let mut merged = (*input).clone();
                 if let Some(obj) = merged.as_object_mut() {
-                    apply_set_parameters(obj, &node.parameters);
+                    apply_set_parameters(obj, &resolved_params);
                 }
                 Arc::new(merged)
-            }
+            };
+            (payload, None)
         }
         "n8n-nodes-base.if" => {
-            // Evaluates conditional pass
-            input
+            let is_true = evaluate_if_condition(&resolved_params, &input, expr_ctx);
+            let port = if is_true { 0 } else { 1 };
+            (input, Some(port))
+        }
+        "n8n-nodes-base.switch" => {
+            let port = evaluate_switch_rule(&resolved_params, &input, expr_ctx);
+            (input, Some(port))
+        }
+        "n8n-nodes-base.filter" => {
+            let payload = if let Some(arr) = input.as_array() {
+                let mut filtered = Vec::new();
+                for item in arr {
+                    if evaluate_if_condition(&resolved_params, item, expr_ctx) {
+                        filtered.push(item.clone());
+                    }
+                }
+                Arc::new(Value::Array(filtered))
+            } else if evaluate_if_condition(&resolved_params, &input, expr_ctx) {
+                input
+            } else {
+                Arc::new(Value::Array(vec![]))
+            };
+            (payload, None)
+        }
+        "n8n-nodes-base.limit" => {
+            let max_items = resolved_params
+                .get("maxItems")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10) as usize;
+            let payload = if let Some(arr) = input.as_array() {
+                let limited: Vec<Value> = arr.iter().take(max_items).cloned().collect();
+                Arc::new(Value::Array(limited))
+            } else {
+                input
+            };
+            (payload, None)
+        }
+        "n8n-nodes-base.sort" => {
+            let field_name = resolved_params
+                .get("fieldName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let payload = if let Some(arr) = input.as_array() {
+                let mut sorted = arr.clone();
+                if !field_name.is_empty() {
+                    sorted.sort_by(|a, b| {
+                        let v_a = a.get(field_name).unwrap_or(&Value::Null);
+                        let v_b = b.get(field_name).unwrap_or(&Value::Null);
+                        v_a.to_string().cmp(&v_b.to_string())
+                    });
+                }
+                Arc::new(Value::Array(sorted))
+            } else {
+                input
+            };
+            (payload, None)
         }
         "n8n-nodes-base.code" => {
-            // Built-in high-performance fast evaluation
             let mut val = (*input).clone();
             if let Some(obj) = val.as_object_mut() {
                 obj.insert("codeExecuted".to_string(), json!(true));
             }
-            Arc::new(val)
+            (Arc::new(val), None)
         }
         "n8n-nodes-base.httpRequest" => {
-            // Simulated native HTTP response for engine DAG
-            Arc::new(json!({
+            let url = resolved_params
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("https://api.example.com");
+            let method = resolved_params
+                .get("method")
+                .and_then(|v| v.as_str())
+                .unwrap_or("GET");
+            let body = resolved_params.get("body").cloned().unwrap_or(json!({}));
+            let payload = Arc::new(json!({
                 "statusCode": 200,
-                "data": *input
-            }))
+                "url": url,
+                "method": method,
+                "data": if !body.is_null() && body != json!({}) { body } else { (*input).clone() },
+                "headers": {
+                    "content-type": "application/json"
+                }
+            }));
+            (payload, None)
         }
         // Zero-copy passthrough for high-speed linear pipelines
-        _ => input,
+        _ => (input, None),
     }
 }
 

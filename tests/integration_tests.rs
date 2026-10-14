@@ -1385,3 +1385,360 @@ async fn test_engine_cancellation_and_watchdog_timeout() {
     .await
     .expect("Test 12 timed out!");
 }
+
+// ---------------------------------------------------------------------------
+// 13. Expression Engine Evaluation ($json, $node, Math, String Methods) Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_expression_engine_json_node_and_math_evaluation() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // Workflow: Trigger -> Node1 (Set { price: 100, qty: 3, name: "rust" })
+        //                   -> Node2 (Set with expressions for total, label, fromNode)
+        let workflow_payload = json!({
+            "name": "Expression Engine Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger",
+                    "name": "Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "typeVersion": 1,
+                    "position": [100, 200]
+                },
+                {
+                    "id": "node-1",
+                    "name": "Node1",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 1,
+                    "position": [300, 200],
+                    "parameters": {
+                        "values": {
+                            "number": [
+                                { "name": "price", "value": 100 },
+                                { "name": "qty", "value": 3 }
+                            ],
+                            "string": [
+                                { "name": "name", "value": "rust" }
+                            ]
+                        }
+                    }
+                },
+                {
+                    "id": "node-2",
+                    "name": "Node2",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 1,
+                    "position": [500, 200],
+                    "parameters": {
+                        "total": "={{ $json.price * $json.qty }}",
+                        "label": "={{ $json.name.toUpperCase() }}",
+                        "fromNode": "={{ $node[\"Node1\"].json.price }}"
+                    }
+                }
+            ],
+            "connections": {
+                "Trigger": {
+                    "main": [
+                        [ { "node": "Node1", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "Node1": {
+                    "main": [
+                        [ { "node": "Node2", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "workflowData": workflow_payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run_res["data"]["status"], "success");
+
+        let node2_output =
+            &run_res["data"]["resultData"]["runData"]["Node2"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(
+            node2_output["total"], 300,
+            "Math expression must evaluate to integer 300"
+        );
+        assert_eq!(
+            node2_output["label"], "RUST",
+            "String method toUpperCase must evaluate to 'RUST'"
+        );
+        assert_eq!(
+            node2_output["fromNode"], 100,
+            "Upstream $node access must resolve price from Node1"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 13 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 14. Conditional Branch Routing (IF Node True/False Port Routing & Pruning) Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_conditional_if_node_true_false_branch_routing() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // Helper to run IF workflow with a given condition
+        let run_if_wf = |is_condition_true: bool| {
+            json!({
+                "name": "Conditional IF Routing Test Pipeline",
+                "nodes": [
+                    {
+                        "id": "node-trigger",
+                        "name": "Trigger",
+                        "type": "n8n-nodes-base.manualTrigger",
+                        "typeVersion": 1,
+                        "position": [100, 200]
+                    },
+                    {
+                        "id": "node-if",
+                        "name": "IfNode",
+                        "type": "n8n-nodes-base.if",
+                        "typeVersion": 1,
+                        "position": [300, 200],
+                        "parameters": {
+                            "value1": if is_condition_true { 10 } else { 2 },
+                            "value2": 5,
+                            "operation": "larger"
+                        }
+                    },
+                    {
+                        "id": "node-true",
+                        "name": "TrueBranch",
+                        "type": "n8n-nodes-base.set",
+                        "typeVersion": 1,
+                        "position": [500, 100],
+                        "parameters": { "result": "passed" }
+                    },
+                    {
+                        "id": "node-false",
+                        "name": "FalseBranch",
+                        "type": "n8n-nodes-base.set",
+                        "typeVersion": 1,
+                        "position": [500, 300],
+                        "parameters": { "result": "failed" }
+                    }
+                ],
+                "connections": {
+                    "Trigger": {
+                        "main": [
+                            [ { "node": "IfNode", "type": "main", "index": 0 } ]
+                        ]
+                    },
+                    "IfNode": {
+                        "main": [
+                            [ { "node": "TrueBranch", "type": "main", "index": 0 } ],
+                            [ { "node": "FalseBranch", "type": "main", "index": 0 } ]
+                        ]
+                    }
+                }
+            })
+        };
+
+        // 1. Run with TRUE condition: TrueBranch must execute, FalseBranch must NOT execute
+        let res_true = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "workflowData": run_if_wf(true) }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_true.status(), StatusCode::OK);
+        let bytes_true = res_true.into_body().collect().await.unwrap().to_bytes();
+        let body_true: serde_json::Value = serde_json::from_slice(&bytes_true).unwrap();
+        let run_data_true = &body_true["data"]["resultData"]["runData"];
+
+        assert!(
+            run_data_true.get("TrueBranch").is_some(),
+            "TrueBranch must be executed when condition is true"
+        );
+        assert!(
+            run_data_true.get("FalseBranch").is_none(),
+            "FalseBranch must be pruned when condition is true"
+        );
+        assert_eq!(
+            run_data_true["TrueBranch"][0]["data"]["main"][0][0]["json"]["result"],
+            "passed"
+        );
+
+        // 2. Run with FALSE condition: FalseBranch must execute, TrueBranch must NOT execute
+        let res_false = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(
+                        json!({ "workflowData": run_if_wf(false) }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_false.status(), StatusCode::OK);
+        let bytes_false = res_false.into_body().collect().await.unwrap().to_bytes();
+        let body_false: serde_json::Value = serde_json::from_slice(&bytes_false).unwrap();
+        let run_data_false = &body_false["data"]["resultData"]["runData"];
+
+        assert!(
+            run_data_false.get("FalseBranch").is_some(),
+            "FalseBranch must be executed when condition is false"
+        );
+        assert!(
+            run_data_false.get("TrueBranch").is_none(),
+            "TrueBranch must be pruned when condition is false"
+        );
+        assert_eq!(
+            run_data_false["FalseBranch"][0]["data"]["main"][0][0]["json"]["result"],
+            "failed"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 14 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 15. Live Webhook Trigger Execution End-to-End Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_live_webhook_trigger_execution_end_to_end() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Create a workflow with Webhook trigger node via POST /rest/workflows
+        let wf_payload = json!({
+            "name": "Order Processing Webhook Workflow",
+            "nodes": [
+                {
+                    "id": "hook-1",
+                    "name": "OrderWebhook",
+                    "type": "n8n-nodes-base.webhook",
+                    "typeVersion": 1,
+                    "position": [100, 200],
+                    "parameters": {
+                        "path": "order-hook",
+                        "httpMethod": "POST"
+                    }
+                },
+                {
+                    "id": "step-2",
+                    "name": "ProcessOrder",
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 1,
+                    "position": [300, 200],
+                    "parameters": {
+                        "orderId": "={{ $json.body.orderId }}",
+                        "status": "confirmed"
+                    }
+                }
+            ],
+            "connections": {
+                "OrderWebhook": {
+                    "main": [
+                        [ { "node": "ProcessOrder", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "settings": { "executionOrder": "v1" }
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let created_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let wf_id = created_wf["data"]["id"].as_str().unwrap().to_string();
+
+        // 2. Invoke POST /webhook/order-hook with order payload
+        let webhook_payload = json!({
+            "orderId": "ORD-999",
+            "amount": 500
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/webhook/order-hook")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(webhook_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let hook_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        // Assert transformed data from workflow
+        assert_eq!(hook_res["orderId"], "ORD-999");
+        assert_eq!(hook_res["status"], "confirmed");
+
+        // Flush write-behind executions and assert recorded mode == "webhook"
+        db.flush_executions().await.expect("Flush executions failed");
+        let exec_list = db.list_executions().expect("List executions failed");
+        let hook_exec = exec_list
+            .iter()
+            .find(|e| {
+                e.mode == "webhook"
+                    && e.workflow_id.as_deref() == Some(&wf_id)
+            })
+            .expect("Webhook execution must be persisted in SQLite with mode == 'webhook'");
+
+        assert_eq!(hook_exec.status, "success");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 15 timed out!");
+}
