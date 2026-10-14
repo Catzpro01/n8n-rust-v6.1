@@ -1,0 +1,6 @@
+/target
+*.sqlite*
+*.db*
+.env
+node_modules/
+../n8n-ref-temp
