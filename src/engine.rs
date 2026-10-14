@@ -449,8 +449,8 @@ fn traverse_node<'scope>(
         // Execute node transformation with zero-copy Arc<Value>
         let result_payload = execute_node_logic(node, current_input);
 
-        // Store output for UI runData (if not compact) or for multi-input joins
-        if !ctx.is_compact_logging || current_idx == (ctx.total_nodes - 1) as u32 {
+        // Store output for UI runData ONLY when not compact logging (saves massive allocations in hyperscale)
+        if !ctx.is_compact_logging {
             ctx.outputs.insert(current_idx, Arc::clone(&result_payload));
         }
 
@@ -518,6 +518,48 @@ fn traverse_node<'scope>(
     }
 }
 
+/// Helper to cleanly extract n8n Set node parameters into top-level json properties
+fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params: &Value) {
+    if let Some(params_obj) = params.as_object() {
+        // 1. Format n8n v1/v2: "values": { "string": [...], "number": [...], "boolean": [...] }
+        if let Some(values_obj) = params_obj.get("values").and_then(|v| v.as_object()) {
+            for type_arr in values_obj.values() {
+                if let Some(arr) = type_arr.as_array() {
+                    for item in arr {
+                        if let (Some(k), Some(v)) =
+                            (item.get("name").and_then(|n| n.as_str()), item.get("value"))
+                        {
+                            target_obj.insert(k.to_string(), v.clone());
+                        }
+                    }
+                }
+            }
+        }
+
+        // 2. Format n8n Edit Fields v3.4: "assignments": { "assignments": [ { "name": k, "value": v, ... } ] }
+        if let Some(assign_arr) = params_obj
+            .get("assignments")
+            .and_then(|a| a.get("assignments"))
+            .and_then(|arr| arr.as_array())
+        {
+            for item in assign_arr {
+                if let (Some(k), Some(v)) =
+                    (item.get("name").and_then(|n| n.as_str()), item.get("value"))
+                {
+                    target_obj.insert(k.to_string(), v.clone());
+                }
+            }
+        }
+
+        // 3. Parameter key-value langsung lainnya (selain internal fields)
+        for (k, v) in params_obj {
+            if k != "values" && k != "assignments" && k != "options" && k != "keepOnlySet" {
+                target_obj.insert(k.clone(), v.clone());
+            }
+        }
+    }
+}
+
 /// Node execution logic: executes transformations with zero-copy input
 fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
     match node.node_type.as_str() {
@@ -549,11 +591,7 @@ fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
                 for elem in arr {
                     let mut merged = elem.clone();
                     if let Some(obj) = merged.as_object_mut() {
-                        if let Some(params) = node.parameters.as_object() {
-                            for (k, v) in params {
-                                obj.insert(k.clone(), v.clone());
-                            }
-                        }
+                        apply_set_parameters(obj, &node.parameters);
                     }
                     new_arr.push(merged);
                 }
@@ -561,11 +599,7 @@ fn execute_node_logic(node: &ArenaNode, input: Arc<Value>) -> Arc<Value> {
             } else {
                 let mut merged = (*input).clone();
                 if let Some(obj) = merged.as_object_mut() {
-                    if let Some(params) = node.parameters.as_object() {
-                        for (k, v) in params {
-                            obj.insert(k.clone(), v.clone());
-                        }
-                    }
+                    apply_set_parameters(obj, &node.parameters);
                 }
                 Arc::new(merged)
             }

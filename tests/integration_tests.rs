@@ -1057,12 +1057,27 @@ async fn test_engine_dag_execution_and_rest_run() {
         assert_eq!(db_exec["data"]["id"], exec_id);
         assert_eq!(db_exec["data"]["status"], "success");
 
-        let merge_items = db_exec["data"]["data"]["resultData"]["runData"]["MergeNodes"][0]["data"]
-            ["main"][0]
+        // Verify Vue Canvas full ITaskData contract across all 4 executed nodes
+        let run_data = &db_exec["data"]["data"]["resultData"]["runData"];
+        for node_name in ["Trigger", "Branch1", "Branch2", "MergeNodes"] {
+            let task_entry = &run_data[node_name][0];
+            assert_eq!(task_entry["executionStatus"], "success");
+            assert!(
+                task_entry["startTime"].as_i64().unwrap_or(0) > 0,
+                "Node {node_name} must have a valid positive startTime timestamp"
+            );
+            assert!(
+                task_entry["executionTime"].as_u64().unwrap_or(0) >= 1,
+                "Node {node_name} must have an executionTime of at least 1ms"
+            );
+            assert!(task_entry["source"].is_array());
+        }
+
+        let merge_items = run_data["MergeNodes"][0]["data"]["main"][0]
             .as_array()
             .expect("MergeNodes main[0] must be an array");
 
-        // Strictly verify that BOTH branch outputs are preserved!
+        // Strictly verify that BOTH branch outputs are preserved with top-level branch properties!
         assert_eq!(
             merge_items.len(),
             2,
