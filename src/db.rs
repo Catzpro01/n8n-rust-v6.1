@@ -271,41 +271,34 @@ impl StorageEngine {
                     }
 
                     if !prepared_records.is_empty() {
-                        let guard = worker_conn.lock();
-                        match guard {
-                            Ok(mut conn) => {
-                                let tx_res = (|| -> Result<()> {
-                                    let tx = conn.transaction_with_behavior(
-                                        rusqlite::TransactionBehavior::Immediate,
-                                    )?;
-                                    {
-                                        let mut stmt = tx.prepare_cached(
-                                            r#"
-                                            INSERT OR REPLACE INTO executions (id, workflow_id, status, mode, started_at, stopped_at, data_zstd)
-                                            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-                                            "#,
-                                        )?;
-                                        for rec in &prepared_records {
-                                            stmt.execute(params![
-                                                rec.0, rec.1, rec.2, rec.3, rec.4, rec.5, rec.6
-                                            ])?;
-                                        }
-                                    }
-                                    tx.commit()?;
-                                    Ok(())
-                                })();
-
-                                if let Err(e) = tx_res {
-                                    error!(
-                                        error = ?e,
-                                        count = prepared_records.len(),
-                                        "Failed to commit batch executions transaction"
-                                    );
+                        let mut conn = worker_conn.lock().unwrap_or_else(|e| e.into_inner());
+                        let tx_res = (|| -> Result<()> {
+                            let tx = conn.transaction_with_behavior(
+                                rusqlite::TransactionBehavior::Immediate,
+                            )?;
+                            {
+                                let mut stmt = tx.prepare_cached(
+                                    r#"
+                                    INSERT OR REPLACE INTO executions (id, workflow_id, status, mode, started_at, stopped_at, data_zstd)
+                                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                                    "#,
+                                )?;
+                                for rec in &prepared_records {
+                                    stmt.execute(params![
+                                        rec.0, rec.1, rec.2, rec.3, rec.4, rec.5, rec.6
+                                    ])?;
                                 }
                             }
-                            Err(e) => {
-                                error!(error = ?e, "Worker failed to acquire db lock for batch insert");
-                            }
+                            tx.commit()?;
+                            Ok(())
+                        })();
+
+                        if let Err(e) = tx_res {
+                            error!(
+                                error = ?e,
+                                count = prepared_records.len(),
+                                "Failed to commit batch executions transaction"
+                            );
                         }
                     }
                 }

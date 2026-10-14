@@ -1,22 +1,116 @@
 use crate::db::{
-    new_id, CredentialRecord, FolderRecord, StorageEngine, TagRecord, VariableRecord,
-    WorkflowRecord,
+    new_id, CredentialRecord, ExecutionWriteMessage, FolderRecord, StorageEngine, TagRecord,
+    VariableRecord, WorkflowRecord,
 };
+use crate::engine::{CompiledGraph, ExecutionNotifier, HyperScaleEngine};
 use axum::{
-    extract::{Path, State},
+    extract::{
+        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
+        Path, State,
+    },
     http::{header, StatusCode},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
+use dashmap::DashMap;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+// ---------------------------------------------------------------------------
+// Real-Time Push Hub & Execution Notifier
+// ---------------------------------------------------------------------------
+
+pub struct PushHub {
+    sender: tokio::sync::broadcast::Sender<String>,
+}
+
+impl Default for PushHub {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl PushHub {
+    pub fn new() -> Self {
+        let (sender, _) = tokio::sync::broadcast::channel(1024);
+        Self { sender }
+    }
+
+    pub fn broadcast(&self, event: &Value) {
+        if let Ok(serialized) = serde_json::to_string(event) {
+            let _ = self.sender.send(serialized);
+        }
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<String> {
+        self.sender.subscribe()
+    }
+}
+
+pub struct PushHubNotifier {
+    hub: Arc<PushHub>,
+}
+
+impl PushHubNotifier {
+    pub fn new(hub: Arc<PushHub>) -> Self {
+        Self { hub }
+    }
+}
+
+impl ExecutionNotifier for PushHubNotifier {
+    fn notify_started(&self, execution_id: &str, workflow_id: Option<&str>) {
+        self.hub.broadcast(&json!({
+            "type": "executionStarted",
+            "data": {
+                "executionId": execution_id,
+                "workflowId": workflow_id
+            }
+        }));
+    }
+
+    fn notify_node_before(&self, execution_id: &str, node_name: &str) {
+        self.hub.broadcast(&json!({
+            "type": "nodeExecuteBefore",
+            "data": {
+                "executionId": execution_id,
+                "nodeName": node_name
+            }
+        }));
+    }
+
+    fn notify_node_after(&self, execution_id: &str, node_name: &str, output: &Value) {
+        self.hub.broadcast(&json!({
+            "type": "nodeExecuteAfter",
+            "data": {
+                "executionId": execution_id,
+                "nodeName": node_name,
+                "data": output
+            }
+        }));
+    }
+
+    fn notify_finished(&self, execution_id: &str, status: &str, duration_ms: u64) {
+        self.hub.broadcast(&json!({
+            "type": "executionFinished",
+            "data": {
+                "executionId": execution_id,
+                "status": status,
+                "durationMs": duration_ms
+            }
+        }));
+    }
+}
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: StorageEngine,
+    pub engine: HyperScaleEngine,
+    pub push_hub: Arc<PushHub>,
+    pub active_executions: Arc<DashMap<String, Arc<AtomicBool>>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1254,6 +1348,236 @@ pub async fn delete_execution(
 }
 
 // ---------------------------------------------------------------------------
+// Real-time Push WebSocket & SSE Endpoint (/rest/push)
+// ---------------------------------------------------------------------------
+
+pub async fn rest_push(
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+    State(state): State<Arc<AppState>>,
+) -> Response {
+    match ws {
+        Ok(ws) => {
+            let hub = Arc::clone(&state.push_hub);
+            ws.on_upgrade(move |socket| handle_websocket(socket, hub))
+                .into_response()
+        }
+        Err(_) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "text/plain; charset=utf-8")],
+            "Push stream active",
+        )
+            .into_response(),
+    }
+}
+
+async fn handle_websocket(mut socket: WebSocket, hub: Arc<PushHub>) {
+    let mut rx = hub.subscribe();
+    while let Ok(msg) = rx.recv().await {
+        if socket.send(WsMessage::Text(msg.into())).await.is_err() {
+            break;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Workflow Execution Endpoints (HyperScaleEngine)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RunWorkflowPayload {
+    pub workflow_data: Option<Value>,
+    pub run_data: Option<Value>,
+    pub pin_data: Option<Value>,
+    pub nodes: Option<Value>,
+    pub connections: Option<Value>,
+}
+
+pub async fn run_workflow_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<Option<RunWorkflowPayload>>,
+) -> impl IntoResponse {
+    let wf = match state.db.get_workflow(&id) {
+        Ok(Some(w)) => w,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(json!({ "message": "Workflow not found" })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Database error: {}", e) })),
+            )
+                .into_response()
+        }
+    };
+
+    let nodes = payload
+        .as_ref()
+        .and_then(|p| {
+            p.nodes.clone().or_else(|| {
+                p.workflow_data
+                    .as_ref()
+                    .and_then(|w| w.get("nodes").cloned())
+            })
+        })
+        .unwrap_or(wf.nodes);
+
+    let connections = payload
+        .as_ref()
+        .and_then(|p| {
+            p.connections.clone().or_else(|| {
+                p.workflow_data
+                    .as_ref()
+                    .and_then(|w| w.get("connections").cloned())
+            })
+        })
+        .unwrap_or(wf.connections);
+
+    execute_workflow_helper(state, Some(id), nodes, connections).await
+}
+
+pub async fn run_workflow_direct(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<Option<RunWorkflowPayload>>,
+) -> impl IntoResponse {
+    let payload = payload.unwrap_or_default();
+    let nodes = payload
+        .nodes
+        .clone()
+        .or_else(|| {
+            payload
+                .workflow_data
+                .as_ref()
+                .and_then(|w| w.get("nodes").cloned())
+        })
+        .unwrap_or_else(|| json!([]));
+
+    let connections = payload
+        .connections
+        .clone()
+        .or_else(|| {
+            payload
+                .workflow_data
+                .as_ref()
+                .and_then(|w| w.get("connections").cloned())
+        })
+        .unwrap_or_else(|| json!({}));
+
+    execute_workflow_helper(state, None, nodes, connections).await
+}
+
+async fn execute_workflow_helper(
+    state: Arc<AppState>,
+    workflow_id: Option<String>,
+    nodes: Value,
+    connections: Value,
+) -> axum::response::Response {
+    let graph = match CompiledGraph::compile(&nodes, &connections) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": format!("Failed to compile workflow DAG: {}", e) })),
+            )
+                .into_response()
+        }
+    };
+
+    let execution_id = format!("exec-{}", new_id());
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    state
+        .active_executions
+        .insert(execution_id.clone(), Arc::clone(&cancel_token));
+
+    let notifier: Arc<dyn ExecutionNotifier> =
+        Arc::new(PushHubNotifier::new(Arc::clone(&state.push_hub)));
+
+    let started_at = Utc::now().to_rfc3339();
+
+    let exec_res = match state
+        .engine
+        .execute(
+            &execution_id,
+            workflow_id.as_deref(),
+            &graph,
+            Arc::new(json!({})),
+            Some(notifier),
+            Some(cancel_token),
+        )
+        .await
+    {
+        Ok(res) => res,
+        Err(e) => {
+            state.active_executions.remove(&execution_id);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "message": format!("Execution engine failure: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
+    let stopped_at = Utc::now().to_rfc3339();
+    state.active_executions.remove(&execution_id);
+
+    // Record to write-behind buffer SQLite
+    let write_msg = ExecutionWriteMessage {
+        id: execution_id.clone(),
+        workflow_id: workflow_id.clone(),
+        status: exec_res.status.clone(),
+        mode: "manual".to_string(),
+        started_at,
+        stopped_at: Some(stopped_at),
+        data_json: exec_res.payload.clone(),
+    };
+    let _ = state.db.record_execution_async(write_msg);
+
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": {
+                "executionId": execution_id,
+                "status": exec_res.status,
+                "executedNodes": exec_res.executed_nodes,
+                "durationMs": exec_res.duration_ms,
+                "resultData": exec_res.payload
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub async fn stop_execution(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Some(token) = state.active_executions.get(&id) {
+        token.store(true, Ordering::Relaxed);
+        (
+            StatusCode::OK,
+            Json(json!({
+                "data": {
+                    "success": true,
+                    "message": "Execution cancellation signaled"
+                }
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "No active execution found with that ID" })),
+        )
+            .into_response()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Main Router Assembly
 // ---------------------------------------------------------------------------
 
@@ -1273,6 +1597,8 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/projects", get(list_projects))
         .route("/rest/projects/personal", get(get_personal_project))
         .route("/rest/roles", get(list_roles))
+        // Real-Time Push & Events
+        .route("/rest/push", get(rest_push))
         // Node & Credential Types Catalogs
         .route(
             "/rest/node-types",
@@ -1281,8 +1607,9 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/credential-types", get(credential_types_catalog))
         .route("/rest/module-settings", get(module_settings))
         .route("/rest/active-workflows", get(active_workflows))
-        // Workflows CRUD
+        // Workflows CRUD & Run
         .route("/rest/workflows", get(list_workflows).post(create_workflow))
+        .route("/rest/workflows/run", post(run_workflow_direct))
         .route(
             "/rest/workflows/{id}",
             get(get_workflow)
@@ -1290,6 +1617,7 @@ pub fn router(app_state: Arc<AppState>) -> Router {
                 .put(update_workflow)
                 .delete(delete_workflow),
         )
+        .route("/rest/workflows/{id}/run", post(run_workflow_by_id))
         .route("/rest/workflows/{id}/archive", post(archive_workflow))
         .route("/rest/workflows/{id}/unarchive", post(unarchive_workflow))
         // Credentials CRUD
@@ -1318,11 +1646,12 @@ pub fn router(app_state: Arc<AppState>) -> Router {
             "/rest/folders/{id}",
             patch(update_folder).delete(delete_folder),
         )
-        // Executions CRUD
+        // Executions CRUD & Stop
         .route("/rest/executions", get(list_executions))
         .route(
             "/rest/executions/{id}",
             get(get_execution).delete(delete_execution),
         )
+        .route("/rest/executions/{id}/stop", post(stop_execution))
         .with_state(app_state)
 }

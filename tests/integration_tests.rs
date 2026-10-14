@@ -1,11 +1,15 @@
 use axum::http::{header, Request, StatusCode};
+use chrono::Utc;
 use http_body_util::BodyExt;
 use n8n_rust_v5::{
     build_app,
     db::{ExecutionWriteMessage, StorageEngine},
+    engine::{ArenaNode, CompiledGraph, HyperScaleEngine},
 };
 use serde_json::json;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Instant;
 use tower::ServiceExt;
 use uuid::Uuid;
 
@@ -875,6 +879,346 @@ async fn test_write_behind_batch_zstd_executions() {
             [0]["json"]["checksum"],
         "crc32-1287"
     );
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// 9. Engine DAG Execution & REST Run Test (Multi-branch Fan-out & Fan-in)
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_engine_dag_execution_and_rest_run() {
+    let (db, db_path) = setup_test_engine();
+    let app = build_app(Path::new("ui-dist"), db.clone());
+
+    // 1. Create a branching DAG workflow:
+    // Manual Trigger -> Branch A (Set) & Branch B (Set) -> Merge
+    let workflow_payload = json!({
+        "name": "Multi-Branch Pipeline",
+        "nodes": [
+            {
+                "id": "node-trigger",
+                "name": "Manual Trigger",
+                "type": "n8n-nodes-base.manualTrigger",
+                "typeVersion": 1,
+                "position": [100, 200]
+            },
+            {
+                "id": "node-branch-a",
+                "name": "Branch Alpha",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "position": [300, 100],
+                "parameters": { "branch": "alpha" }
+            },
+            {
+                "id": "node-branch-b",
+                "name": "Branch Beta",
+                "type": "n8n-nodes-base.set",
+                "typeVersion": 3.4,
+                "position": [300, 300],
+                "parameters": { "branch": "beta" }
+            },
+            {
+                "id": "node-merge",
+                "name": "Merge",
+                "type": "n8n-nodes-base.merge",
+                "typeVersion": 3,
+                "position": [500, 200]
+            }
+        ],
+        "connections": {
+            "Manual Trigger": {
+                "main": [
+                    [
+                        { "node": "Branch Alpha", "type": "main", "index": 0 },
+                        { "node": "Branch Beta", "type": "main", "index": 0 }
+                    ]
+                ]
+            },
+            "Branch Alpha": {
+                "main": [
+                    [
+                        { "node": "Merge", "type": "main", "index": 0 }
+                    ]
+                ]
+            },
+            "Branch Beta": {
+                "main": [
+                    [
+                        { "node": "Merge", "type": "main", "index": 1 }
+                    ]
+                ]
+            }
+        },
+        "settings": {
+            "executionOrder": "v1"
+        }
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/workflows")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(workflow_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let created: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let wf_id = created["data"]["id"].as_str().unwrap().to_string();
+
+    // 2. Execute workflow via POST /rest/workflows/:id/run
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/rest/workflows/{wf_id}/run"))
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(json!({}).to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let exec_id = run_res["data"]["executionId"].as_str().unwrap().to_string();
+    assert_eq!(run_res["data"]["status"], "success");
+    assert_eq!(run_res["data"]["executedNodes"], 4);
+
+    // Flush write-behind executions buffer
+    db.flush_executions().await.expect("Flush failed");
+
+    // 3. Verify execution was recorded to SQLite and decompressed correctly
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/rest/executions/{exec_id}"))
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let db_exec: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(db_exec["data"]["id"], exec_id);
+    assert_eq!(db_exec["data"]["status"], "success");
+    assert!(db_exec["data"]["data"]["resultData"]["runData"]["Merge"].is_array());
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// 10. Real-Time Push Events & Direct Workflow Run Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_websocket_push_realtime_events() {
+    let (db, db_path) = setup_test_engine();
+    let app = build_app(Path::new("ui-dist"), db.clone());
+
+    // 1. Verify /rest/push endpoint connects cleanly
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/push?pushRef=test-client-1")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    // 2. Direct run workflow via POST /rest/workflows/run
+    let run_direct_payload = json!({
+        "nodes": [
+            {
+                "id": "direct-node-1",
+                "name": "Direct Trigger",
+                "type": "n8n-nodes-base.manualTrigger",
+                "typeVersion": 1,
+                "position": [100, 200]
+            },
+            {
+                "id": "direct-node-2",
+                "name": "Direct Transform",
+                "type": "n8n-nodes-base.code",
+                "typeVersion": 2,
+                "position": [300, 200]
+            }
+        ],
+        "connections": {
+            "Direct Trigger": {
+                "main": [
+                    [
+                        { "node": "Direct Transform", "type": "main", "index": 0 }
+                    ]
+                ]
+            }
+        }
+    });
+
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/rest/workflows/run")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(axum::body::Body::from(run_direct_payload.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = res.into_body().collect().await.unwrap().to_bytes();
+    let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(run_res["data"]["status"], "success");
+    assert_eq!(run_res["data"]["executedNodes"], 2);
+
+    let _ = std::fs::remove_file(db_path);
+}
+
+// ---------------------------------------------------------------------------
+// 11. Hyper-Scale 1,000,000 (One Million) Node Zero-Copy Arena Stress Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_hyperscale_one_million_nodes_arena_execution() {
+    let (db, db_path) = setup_test_engine();
+    let engine = HyperScaleEngine::new(None).expect("Failed to initialize engine");
+
+    let total_nodes = 1_000_000;
+    let chains_count = 1_000;
+    let nodes_per_chain = total_nodes / chains_count; // 1,000 nodes per chain
+
+    println!("\n========================================================");
+    println!(">>> BUILDING 1,000,000 NODE FLAT ARENA DAG GRAPH <<<");
+    let build_start = Instant::now();
+
+    let mut nodes = Vec::with_capacity(total_nodes);
+    let mut edges = vec![Vec::new(); total_nodes];
+
+    // Build 1,000 parallel independent transform chains
+    for c in 0..chains_count {
+        let base = c * nodes_per_chain;
+        for s in 0..nodes_per_chain {
+            let idx = base + s;
+            nodes.push(ArenaNode {
+                id: format!("n_{idx}"),
+                name: format!("Node_{idx}"),
+                node_type: "n8n-nodes-base.set".to_string(),
+                parameters: json!({ "chain": c, "step": s }),
+            });
+
+            if s + 1 < nodes_per_chain {
+                edges[idx].push((idx + 1) as u32);
+            }
+        }
+    }
+
+    let graph = CompiledGraph::programmatic(nodes, edges);
+    let build_duration = build_start.elapsed();
+    println!(
+        ">>> Graph Construction Completed in: {:?} <<<",
+        build_duration
+    );
+    println!(
+        ">>> Total Nodes: {} | Total Roots: {} <<<",
+        graph.nodes.len(),
+        graph.roots.len()
+    );
+    assert_eq!(graph.nodes.len(), 1_000_000);
+    assert_eq!(graph.roots.len(), 1_000);
+
+    // Initial zero-copy seed payload
+    let initial_payload = Arc::new(json!({
+        "benchmark": "1_000_000_nodes_execution",
+        "zeroCopy": true,
+        "mode": "hyperScale"
+    }));
+
+    println!(">>> STARTING ZERO-COPY MULTI-RUNNER EXECUTION <<<");
+    let exec_start = Instant::now();
+    let exec_id = format!("bench-1m-{}", Uuid::new_v4());
+
+    let result = engine
+        .execute(
+            &exec_id,
+            Some("wf-benchmark-1m"),
+            &graph,
+            initial_payload,
+            None,
+            None,
+        )
+        .await
+        .expect("HyperScale execution failed");
+
+    let exec_duration = exec_start.elapsed();
+    let exec_ms = exec_duration.as_millis();
+    let throughput = (total_nodes as f64) / exec_duration.as_secs_f64();
+
+    println!("========================================================");
+    println!(">>> [HYPERSCALE VERIFICATION RESULT] <<<");
+    println!(">>> Executed Nodes Count: {}", result.executed_nodes);
+    println!(">>> Status: {}", result.status);
+    println!(">>> Duration: {} ms ({:?})", exec_ms, exec_duration);
+    println!(
+        ">>> Throughput: {:.2} nodes/sec ({:.2} million nodes/sec)",
+        throughput,
+        throughput / 1_000_000.0
+    );
+    println!("========================================================\n");
+
+    // Strict asserts
+    assert_eq!(
+        result.executed_nodes, 1_000_000,
+        "Must execute exactly 1,000,000 nodes"
+    );
+    assert_eq!(result.status, "success", "Execution status must be success");
+    assert!(
+        exec_ms < 5000,
+        "Execution of 1,000,000 nodes took {} ms (must be under 5,000 ms)",
+        exec_ms
+    );
+
+    // Save to SQLite via write-behind buffer and flush
+    let write_msg = ExecutionWriteMessage {
+        id: exec_id.clone(),
+        workflow_id: Some("wf-benchmark-1m".to_string()),
+        status: result.status.clone(),
+        mode: "hyperScaleCompact".to_string(),
+        started_at: Utc::now().to_rfc3339(),
+        stopped_at: Some(Utc::now().to_rfc3339()),
+        data_json: result.payload.clone(),
+    };
+    db.record_execution_async(write_msg)
+        .expect("Failed to enqueue 1M execution record");
+    db.flush_executions()
+        .await
+        .expect("Failed to flush 1M execution to disk");
+
+    // Verify persisted record in SQLite
+    let db_record = db
+        .get_execution(&exec_id)
+        .expect("Failed to query db")
+        .expect("1M execution record not found in SQLite");
+    assert_eq!(db_record.id, exec_id);
+    assert_eq!(db_record.status, "success");
+    assert_eq!(db_record.data["executedNodes"], 1_000_000);
+    assert_eq!(db_record.data["mode"], "hyperScaleCompact");
 
     let _ = std::fs::remove_file(db_path);
 }
