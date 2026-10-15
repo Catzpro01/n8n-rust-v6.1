@@ -2526,7 +2526,96 @@ async fn test_sub_workflow_execution_and_recursion_guard() {
         assert_eq!(sub_run_data["sub_executed"], true);
         assert_eq!(sub_run_data["multiplier"], 42);
 
-        // B. Recursion Depth Guard: Circular Sub-Workflow Calling Itself (> 10 levels)
+        // B. Real End-to-End Test: Create sub-workflow via REST POST /rest/workflows, then execute it by workflowId
+        let db_subwf_payload = json!({
+            "name": "Database Sub-Workflow",
+            "active": true,
+            "nodes": [
+                {
+                    "id": "db-sub-1",
+                    "name": "DB Sub Node",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "from_db_subwf": true,
+                        "value": 999
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_create_sub = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(db_subwf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_sub.status(), StatusCode::OK);
+        let bytes_create = res_create_sub.into_body().collect().await.unwrap().to_bytes();
+        let create_res: serde_json::Value = serde_json::from_slice(&bytes_create).unwrap();
+        let created_sub_id = create_res["data"]["id"].as_str().unwrap().to_string();
+
+        let parent_db_payload = json!({
+            "nodes": [
+                {
+                    "id": "p-trig",
+                    "name": "Parent Trig",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "p-sub-exec",
+                    "name": "Execute DB SubWF",
+                    "type": "n8n-nodes-base.executeWorkflow",
+                    "parameters": {
+                        "workflowId": created_sub_id
+                    }
+                }
+            ],
+            "connections": {
+                "Parent Trig": {
+                    "main": [
+                        [
+                            {
+                                "node": "Execute DB SubWF",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let res_run_db_sub = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(parent_db_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_db_sub.status(), StatusCode::OK);
+        let bytes_db_sub = res_run_db_sub.into_body().collect().await.unwrap().to_bytes();
+        let run_db_res: serde_json::Value = serde_json::from_slice(&bytes_db_sub).unwrap();
+        assert_eq!(run_db_res["data"]["status"], "success");
+        let db_sub_data = &run_db_res["data"]["resultData"]["runData"]["Execute DB SubWF"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(db_sub_data["from_db_subwf"], true);
+        assert_eq!(db_sub_data["value"], 999);
+
+        // C. Recursion Depth Guard: Circular Sub-Workflow Calling Itself (> 10 levels)
         let circular_sub_id = "circular-loop-subwf";
         let circular_wf = json!({
             "nodes": [
@@ -2601,6 +2690,60 @@ async fn test_sub_workflow_execution_and_recursion_guard() {
             "Expected recursion guard error message, got: {}",
             error_msg
         );
+
+        // D. Test continueOnFail: true on sub-workflow recursion failure
+        let parent_loop_cof_payload = json!({
+            "nodes": [
+                {
+                    "id": "trigger-cof",
+                    "name": "Loop Trigger COF",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "loop-exec-cof",
+                    "name": "Loop SubWorkflow COF",
+                    "type": "n8n-nodes-base.executeWorkflow",
+                    "parameters": {
+                        "workflowId": circular_sub_id,
+                        "continueOnFail": true
+                    }
+                }
+            ],
+            "connections": {
+                "Loop Trigger COF": {
+                    "main": [
+                        [
+                            {
+                                "node": "Loop SubWorkflow COF",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let res_loop_cof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(parent_loop_cof_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_loop_cof.status(), StatusCode::OK);
+        let bytes_loop_cof = res_loop_cof.into_body().collect().await.unwrap().to_bytes();
+        let loop_cof_res: serde_json::Value = serde_json::from_slice(&bytes_loop_cof).unwrap();
+        assert_eq!(loop_cof_res["data"]["status"], "success");
+        let cof_entry = &loop_cof_res["data"]["resultData"]["runData"]["Loop SubWorkflow COF"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(cof_entry["continueOnFail"], true);
 
         let _ = std::fs::remove_file(db_path);
     })

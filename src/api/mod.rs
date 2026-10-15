@@ -586,6 +586,18 @@ pub fn get_core_node_types_array() -> Value {
             "inputs": ["main", "main"],
             "outputs": ["main"],
             "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.executeWorkflow",
+            "displayName": "Execute Workflow",
+            "icon": "fa:sitemap",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Executes another workflow and returns its output",
+            "defaults": { "name": "Execute Workflow" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
         }
     ])
 }
@@ -998,7 +1010,13 @@ pub async fn create_workflow(
     };
 
     match state.db.insert_or_update_workflow(&wf) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+        Ok(()) => {
+            crate::engine::register_subworkflow(
+                &wf.id,
+                json!({ "nodes": wf.nodes, "connections": wf.connections }),
+            );
+            (StatusCode::OK, Json(json!({ "data": wf }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1050,7 +1068,13 @@ pub async fn update_workflow(
     };
 
     match state.db.insert_or_update_workflow(&updated) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": updated }))).into_response(),
+        Ok(()) => {
+            crate::engine::register_subworkflow(
+                &updated.id,
+                json!({ "nodes": updated.nodes, "connections": updated.connections }),
+            );
+            (StatusCode::OK, Json(json!({ "data": updated }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1064,7 +1088,10 @@ pub async fn delete_workflow(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.delete_workflow(&id) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(true) => {
+            crate::engine::unregister_subworkflow(&id);
+            (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Workflow not found" })),

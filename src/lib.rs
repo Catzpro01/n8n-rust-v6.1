@@ -18,6 +18,15 @@ use tower_http::trace::TraceLayer;
 
 /// Build the root Axum application with all API and Web static/SPA routes
 pub fn build_app(ui_dist_path: &Path, db: StorageEngine) -> Router {
+    if let Ok(workflows) = db.list_workflows() {
+        for wf in workflows {
+            engine::register_subworkflow(
+                &wf.id,
+                serde_json::json!({ "nodes": wf.nodes, "connections": wf.connections }),
+            );
+        }
+    }
+
     let engine = HyperScaleEngine::new(None)
         .unwrap_or_else(|e| panic!("Failed to initialize HyperScaleEngine: {e}"));
     let push_hub = Arc::new(PushHub::new());

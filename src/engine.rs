@@ -67,6 +67,12 @@ pub fn get_subworkflow(workflow_id: &str) -> Option<Value> {
     registry.get(workflow_id).map(|v| v.clone())
 }
 
+pub fn unregister_subworkflow(workflow_id: &str) {
+    if let Some(registry) = SUBWORKFLOW_REGISTRY.get() {
+        registry.remove(workflow_id);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArenaNode {
     pub id: String,
@@ -1253,16 +1259,25 @@ fn execute_node_logic(
             (Arc::new(res), None)
         }
         NodeKind::ExecuteWorkflow => {
+            let continue_on_fail = params_ref
+                .get("continueOnFail")
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    params_ref
+                        .get("options")
+                        .and_then(|o| o.get("continueOnFail"))
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(false);
+
             if subworkflow_depth >= 10 {
-                return (
-                    Arc::new(json!({
-                        "__node_error": true,
-                        "error": {
-                            "message": "Exceeded maximum sub-workflow recursion depth (10)"
-                        }
-                    })),
-                    None,
-                );
+                let err_res = json!({
+                    "__node_error": true,
+                    "error": {
+                        "message": "Exceeded maximum sub-workflow recursion depth (10)"
+                    }
+                });
+                return wrap_continue_on_fail(err_res, continue_on_fail);
             }
 
             let workflow_val = if let Some(wf) = params_ref.get("workflow") {
@@ -1274,15 +1289,13 @@ fn execute_node_logic(
             };
 
             let Some(wf_val) = workflow_val else {
-                return (
-                    Arc::new(json!({
-                        "__node_error": true,
-                        "error": {
-                            "message": "Sub-workflow not found or missing workflowId/workflow parameter"
-                        }
-                    })),
-                    None,
-                );
+                let err_res = json!({
+                    "__node_error": true,
+                    "error": {
+                        "message": "Sub-workflow not found or missing workflowId/workflow parameter"
+                    }
+                });
+                return wrap_continue_on_fail(err_res, continue_on_fail);
             };
 
             let empty_arr = Value::Array(vec![]);
@@ -1293,22 +1306,49 @@ fn execute_node_logic(
             let compiled = match CompiledGraph::compile(nodes_val, conns_val) {
                 Ok(c) => c,
                 Err(e) => {
-                    return (
-                        Arc::new(json!({
-                            "__node_error": true,
-                            "error": {
-                                "message": format!("Failed to compile sub-workflow: {}", e)
-                            }
-                        })),
-                        None,
-                    );
+                    let err_res = json!({
+                        "__node_error": true,
+                        "error": {
+                            "message": format!("Failed to compile sub-workflow: {}", e)
+                        }
+                    });
+                    return wrap_continue_on_fail(err_res, continue_on_fail);
                 }
             };
 
-            execute_subworkflow(&compiled, Arc::clone(&input), subworkflow_depth + 1)
+            let (sub_out, port) =
+                execute_subworkflow(&compiled, Arc::clone(&input), subworkflow_depth + 1);
+
+            if continue_on_fail {
+                let is_err = sub_out
+                    .as_object()
+                    .and_then(|o| o.get("__node_error"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if is_err {
+                    let mut modified = (*sub_out).clone();
+                    if let Some(obj) = modified.as_object_mut() {
+                        obj.remove("__node_error");
+                        obj.insert("continueOnFail".to_string(), json!(true));
+                    }
+                    return (Arc::new(modified), port);
+                }
+            }
+
+            (sub_out, port)
         }
         _ => (input, None),
     }
+}
+
+fn wrap_continue_on_fail(mut val: Value, continue_on_fail: bool) -> (Arc<Value>, Option<u16>) {
+    if continue_on_fail {
+        if let Some(obj) = val.as_object_mut() {
+            obj.remove("__node_error");
+            obj.insert("continueOnFail".to_string(), json!(true));
+        }
+    }
+    (Arc::new(val), None)
 }
 
 pub fn execute_subworkflow(
@@ -1379,13 +1419,22 @@ pub fn execute_subworkflow(
 
     if has_error.load(Ordering::Relaxed) {
         let mut err_obj = (*final_output).clone();
-        if !err_obj
-            .as_object()
-            .is_some_and(|o| o.contains_key("__node_error"))
-        {
-            if let Some(obj) = err_obj.as_object_mut() {
-                obj.insert("__node_error".to_string(), json!(true));
+        if let Some(obj) = err_obj.as_object_mut() {
+            obj.insert("__node_error".to_string(), json!(true));
+            if !obj.contains_key("error") {
+                obj.insert(
+                    "error".to_string(),
+                    json!({ "message": "Sub-workflow execution failed" }),
+                );
             }
+        } else {
+            err_obj = json!({
+                "__node_error": true,
+                "error": {
+                    "message": "Sub-workflow execution failed"
+                },
+                "data": err_obj
+            });
         }
         (Arc::new(err_obj), None)
     } else {
