@@ -4,7 +4,7 @@ use http_body_util::BodyExt;
 use n8n_rust_v5::{
     build_app,
     db::{ExecutionWriteMessage, StorageEngine},
-    engine::{ArenaNode, CompiledGraph, HyperScaleEngine},
+    engine::{ArenaNode, CompiledGraph, HyperScaleEngine, NodeKind},
 };
 use serde_json::json;
 use std::path::Path;
@@ -1260,6 +1260,7 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
                     node_type: node_type.to_string(),
                     parameters: params,
                     has_expressions: false,
+                    kind: NodeKind::from_type_str(node_type),
                 });
 
                 if s + 1 < nodes_per_chain {
@@ -1393,6 +1394,7 @@ async fn test_engine_cancellation_and_watchdog_timeout() {
                 node_type: "n8n-nodes-base.manualTrigger".to_string(),
                 parameters: json!({}),
                 has_expressions: false,
+                kind: NodeKind::ManualTrigger,
             },
             ArenaNode {
                 id: "c2".to_string(),
@@ -1400,6 +1402,7 @@ async fn test_engine_cancellation_and_watchdog_timeout() {
                 node_type: "n8n-nodes-base.set".to_string(),
                 parameters: json!({ "v": 1 }),
                 has_expressions: false,
+                kind: NodeKind::Set,
             },
         ];
         let edges = vec![vec![1], vec![]];
@@ -1496,7 +1499,9 @@ async fn test_expression_engine_json_node_and_math_evaluation() {
                     "parameters": {
                         "total": "={{ $json.price * $json.qty }}",
                         "label": "={{ $json.name.toUpperCase() }}",
-                        "fromNode": "={{ $node[\"Node1\"].json.price }}"
+                        "fromNode": "={{ $node[\"Node1\"].json.price }}",
+                        "isMatch": "={{ $json.price > 50 && $json.qty == 3 }}",
+                        "isEither": "={{ $json.price < 50 || $json.qty == 3 }}"
                     }
                 }
             ],
@@ -1547,6 +1552,14 @@ async fn test_expression_engine_json_node_and_math_evaluation() {
         assert_eq!(
             node2_output["fromNode"], 100,
             "Upstream $node access must resolve price from Node1"
+        );
+        assert_eq!(
+            node2_output["isMatch"], true,
+            "Boolean && operator expression must evaluate to true"
+        );
+        assert_eq!(
+            node2_output["isEither"], true,
+            "Boolean || operator expression must evaluate to true"
         );
 
         let _ = std::fs::remove_file(db_path);
@@ -1688,6 +1701,54 @@ async fn test_conditional_if_node_true_false_branch_routing() {
             run_data_false["FalseBranch"][0]["data"]["main"][0][0]["json"]["result"],
             "failed"
         );
+
+        // 3. Test Sort node directly via HyperScaleEngine with numeric values and descending order
+        let sort_engine = HyperScaleEngine::new(Some(2)).expect("Sort engine init failed");
+        let sort_nodes = vec![
+            ArenaNode {
+                id: "s1".to_string(),
+                name: "SortTrigger".to_string(),
+                node_type: "n8n-nodes-base.manualTrigger".to_string(),
+                parameters: json!({}),
+                has_expressions: false,
+                kind: NodeKind::ManualTrigger,
+            },
+            ArenaNode {
+                id: "s2".to_string(),
+                name: "SortNode".to_string(),
+                node_type: "n8n-nodes-base.sort".to_string(),
+                parameters: json!({
+                    "fieldName": "score",
+                    "descending": true
+                }),
+                has_expressions: false,
+                kind: NodeKind::Sort,
+            },
+        ];
+        let sort_edges = vec![vec![1], vec![]];
+        let sort_graph = CompiledGraph::programmatic(sort_nodes, sort_edges);
+        let sort_input = Arc::new(json!([
+            { "score": 10, "name": "ten" },
+            { "score": 100, "name": "hundred" },
+            { "score": 25, "name": "twenty-five" }
+        ]));
+        let sort_res = sort_engine
+            .execute(
+                &format!("exec-sort-{}", Uuid::new_v4()),
+                Some("wf-sort-test"),
+                &sort_graph,
+                sort_input,
+                None,
+                None,
+            )
+            .await
+            .expect("Sort engine execution failed");
+
+        assert_eq!(sort_res.status, "success");
+        let sorted_arr = sort_res.final_output.as_array().expect("Output must be array");
+        assert_eq!(sorted_arr[0]["score"], 100);
+        assert_eq!(sorted_arr[1]["score"], 25);
+        assert_eq!(sorted_arr[2]["score"], 10);
 
         let _ = std::fs::remove_file(db_path);
     })
