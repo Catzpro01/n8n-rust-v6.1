@@ -312,6 +312,7 @@ impl HyperScaleEngine {
         }
 
         // Initialize atomic in-degrees
+        // Initialize atomic in-degrees
         let remaining_in_degree: Vec<AtomicU32> =
             graph.in_degree.iter().map(|&d| AtomicU32::new(d)).collect();
 
@@ -1092,19 +1093,139 @@ fn execute_node_logic(
                 .get("method")
                 .and_then(|v| v.as_str())
                 .unwrap_or("GET");
-            let body = params_ref.get("body").cloned().unwrap_or(json!({}));
-            let payload = Arc::new(json!({
-                "statusCode": 200,
-                "url": url,
-                "method": method,
-                "data": if !body.is_null() && body != json!({}) { body } else { (*input).clone() },
-                "headers": {
-                    "content-type": "application/json"
-                }
-            }));
-            (payload, None)
+            let headers = params_ref.get("headers");
+            let body = params_ref.get("body").or_else(|| params_ref.get("data"));
+            let res = execute_real_http_request(url, method, headers, body);
+            (Arc::new(res), None)
         }
         _ => (input, None),
+    }
+}
+
+fn execute_real_http_request(
+    url: &str,
+    method: &str,
+    headers_val: Option<&Value>,
+    body_val: Option<&Value>,
+) -> Value {
+    if url.is_empty() {
+        return json!({
+            "statusCode": 400,
+            "url": url,
+            "method": method,
+            "error": "URL cannot be empty",
+            "data": Value::Null
+        });
+    }
+
+    let url_owned = url.to_string();
+    let method_owned = method.to_string();
+    let headers_owned = headers_val.cloned();
+    let body_owned = body_val.cloned();
+
+    let runner = move || {
+        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+            Ok(r) => r,
+            Err(e) => {
+                return json!({
+                    "statusCode": 500,
+                    "url": url_owned,
+                    "method": method_owned,
+                    "error": format!("Runtime init error: {e}"),
+                    "data": Value::Null
+                });
+            }
+        };
+
+        rt.block_on(async move {
+            let client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    return json!({
+                        "statusCode": 500,
+                        "url": url_owned,
+                        "method": method_owned,
+                        "error": format!("HTTP client initialization failed: {e}"),
+                        "data": Value::Null
+                    });
+                }
+            };
+
+            let req_method = match method_owned.to_ascii_uppercase().as_str() {
+                "POST" => reqwest::Method::POST,
+                "PUT" => reqwest::Method::PUT,
+                "DELETE" => reqwest::Method::DELETE,
+                "PATCH" => reqwest::Method::PATCH,
+                "HEAD" => reqwest::Method::HEAD,
+                "OPTIONS" => reqwest::Method::OPTIONS,
+                _ => reqwest::Method::GET,
+            };
+
+            let mut req = client.request(req_method, &url_owned);
+
+            if let Some(h_obj) = headers_owned.as_ref().and_then(|h| h.as_object()) {
+                for (k, v) in h_obj {
+                    if let Some(v_str) = v.as_str() {
+                        req = req.header(k.as_str(), v_str);
+                    }
+                }
+            }
+
+            if let Some(ref b) = body_owned {
+                if !b.is_null() && b != &json!({}) {
+                    req = req.json(b);
+                }
+            }
+
+            match req.send().await {
+                Ok(resp) => {
+                    let status = resp.status().as_u16();
+                    let mut resp_headers = serde_json::Map::new();
+                    for (k, v) in resp.headers() {
+                        if let Ok(v_str) = v.to_str() {
+                            resp_headers.insert(k.as_str().to_string(), Value::String(v_str.to_string()));
+                        }
+                    }
+                    let body_json = match resp.json::<Value>().await {
+                        Ok(j) => j,
+                        Err(_) => Value::Null,
+                    };
+                    json!({
+                        "statusCode": status,
+                        "url": url_owned,
+                        "method": method_owned,
+                        "headers": Value::Object(resp_headers),
+                        "data": body_json
+                    })
+                }
+                Err(e) => {
+                    json!({
+                        "statusCode": 502,
+                        "url": url_owned,
+                        "method": method_owned,
+                        "error": e.to_string(),
+                        "data": Value::Null
+                    })
+                }
+            }
+        })
+    };
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        std::thread::spawn(runner).join().unwrap_or_else(|_| {
+            json!({
+                "statusCode": 500,
+                "url": url,
+                "method": method,
+                "error": "Thread execution panicked",
+                "data": Value::Null
+            })
+        })
+    } else {
+        runner()
     }
 }
 
@@ -1113,3 +1234,4 @@ fn num_cpus_available() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
 }
+

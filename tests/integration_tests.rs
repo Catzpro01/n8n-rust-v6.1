@@ -1864,3 +1864,343 @@ async fn test_live_webhook_trigger_execution_end_to_end() {
     .await
     .expect("Test 15 timed out!");
 }
+
+// ---------------------------------------------------------------------------
+// 16. Spatial LOD Viewport & Clustering Engine Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_spatial_lod_viewport_clustering() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
+
+        // 1. Create a workflow with 10 nodes:
+        // 2 nodes inside viewport [0..500, 0..500], 8 nodes outside in clusters
+        let mut nodes = Vec::new();
+        // 2 inside
+        nodes.push(json!({
+            "id": "node-in-1",
+            "name": "Node Inside 1",
+            "type": "n8n-nodes-base.manualTrigger",
+            "position": [100.0, 100.0]
+        }));
+        nodes.push(json!({
+            "id": "node-in-2",
+            "name": "Node Inside 2",
+            "type": "n8n-nodes-base.set",
+            "position": [200.0, 200.0]
+        }));
+
+        // 4 nodes in cluster grid (4, 4) -> position [2100, 2100]
+        for i in 1..=4 {
+            nodes.push(json!({
+                "id": format!("node-out-a-{}", i),
+                "name": format!("Node Out A {}", i),
+                "type": "n8n-nodes-base.set",
+                "position": [2050.0 + (i as f64) * 10.0, 2050.0 + (i as f64) * 10.0]
+            }));
+        }
+
+        // 4 nodes in cluster grid (6, 6) -> position [3100, 3100]
+        for i in 1..=4 {
+            nodes.push(json!({
+                "id": format!("node-out-b-{}", i),
+                "name": format!("Node Out B {}", i),
+                "type": "n8n-nodes-base.set",
+                "position": [3050.0 + (i as f64) * 10.0, 3050.0 + (i as f64) * 10.0]
+            }));
+        }
+
+        let wf_payload = json!({
+            "name": "Spatial LOD Test Workflow",
+            "nodes": nodes,
+            "connections": {}
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let created_wf: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let wf_id = created_wf["data"]["id"].as_str().unwrap().to_string();
+
+        // 2. Query spatial map with viewport [0..500, 0..500] and gridSize 500
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}/spatial-map?minX=0&maxX=500&minY=0&maxY=500&gridSize=500"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let spatial_map: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let data = &spatial_map["data"];
+
+        assert_eq!(data["totalOriginalNodes"], 10);
+        assert!(data["renderedNodes"].as_u64().unwrap() < 10);
+        assert_eq!(data["isClustered"], true);
+
+        // Verify presence of cluster super-nodes
+        let rendered_nodes = data["nodes"].as_array().unwrap();
+        let has_cluster = rendered_nodes.iter().any(|n| {
+            n.get("type").and_then(|t| t.as_str()) == Some("n8n-nodes-base.clusterSuperNode")
+        });
+        assert!(has_cluster, "Spatial map must include clusterSuperNode");
+
+        // 3. Query get_workflow with viewport=true
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}?viewport=true&minX=0&maxX=500&minY=0&maxY=500&gridSize=500"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let wf_resp: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(wf_resp["data"]["meta"]["lodClustered"], true);
+        assert_eq!(wf_resp["data"]["meta"]["totalOriginalNodes"], 10);
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 16 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 17. Community Packages Registry & Dynamic Node Types Merge Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_community_packages_registry_and_node_types_merge() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
+
+        // 1. Install custom community package
+        let pkg_payload = json!({
+            "name": "n8n-nodes-custom-crm",
+            "version": "1.2.0",
+            "author": "Community Developer",
+            "description": "Custom CRM integration nodes",
+            "manifest": {
+                "nodeTypes": [
+                    {
+                        "name": "n8n-nodes-custom-crm.leadCreator",
+                        "displayName": "CRM Lead Creator",
+                        "group": ["action"],
+                        "version": 1,
+                        "description": "Creates a lead in custom CRM"
+                    }
+                ]
+            }
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/community-packages")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(pkg_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let installed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(installed["data"]["name"], "n8n-nodes-custom-crm");
+
+        // 2. List community packages
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/community-packages")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let pkgs = list["data"].as_array().unwrap();
+        assert!(pkgs.iter().any(|p| p["name"] == "n8n-nodes-custom-crm"));
+
+        // 3. Verify node-types catalog dynamically includes custom CRM node
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/node-types")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let catalog: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let nodes = catalog["data"].as_array().unwrap();
+        let has_custom_node = nodes.iter().any(|n| {
+            n.get("name").and_then(|name| name.as_str()) == Some("n8n-nodes-custom-crm.leadCreator")
+        });
+        assert!(has_custom_node, "Catalog must dynamically merge community nodes");
+
+        // 4. Delete community package
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/community-packages/n8n-nodes-custom-crm")
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 17 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 18. Real HTTP Client & Active Workflow ScheduleTrigger Daemon Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_real_http_client_and_schedule_daemon() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Direct execution of HttpRequest node (testing graceful networking and expression resolution)
+        let http_wf_payload = json!({
+            "nodes": [
+                {
+                    "id": "http-1",
+                    "name": "HTTP Request Node",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": "http://127.0.0.1:5678/healthz",
+                        "method": "GET"
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(http_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run_res["data"]["status"], "success");
+
+        // 2. Test active workflow with scheduleTrigger (intervalSecs: 1)
+        let schedule_wf = json!({
+            "name": "Scheduled Cron Workflow",
+            "active": true,
+            "nodes": [
+                {
+                    "id": "sched-1",
+                    "name": "Schedule Trigger",
+                    "type": "n8n-nodes-base.scheduleTrigger",
+                    "parameters": {
+                        "intervalSecs": 1
+                    }
+                },
+                {
+                    "id": "set-1",
+                    "name": "Set Processed",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "ran": true
+                    }
+                }
+            ],
+            "connections": {
+                "Schedule Trigger": {
+                    "main": [
+                        [
+                            {
+                                "node": "Set Processed",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(schedule_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // Allow scheduler daemon to tick and trigger execution
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let _ = db.flush_executions().await;
+        let execs = db.list_executions().unwrap_or_default();
+        assert!(
+            !execs.is_empty(),
+            "ScheduleTrigger daemon must have triggered at least one execution"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 18 timed out!");
+}
+

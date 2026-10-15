@@ -1,19 +1,19 @@
 use crate::db::{
-    new_id, CredentialRecord, ExecutionWriteMessage, FolderRecord, StorageEngine, TagRecord,
-    VariableRecord, WorkflowRecord,
+    new_id, CommunityPackageRecord, CredentialRecord, ExecutionWriteMessage, FolderRecord,
+    StorageEngine, TagRecord, VariableRecord, WorkflowRecord,
 };
 use crate::engine::{CompiledGraph, ExecutionNotifier, HyperScaleEngine};
 use axum::{
     extract::{
         ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-        Path, State,
+        Path, Query, State,
     },
     http::{header, StatusCode},
     response::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, patch, post},
+    routing::{delete, get, patch, post},
     Json, Router,
 };
 use chrono::Utc;
@@ -590,10 +590,82 @@ pub fn get_core_node_types_array() -> Value {
     ])
 }
 
-pub async fn node_types_catalog() -> impl IntoResponse {
-    Json(json!({
-        "data": get_core_node_types_array()
-    }))
+#[derive(Debug, Deserialize)]
+pub struct CommunityPackageInputDto {
+    pub name: String,
+    pub version: Option<String>,
+    pub author: Option<String>,
+    pub description: Option<String>,
+    pub manifest: Option<Value>,
+}
+
+pub async fn node_types_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut catalog = get_core_node_types_array();
+    if let Ok(packages) = state.db.list_community_packages() {
+        if let Some(cat_arr) = catalog.as_array_mut() {
+            for pkg in packages {
+                if let Some(nodes) = pkg.manifest.get("nodeTypes").and_then(|n| n.as_array()) {
+                    for node in nodes {
+                        cat_arr.push(node.clone());
+                    }
+                }
+            }
+        }
+    }
+    Json(json!({ "data": catalog }))
+}
+
+pub async fn list_community_packages(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    match state.db.list_community_packages() {
+        Ok(list) => (StatusCode::OK, Json(json!({ "data": list }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": format!("Database error: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn install_community_package(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CommunityPackageInputDto>,
+) -> impl IntoResponse {
+    let now = Utc::now().to_rfc3339();
+    let pkg = CommunityPackageRecord {
+        name: payload.name,
+        version: payload.version.unwrap_or_else(|| "1.0.0".to_string()),
+        author: payload.author.unwrap_or_default(),
+        description: payload.description.unwrap_or_default(),
+        manifest: payload.manifest.unwrap_or_else(|| json!({ "nodeTypes": [] })),
+        installed_at: now,
+    };
+    match state.db.save_community_package(&pkg) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "data": pkg }))).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": format!("Database error: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_community_package(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.db.delete_community_package(&name) {
+        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(false) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Community package not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": format!("Database error: {}", e) })),
+        )
+            .into_response(),
+    }
 }
 
 pub async fn credential_types_catalog() -> impl IntoResponse {
@@ -663,12 +735,115 @@ pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResp
     }
 }
 
-pub async fn get_workflow(
+#[derive(Debug, Deserialize, Default)]
+pub struct ViewportQuery {
+    pub viewport: Option<bool>,
+    #[serde(rename = "minX")]
+    pub min_x: Option<f64>,
+    #[serde(rename = "maxX")]
+    pub max_x: Option<f64>,
+    #[serde(rename = "minY")]
+    pub min_y: Option<f64>,
+    #[serde(rename = "maxY")]
+    pub max_y: Option<f64>,
+    #[serde(rename = "gridSize")]
+    pub grid_size: Option<f64>,
+}
+
+pub fn slice_workflow_spatial(
+    wf: &WorkflowRecord,
+    q: &ViewportQuery,
+) -> (Vec<Value>, usize, usize, bool) {
+    let nodes_arr = match wf.nodes.as_array() {
+        Some(arr) => arr,
+        None => return (Vec::new(), 0, 0, false),
+    };
+
+    let total_nodes = nodes_arr.len();
+    let min_x = q.min_x.unwrap_or(-1000.0);
+    let max_x = q.max_x.unwrap_or(2000.0);
+    let min_y = q.min_y.unwrap_or(-1000.0);
+    let max_y = q.max_y.unwrap_or(2000.0);
+    let grid_size = q.grid_size.unwrap_or(500.0).max(50.0);
+
+    let mut inside_nodes = Vec::new();
+    let mut clusters: HashMap<(i64, i64), Vec<Value>> = HashMap::new();
+
+    for node in nodes_arr {
+        let (x, y) = if let Some(pos) = node.get("position").and_then(|p| p.as_array()) {
+            let px = pos.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let py = pos.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
+            (px, py)
+        } else {
+            (0.0, 0.0)
+        };
+
+        if x >= min_x && x <= max_x && y >= min_y && y <= max_y {
+            inside_nodes.push(node.clone());
+        } else {
+            let gx = (x / grid_size).floor() as i64;
+            let gy = (y / grid_size).floor() as i64;
+            clusters.entry((gx, gy)).or_default().push(node.clone());
+        }
+    }
+
+    let mut final_nodes = inside_nodes;
+    for ((gx, gy), c_nodes) in clusters {
+        let count = c_nodes.len();
+        if count == 1 {
+            final_nodes.push(c_nodes[0].clone());
+        } else {
+            let center_x = (gx as f64) * grid_size + grid_size / 2.0;
+            let center_y = (gy as f64) * grid_size + grid_size / 2.0;
+            final_nodes.push(json!({
+                "id": format!("cluster-{gx}-{gy}"),
+                "name": format!("Cluster ({count} nodes)"),
+                "type": "n8n-nodes-base.clusterSuperNode",
+                "position": [center_x, center_y],
+                "parameters": {
+                    "count": count,
+                    "gridX": gx,
+                    "gridY": gy,
+                    "bounds": [
+                        (gx as f64) * grid_size,
+                        ((gx + 1) as f64) * grid_size,
+                        (gy as f64) * grid_size,
+                        ((gy + 1) as f64) * grid_size,
+                    ]
+                }
+            }));
+        }
+    }
+
+    let rendered_nodes = final_nodes.len();
+    let is_clustered = rendered_nodes < total_nodes;
+    (final_nodes, total_nodes, rendered_nodes, is_clustered)
+}
+
+pub async fn get_workflow_spatial_map(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(q): Query<ViewportQuery>,
 ) -> impl IntoResponse {
     match state.db.get_workflow(&id) {
-        Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+        Ok(Some(wf)) => {
+            let (nodes, total, rendered, is_clustered) = slice_workflow_spatial(&wf, &q);
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "data": {
+                        "id": wf.id,
+                        "name": wf.name,
+                        "nodes": nodes,
+                        "connections": wf.connections,
+                        "totalOriginalNodes": total,
+                        "renderedNodes": rendered,
+                        "isClustered": is_clustered
+                    }
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Workflow not found" })),
@@ -676,7 +851,39 @@ pub async fn get_workflow(
             .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "message": format!("Database error: {}", e) })),
+            Json(json!({ "message": format!("Database error: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn get_workflow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(q): Query<ViewportQuery>,
+) -> impl IntoResponse {
+    match state.db.get_workflow(&id) {
+        Ok(Some(mut wf)) => {
+            let node_count = wf.nodes.as_array().map_or(0, |a| a.len());
+            if q.viewport == Some(true) || node_count > 2000 {
+                let (sliced_nodes, total, rendered, is_clustered) = slice_workflow_spatial(&wf, &q);
+                wf.nodes = Value::Array(sliced_nodes);
+                if let Some(meta_obj) = wf.meta.as_object_mut() {
+                    meta_obj.insert("lodClustered".to_string(), json!(is_clustered));
+                    meta_obj.insert("totalOriginalNodes".to_string(), json!(total));
+                    meta_obj.insert("renderedNodes".to_string(), json!(rendered));
+                }
+            }
+            (StatusCode::OK, Json(json!({ "data": wf }))).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "message": "Workflow not found" })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "message": format!("Database error: {e}") })),
         )
             .into_response(),
     }
@@ -1786,9 +1993,22 @@ pub fn router(app_state: Arc<AppState>) -> Router {
                 .put(update_workflow)
                 .delete(delete_workflow),
         )
+        .route(
+            "/rest/workflows/{id}/spatial-map",
+            get(get_workflow_spatial_map),
+        )
         .route("/rest/workflows/{id}/run", post(run_workflow_by_id))
         .route("/rest/workflows/{id}/archive", post(archive_workflow))
         .route("/rest/workflows/{id}/unarchive", post(unarchive_workflow))
+        // Community Packages CRUD
+        .route(
+            "/rest/community-packages",
+            get(list_community_packages).post(install_community_package),
+        )
+        .route(
+            "/rest/community-packages/{name}",
+            delete(delete_community_package),
+        )
         // Credentials CRUD
         .route(
             "/rest/credentials",
@@ -1824,3 +2044,80 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/executions/{id}/stop", post(stop_execution))
         .with_state(app_state)
 }
+
+/// Spawns a background Tokio task to evaluate and trigger active workflows with scheduleTrigger
+pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+        let last_runs: Arc<DashMap<String, std::time::Instant>> = Arc::new(DashMap::new());
+
+        loop {
+            interval.tick().await;
+
+            let active_wfs = match state.db.list_active_workflows() {
+                Ok(wfs) => wfs,
+                Err(e) => {
+                    tracing::warn!("Cron scheduler db error: {}", e);
+                    continue;
+                }
+            };
+
+            for wf in active_wfs {
+                let has_schedule = wf.nodes.as_array().is_some_and(|nodes| {
+                    nodes.iter().any(|n| {
+                        n.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
+                            t == "n8n-nodes-base.scheduleTrigger" || t == "scheduleTrigger"
+                        })
+                    })
+                });
+
+                if !has_schedule {
+                    continue;
+                }
+
+                let interval_secs = wf
+                    .nodes
+                    .as_array()
+                    .and_then(|nodes| {
+                        nodes.iter().find_map(|n| {
+                            let t = n.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if t == "n8n-nodes-base.scheduleTrigger" || t == "scheduleTrigger" {
+                                let params = n.get("parameters")?;
+                                if let Some(sec) =
+                                    params.get("secondsInterval").and_then(|s| s.as_u64())
+                                {
+                                    return Some(sec);
+                                }
+                                if let Some(sec) =
+                                    params.get("intervalSecs").and_then(|s| s.as_u64())
+                                {
+                                    return Some(sec);
+                                }
+                            }
+                            None
+                        })
+                    })
+                    .unwrap_or(60);
+
+                let should_run = match last_runs.get(&wf.id) {
+                    Some(entry) => entry.elapsed().as_secs() >= interval_secs,
+                    None => true,
+                };
+
+                if should_run {
+                    last_runs.insert(wf.id.clone(), std::time::Instant::now());
+                    let state_clone = Arc::clone(&state);
+                    let wf_id = wf.id.clone();
+                    let nodes = wf.nodes.clone();
+                    let connections = wf.connections.clone();
+
+                    tokio::spawn(async move {
+                        let _ = execute_workflow_helper(state_clone, Some(wf_id), nodes, connections)
+                            .await;
+                    });
+                }
+            }
+        }
+    })
+}
+

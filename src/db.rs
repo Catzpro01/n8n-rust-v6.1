@@ -93,6 +93,17 @@ pub struct FolderRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct CommunityPackageRecord {
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    pub description: String,
+    pub manifest: Value,
+    pub installed_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ExecutionSummary {
     pub id: String,
     pub workflow_id: Option<String>,
@@ -211,6 +222,15 @@ impl StorageEngine {
             CREATE TABLE IF NOT EXISTS settings_kv (
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS community_packages (
+                name TEXT PRIMARY KEY,
+                version TEXT NOT NULL,
+                author TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                manifest TEXT NOT NULL,
+                installed_at TEXT NOT NULL
             );
             "#,
         )?;
@@ -336,6 +356,64 @@ impl StorageEngine {
                    parent_folder_id, created_at, updated_at
             FROM workflows
             ORDER BY updated_at DESC
+            "#,
+        )?;
+
+        let rows = stmt.query_map([], |row| {
+            let active_int: i64 = row.get(2)?;
+            let is_archived_int: i64 = row.get(3)?;
+            let nodes_str: String = row.get(4)?;
+            let conn_str: String = row.get(5)?;
+            let settings_str: String = row.get(6)?;
+            let static_str: String = row.get(7)?;
+            let pin_str: String = row.get(8)?;
+            let meta_str: String = row.get(9)?;
+            let tags_str: String = row.get(12)?;
+
+            Ok(WorkflowRecord {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                active: active_int != 0,
+                is_archived: is_archived_int != 0,
+                nodes: serde_json::from_str(&nodes_str).unwrap_or(Value::Array(vec![])),
+                connections: serde_json::from_str(&conn_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                settings: serde_json::from_str(&settings_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                static_data: serde_json::from_str(&static_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                pin_data: serde_json::from_str(&pin_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                meta: serde_json::from_str(&meta_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                version_id: row.get(10)?,
+                trigger_count: row.get(11)?,
+                tags: serde_json::from_str(&tags_str).unwrap_or(Value::Array(vec![])),
+                parent_folder_id: row.get(13)?,
+                created_at: row.get(14)?,
+                updated_at: row.get(15)?,
+            })
+        })?;
+
+        let mut workflows = Vec::new();
+        for r in rows {
+            workflows.push(r?);
+        }
+        Ok(workflows)
+    }
+
+    pub fn list_active_workflows(&self) -> Result<Vec<WorkflowRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let mut stmt = conn.prepare(
+            r#"
+            SELECT id, name, active, is_archived, nodes, connections, settings,
+                   static_data, pin_data, meta, version_id, trigger_count, tags,
+                   parent_folder_id, created_at, updated_at
+            FROM workflows
+            WHERE active = 1 AND is_archived = 0
             "#,
         )?;
 
@@ -908,6 +986,64 @@ impl StorageEngine {
             .lock()
             .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
         let affected = conn.execute("DELETE FROM executions WHERE id = ?1", params![id])?;
+        Ok(affected > 0)
+    }
+
+    pub fn list_community_packages(&self) -> Result<Vec<CommunityPackageRecord>> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let mut stmt = conn.prepare(
+            "SELECT name, version, author, description, manifest, installed_at FROM community_packages ORDER BY name ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let manifest_str: String = row.get(4)?;
+            let manifest: Value = serde_json::from_str(&manifest_str).unwrap_or(Value::Null);
+            Ok(CommunityPackageRecord {
+                name: row.get(0)?,
+                version: row.get(1)?,
+                author: row.get(2)?,
+                description: row.get(3)?,
+                manifest,
+                installed_at: row.get(5)?,
+            })
+        })?;
+        let mut list = Vec::new();
+        for r in rows {
+            list.push(r?);
+        }
+        Ok(list)
+    }
+
+    pub fn save_community_package(&self, pkg: &CommunityPackageRecord) -> Result<()> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let manifest_str = serde_json::to_string(&pkg.manifest)?;
+        conn.execute(
+            r#"
+            INSERT INTO community_packages (name, version, author, description, manifest, installed_at)
+            VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            ON CONFLICT(name) DO UPDATE SET
+                version = excluded.version,
+                author = excluded.author,
+                description = excluded.description,
+                manifest = excluded.manifest,
+                installed_at = excluded.installed_at
+            "#,
+            params![pkg.name, pkg.version, pkg.author, pkg.description, manifest_str, pkg.installed_at],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_community_package(&self, name: &str) -> Result<bool> {
+        let conn = self
+            .conn
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let affected = conn.execute("DELETE FROM community_packages WHERE name = ?1", params![name])?;
         Ok(affected > 0)
     }
 }

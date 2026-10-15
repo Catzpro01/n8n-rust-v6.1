@@ -18,7 +18,8 @@ use tower_http::trace::TraceLayer;
 
 /// Build the root Axum application with all API and Web static/SPA routes
 pub fn build_app(ui_dist_path: &Path, db: StorageEngine) -> Router {
-    let engine = HyperScaleEngine::new(None).expect("Failed to initialize HyperScaleEngine");
+    let engine = HyperScaleEngine::new(None)
+        .unwrap_or_else(|e| panic!("Failed to initialize HyperScaleEngine: {e}"));
     let push_hub = Arc::new(PushHub::new());
     let active_executions = Arc::new(DashMap::new());
     let app_state = Arc::new(AppState {
@@ -27,6 +28,11 @@ pub fn build_app(ui_dist_path: &Path, db: StorageEngine) -> Router {
         push_hub,
         active_executions,
     });
+
+    if tokio::runtime::Handle::try_current().is_ok() {
+        api::spawn_cron_scheduler_daemon(Arc::clone(&app_state));
+    }
+
     let api_router = api::router(app_state);
     let web_router = web::router(ui_dist_path);
 

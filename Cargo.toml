@@ -4,6 +4,7 @@ version = "0.2.0"
 edition = "2021"
 authors = ["Catzpro01"]
 description = "High-performance single-crate Rust implementation of n8n engine & Axum UI server"
+build = false
 
 [dependencies]
 axum = { version = "0.8", features = ["ws"] }
@@ -21,6 +22,7 @@ chrono = { version = "0.4", features = ["serde"] }
 rayon = "1.10"
 dashmap = "6.1"
 futures-util = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
