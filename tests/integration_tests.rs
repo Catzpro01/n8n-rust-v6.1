@@ -4933,6 +4933,475 @@ async fn test_switch_sort_limit_and_filter_nodes() {
     .expect("Test 25 timed out!");
 }
 
+// ---------------------------------------------------------------------------
+// 26. Polyglot Code Node, Download/Delete Runtime & Dynamic Manager Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db);
 
+        // ===================================================================
+        // Skenario 1: List Runtimes Contract
+        // ===================================================================
+        let res_list = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/runtimes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
 
+        assert_eq!(res_list.status(), StatusCode::OK, "GET /rest/runtimes must return 200 OK");
+        let bytes_list = res_list.into_body().collect().await.unwrap().to_bytes();
+        let body_list: serde_json::Value = serde_json::from_slice(&bytes_list).unwrap();
+        let runtimes = body_list["data"].as_array().expect("runtimes 'data' must be an array");
 
+        // Verify default runtimes
+        let js_rt = runtimes
+            .iter()
+            .find(|r| r["language"] == "javascript" && r["version"] == "es2022-quickjs")
+            .expect("Default javascript runtime 'es2022-quickjs' must be present");
+        assert_eq!(js_rt["installed"], true, "javascript:es2022-quickjs must be installed");
+
+        let py_rt = runtimes
+            .iter()
+            .find(|r| r["language"] == "python" && r["version"] == "3.11-sandbox")
+            .expect("Default python runtime '3.11-sandbox' must be present");
+        assert_eq!(py_rt["installed"], true, "python:3.11-sandbox must be installed");
+
+        let wasm_rt = runtimes
+            .iter()
+            .find(|r| r["language"] == "wasm" && r["version"] == "wasm32-wasmer-4.0")
+            .expect("Default wasm runtime 'wasm32-wasmer-4.0' must be present");
+        assert_eq!(wasm_rt["installed"], true, "wasm:wasm32-wasmer-4.0 must be installed");
+
+        // ===================================================================
+        // Skenario 2: Download Versi Baru & Delete Versi Lama
+        // ===================================================================
+        // 1. Download python:3.13-jit
+        let dl_payload = json!({
+            "language": "python",
+            "version": "3.13-jit"
+        });
+
+        let res_dl = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/runtimes/download")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(dl_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_dl.status(), StatusCode::OK, "POST /rest/runtimes/download must return 200 OK");
+        let bytes_dl = res_dl.into_body().collect().await.unwrap().to_bytes();
+        let body_dl: serde_json::Value = serde_json::from_slice(&bytes_dl).unwrap();
+        assert_eq!(
+            body_dl["data"]["installed"], true,
+            "Downloaded runtime data must have installed == true"
+        );
+
+        // 2. Verify GET /rest/runtimes: 3.13-jit is registered with installed == true
+        let res_list_after_dl = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/runtimes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_list_after_dl.status(), StatusCode::OK);
+        let bytes_lad = res_list_after_dl.into_body().collect().await.unwrap().to_bytes();
+        let body_lad: serde_json::Value = serde_json::from_slice(&bytes_lad).unwrap();
+        let runtimes_lad = body_lad["data"].as_array().expect("runtimes must be array");
+        let py_13 = runtimes_lad
+            .iter()
+            .find(|r| r["language"] == "python" && r["version"] == "3.13-jit")
+            .expect("python:3.13-jit must be registered after download");
+        assert_eq!(py_13["installed"], true, "python:3.13-jit must have installed == true");
+
+        // 3. Delete python:3.11-sandbox
+        let res_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/runtimes/python/3.11-sandbox")
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_del.status(), StatusCode::OK, "DELETE /rest/runtimes/python/3.11-sandbox must return 200 OK");
+
+        // 4. Verify GET /rest/runtimes: 3.11-sandbox is installed == false or not present
+        let res_list_after_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/runtimes")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_list_after_del.status(), StatusCode::OK);
+        let bytes_ld = res_list_after_del.into_body().collect().await.unwrap().to_bytes();
+        let body_ld: serde_json::Value = serde_json::from_slice(&bytes_ld).unwrap();
+        let runtimes_ld = body_ld["data"].as_array().expect("runtimes must be array");
+        let py_11_opt = runtimes_ld
+            .iter()
+            .find(|r| r["language"] == "python" && r["version"] == "3.11-sandbox");
+        if let Some(py_11) = py_11_opt {
+            assert_eq!(
+                py_11["installed"], false,
+                "python:3.11-sandbox must be uninstalled (installed == false)"
+            );
+        }
+
+        // ===================================================================
+        // Skenario 3: Eksekusi Nyata Code Node Multi-Bahasa
+        // ===================================================================
+
+        // -------------------------------------------------------------------
+        // 3a. JavaScript Code Node
+        // -------------------------------------------------------------------
+        let js_wf_payload = json!({
+            "name": "Polyglot JavaScript Code Pipeline",
+            "nodes": [
+                {
+                    "id": "node-js-trig",
+                    "name": "manualTrigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": [{ "json": { "price": 10, "qty": 5 } }]
+                    }
+                },
+                {
+                    "id": "node-js-code",
+                    "name": "Code",
+                    "type": "n8n-nodes-base.code",
+                    "parameters": {
+                        "language": "javascript",
+                        "runtimeVersion": "es2022-quickjs",
+                        "jsCode": "item.total = item.price * item.qty;\nreturn item;"
+                    }
+                }
+            ],
+            "connections": {
+                "manualTrigger": {
+                    "main": [
+                        [ { "node": "Code", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res_create_js = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(js_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_js.status(), StatusCode::OK);
+        let bytes_cjs = res_create_js.into_body().collect().await.unwrap().to_bytes();
+        let body_cjs: serde_json::Value = serde_json::from_slice(&bytes_cjs).unwrap();
+        let js_wf_id = body_cjs["data"]["id"]
+            .as_str()
+            .expect("Created JS workflow must have an id");
+
+        let run_js_payload = json!({
+            "pinData": {
+                "manualTrigger": [
+                    { "json": { "price": 10, "qty": 5 } }
+                ]
+            }
+        });
+
+        let res_run_js = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{js_wf_id}/run"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_js_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_js.status(), StatusCode::OK);
+        let bytes_rjs = res_run_js.into_body().collect().await.unwrap().to_bytes();
+        let body_rjs: serde_json::Value = serde_json::from_slice(&bytes_rjs).unwrap();
+        assert_eq!(
+            body_rjs["data"]["status"], "success",
+            "JavaScript Code workflow execution must succeed"
+        );
+
+        let js_out = &body_rjs["data"]["resultData"]["runData"]["Code"][0]["data"]["main"][0];
+        let js_arr = js_out.as_array().expect("Code output must be an array");
+        assert!(!js_arr.is_empty(), "Code output must not be empty");
+        let js_item = &js_arr[0];
+
+        let total_val = js_item
+            .get("total")
+            .or_else(|| js_item.get("json").and_then(|j| j.get("total")));
+        assert_eq!(total_val, Some(&json!(50)), "item total must equal 50");
+
+        let js_code_exec = js_item
+            .get("codeExecuted")
+            .or_else(|| js_item.get("json").and_then(|j| j.get("codeExecuted")));
+        assert_eq!(js_code_exec, Some(&json!(true)), "codeExecuted must be true");
+
+        let js_runtime_used = js_item
+            .get("runtimeUsed")
+            .or_else(|| js_item.get("json").and_then(|j| j.get("runtimeUsed")));
+        assert_eq!(
+            js_runtime_used,
+            Some(&json!("javascript:es2022-quickjs")),
+            "runtimeUsed must be 'javascript:es2022-quickjs'"
+        );
+
+        // -------------------------------------------------------------------
+        // 3b. Python Code Node
+        // -------------------------------------------------------------------
+        let py_wf_payload = json!({
+            "name": "Polyglot Python Code Pipeline",
+            "nodes": [
+                {
+                    "id": "node-py-trig",
+                    "name": "manualTrigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": [{ "json": { "price": 100 } }]
+                    }
+                },
+                {
+                    "id": "node-py-code",
+                    "name": "Code",
+                    "type": "n8n-nodes-base.code",
+                    "parameters": {
+                        "language": "python",
+                        "runtimeVersion": "3.13-jit",
+                        "pythonCode": "item['tax'] = item['price'] * 0.1\nreturn item"
+                    }
+                }
+            ],
+            "connections": {
+                "manualTrigger": {
+                    "main": [
+                        [ { "node": "Code", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res_create_py = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(py_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_py.status(), StatusCode::OK);
+        let bytes_cpy = res_create_py.into_body().collect().await.unwrap().to_bytes();
+        let body_cpy: serde_json::Value = serde_json::from_slice(&bytes_cpy).unwrap();
+        let py_wf_id = body_cpy["data"]["id"]
+            .as_str()
+            .expect("Created Python workflow must have an id");
+
+        let run_py_payload = json!({
+            "pinData": {
+                "manualTrigger": [
+                    { "json": { "price": 100 } }
+                ]
+            }
+        });
+
+        let res_run_py = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{py_wf_id}/run"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_py_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_py.status(), StatusCode::OK);
+        let bytes_rpy = res_run_py.into_body().collect().await.unwrap().to_bytes();
+        let body_rpy: serde_json::Value = serde_json::from_slice(&bytes_rpy).unwrap();
+        assert_eq!(
+            body_rpy["data"]["status"], "success",
+            "Python Code workflow execution must succeed"
+        );
+
+        let py_out = &body_rpy["data"]["resultData"]["runData"]["Code"][0]["data"]["main"][0];
+        let py_arr = py_out.as_array().expect("Code output must be an array");
+        assert!(!py_arr.is_empty(), "Python Code output must not be empty");
+        let py_item = &py_arr[0];
+
+        let tax_val = py_item
+            .get("tax")
+            .or_else(|| py_item.get("json").and_then(|j| j.get("tax")));
+        let is_tax_10 = tax_val == Some(&json!(10.0))
+            || tax_val == Some(&json!(10))
+            || tax_val == Some(&json!(10.0f64));
+        assert!(
+            is_tax_10,
+            "tax must be 10.0 or 10, got: {:?}",
+            tax_val
+        );
+
+        let py_code_exec = py_item
+            .get("codeExecuted")
+            .or_else(|| py_item.get("json").and_then(|j| j.get("codeExecuted")));
+        assert_eq!(py_code_exec, Some(&json!(true)), "Python codeExecuted must be true");
+
+        let py_runtime_used = py_item
+            .get("runtimeUsed")
+            .or_else(|| py_item.get("json").and_then(|j| j.get("runtimeUsed")));
+        assert_eq!(
+            py_runtime_used,
+            Some(&json!("python:3.13-jit")),
+            "Python runtimeUsed must be 'python:3.13-jit'"
+        );
+
+        // -------------------------------------------------------------------
+        // 3c. WASM Code Node
+        // -------------------------------------------------------------------
+        let wasm_wf_payload = json!({
+            "name": "Polyglot WASM Code Pipeline",
+            "nodes": [
+                {
+                    "id": "node-wasm-trig",
+                    "name": "manualTrigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": [{ "json": { "id": 42 } }]
+                    }
+                },
+                {
+                    "id": "node-wasm-code",
+                    "name": "Code",
+                    "type": "n8n-nodes-base.code",
+                    "parameters": {
+                        "language": "wasm",
+                        "runtimeVersion": "wasm32-wasmer-4.0",
+                        "wasmCode": "transform"
+                    }
+                }
+            ],
+            "connections": {
+                "manualTrigger": {
+                    "main": [
+                        [ { "node": "Code", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res_create_wasm = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(wasm_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_wasm.status(), StatusCode::OK);
+        let bytes_cwasm = res_create_wasm.into_body().collect().await.unwrap().to_bytes();
+        let body_cwasm: serde_json::Value = serde_json::from_slice(&bytes_cwasm).unwrap();
+        let wasm_wf_id = body_cwasm["data"]["id"]
+            .as_str()
+            .expect("Created WASM workflow must have an id");
+
+        let run_wasm_payload = json!({
+            "pinData": {
+                "manualTrigger": [
+                    { "json": { "id": 42 } }
+                ]
+            }
+        });
+
+        let res_run_wasm = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wasm_wf_id}/run"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_wasm_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_wasm.status(), StatusCode::OK);
+        let bytes_rwasm = res_run_wasm.into_body().collect().await.unwrap().to_bytes();
+        let body_rwasm: serde_json::Value = serde_json::from_slice(&bytes_rwasm).unwrap();
+        assert_eq!(
+            body_rwasm["data"]["status"], "success",
+            "WASM Code workflow execution must succeed"
+        );
+
+        let wasm_out = &body_rwasm["data"]["resultData"]["runData"]["Code"][0]["data"]["main"][0];
+        let wasm_arr = wasm_out.as_array().expect("WASM Code output must be an array");
+        assert!(!wasm_arr.is_empty(), "WASM Code output must not be empty");
+        let wasm_item = &wasm_arr[0];
+
+        let wasm_code_exec = wasm_item
+            .get("codeExecuted")
+            .or_else(|| wasm_item.get("json").and_then(|j| j.get("codeExecuted")));
+        assert_eq!(wasm_code_exec, Some(&json!(true)), "WASM codeExecuted must be true");
+
+        let wasm_runtime_used = wasm_item
+            .get("runtimeUsed")
+            .or_else(|| wasm_item.get("json").and_then(|j| j.get("runtimeUsed")));
+        assert_eq!(
+            wasm_runtime_used,
+            Some(&json!("wasm:wasm32-wasmer-4.0")),
+            "WASM runtimeUsed must be 'wasm:wasm32-wasmer-4.0'"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 26 timed out!");
+}

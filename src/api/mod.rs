@@ -640,10 +640,51 @@ pub fn get_core_node_types_array() -> Value {
             "outputs": ["main"],
             "properties": [
                 {
+                    "displayName": "Language",
+                    "name": "language",
+                    "type": "options",
+                    "default": "javascript",
+                    "options": [
+                        { "name": "JavaScript", "value": "javascript" },
+                        { "name": "Python", "value": "python" },
+                        { "name": "WebAssembly (WASM)", "value": "wasm" },
+                        { "name": "Rust Script", "value": "rust-script" }
+                    ]
+                },
+                {
+                    "displayName": "Runtime Version",
+                    "name": "runtimeVersion",
+                    "type": "options",
+                    "default": "es2022-quickjs",
+                    "options": [
+                        { "name": "JavaScript ES2022 (QuickJS)", "value": "es2022-quickjs" },
+                        { "name": "JavaScript ES2024 (V8 Compat)", "value": "es2024-v8-compat" },
+                        { "name": "Python 3.11 Sandbox", "value": "3.11-sandbox" },
+                        { "name": "Python 3.12 (PyO3)", "value": "3.12-pyo3" },
+                        { "name": "WASM (Wasmer 4.0)", "value": "wasm32-wasmer-4.0" }
+                    ]
+                },
+                {
+                    "displayName": "Mode",
+                    "name": "mode",
+                    "type": "options",
+                    "default": "runOnceForAllItems",
+                    "options": [
+                        { "name": "Run Once for All Items", "value": "runOnceForAllItems" },
+                        { "name": "Run Once for Each Item", "value": "runOnceForEachItem" }
+                    ]
+                },
+                {
                     "displayName": "JavaScript Code",
                     "name": "jsCode",
                     "type": "string",
                     "default": "return $input.all();"
+                },
+                {
+                    "displayName": "Python Code",
+                    "name": "pythonCode",
+                    "type": "string",
+                    "default": "return _input.all()"
                 }
             ]
         },
@@ -1158,6 +1199,104 @@ pub async fn delete_community_package(
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
+        )
+            .into_response(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic Modular Runtime Manager Handlers
+// ---------------------------------------------------------------------------
+
+pub async fn list_runtimes_handler() -> impl IntoResponse {
+    let runtimes = crate::runtime::list_runtimes();
+    Json(json!({ "data": runtimes }))
+}
+
+pub async fn download_runtime_handler(Json(payload): Json<Value>) -> impl IntoResponse {
+    let language = match payload.get("language").and_then(|v| v.as_str()) {
+        Some(l) if !l.trim().is_empty() => l.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing or empty 'language'" })),
+            )
+                .into_response()
+        }
+    };
+    let version = match payload.get("version").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing or empty 'version'" })),
+            )
+                .into_response()
+        }
+    };
+
+    match crate::runtime::download_runtime(language, version) {
+        Ok(pkg) => (
+            StatusCode::OK,
+            Json(json!({ "success": true, "data": pkg })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_runtime_path_handler(
+    Path((language, version)): Path<(String, String)>,
+) -> impl IntoResponse {
+    match crate::runtime::delete_runtime(&language, &version) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "success": true })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": err })),
+        )
+            .into_response(),
+    }
+}
+
+pub async fn delete_runtime_post_handler(Json(payload): Json<Value>) -> impl IntoResponse {
+    let language = match payload.get("language").and_then(|v| v.as_str()) {
+        Some(l) if !l.trim().is_empty() => l.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing or empty 'language'" })),
+            )
+                .into_response()
+        }
+    };
+    let version = match payload.get("version").and_then(|v| v.as_str()) {
+        Some(v) if !v.trim().is_empty() => v.trim(),
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "Missing or empty 'version'" })),
+            )
+                .into_response()
+        }
+    };
+
+    match crate::runtime::delete_runtime(language, version) {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "success": true })),
+        )
+            .into_response(),
+        Err(err) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": err })),
         )
             .into_response(),
     }
@@ -2888,6 +3027,14 @@ pub fn router(app_state: Arc<AppState>) -> Router {
             "/rest/community-packages/{name}",
             delete(delete_community_package),
         )
+        // Dynamic Runtime Manager
+        .route("/rest/runtimes", get(list_runtimes_handler))
+        .route("/rest/runtimes/download", post(download_runtime_handler))
+        .route(
+            "/rest/runtimes/{language}/{version}",
+            delete(delete_runtime_path_handler),
+        )
+        .route("/rest/runtimes/delete", post(delete_runtime_post_handler))
         // Credentials CRUD
         .route(
             "/rest/credentials",

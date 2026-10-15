@@ -155,6 +155,30 @@ impl ArenaNode {
     }
 }
 
+pub trait NodeExecutor: Send + Sync {
+    fn execute(
+        &self,
+        node: &ArenaNode,
+        input: Arc<Value>,
+        ctx: &ExprContext,
+        is_hyperscale: bool,
+    ) -> (Arc<Value>, Option<u16>);
+}
+
+pub struct DefaultNodeExecutor;
+
+impl NodeExecutor for DefaultNodeExecutor {
+    fn execute(
+        &self,
+        node: &ArenaNode,
+        input: Arc<Value>,
+        ctx: &ExprContext,
+        is_hyperscale: bool,
+    ) -> (Arc<Value>, Option<u16>) {
+        execute_node_logic(node, input, ctx, is_hyperscale, 0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EdgeTarget {
     pub to_idx: u32,
@@ -1449,47 +1473,138 @@ fn execute_node_logic(
             }
         }
         NodeKind::Code => {
-            if let Some(arr) = input.as_array() {
-                let all_executed = arr.iter().all(|item| {
-                    item.as_object()
-                        .and_then(|o| {
-                            o.get("codeExecuted")
-                                .or_else(|| o.get("json").and_then(|j| j.get("codeExecuted")))
-                        })
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false)
-                });
-                if all_executed {
-                    return (Arc::clone(&input), None);
-                }
-                let mut new_arr = arr.clone();
-                for item in &mut new_arr {
-                    if let Some(obj) = item.as_object_mut() {
-                        if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
-                            inner.insert("codeExecuted".to_string(), json!(true));
+            let language = params_ref
+                .get("language")
+                .and_then(|v| v.as_str())
+                .unwrap_or("javascript");
+
+            let default_version = match language {
+                "python" => "3.11-sandbox",
+                "wasm" => "wasm32-wasmer-4.0",
+                _ => "es2022-quickjs",
+            };
+
+            let version = params_ref
+                .get("runtimeVersion")
+                .or_else(|| params_ref.get("languageVersion"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(default_version);
+
+            let code_str = params_ref
+                .get("jsCode")
+                .or_else(|| params_ref.get("pythonCode"))
+                .or_else(|| params_ref.get("wasmCode"))
+                .or_else(|| params_ref.get("code"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+
+            let is_default_bypass = is_hyperscale
+                || code_str.is_empty()
+                || code_str == "return $input.all();"
+                || code_str == "return _input.all();"
+                || code_str == "return $input.all()"
+                || code_str == "return _input.all()";
+
+            if is_default_bypass {
+                let runtime_tag = json!(format!("{language}:{version}"));
+                if let Some(arr) = input.as_array() {
+                    let all_executed = arr.iter().all(|item| {
+                        item.as_object()
+                            .and_then(|o| {
+                                o.get("codeExecuted")
+                                    .or_else(|| o.get("json").and_then(|j| j.get("codeExecuted")))
+                            })
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false)
+                    });
+                    if all_executed {
+                        return (Arc::clone(&input), None);
+                    }
+                    let mut new_arr = arr.clone();
+                    for item in &mut new_arr {
+                        if let Some(obj) = item.as_object_mut() {
+                            if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                inner.insert("codeExecuted".to_string(), json!(true));
+                                inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                            }
+                            obj.insert("codeExecuted".to_string(), json!(true));
+                            obj.insert("runtimeUsed".to_string(), runtime_tag.clone());
                         }
-                        obj.insert("codeExecuted".to_string(), json!(true));
+                    }
+                    return (Arc::new(Value::Array(new_arr)), None);
+                }
+                if let Some(obj) = input.as_object() {
+                    let executed = obj
+                        .get("codeExecuted")
+                        .or_else(|| obj.get("json").and_then(|j| j.get("codeExecuted")))
+                        == Some(&json!(true));
+                    if executed {
+                        return (Arc::clone(&input), None);
                     }
                 }
-                return (Arc::new(Value::Array(new_arr)), None);
-            }
-            if let Some(obj) = input.as_object() {
-                let executed = obj
-                    .get("codeExecuted")
-                    .or_else(|| obj.get("json").and_then(|j| j.get("codeExecuted")))
-                    == Some(&json!(true));
-                if executed {
-                    return (Arc::clone(&input), None);
+                let mut val = (*input).clone();
+                if let Some(obj) = val.as_object_mut() {
+                    if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                        inner.insert("codeExecuted".to_string(), json!(true));
+                        inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                    }
+                    obj.insert("codeExecuted".to_string(), json!(true));
+                    obj.insert("runtimeUsed".to_string(), runtime_tag);
+                    (Arc::new(val), None)
+                } else {
+                    (
+                        Arc::new(json!({
+                            "codeExecuted": true,
+                            "runtimeUsed": format!("{language}:{version}"),
+                            "data": val
+                        })),
+                        None,
+                    )
+                }
+            } else {
+                match crate::runtime::execute_polyglot_code(language, version, code_str, &input, expr_ctx) {
+                    Ok(result) => (Arc::new(result), None),
+                    Err(err) => {
+                        let mut err_val = (*input).clone();
+                        let runtime_tag = json!(format!("{language}:{version}"));
+                        if let Some(arr) = err_val.as_array_mut() {
+                            for item in arr {
+                                if let Some(obj) = item.as_object_mut() {
+                                    if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                        inner.insert("codeExecuted".to_string(), json!(true));
+                                        inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                                        inner.insert("error".to_string(), json!(err));
+                                    }
+                                    obj.insert("codeExecuted".to_string(), json!(true));
+                                    obj.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                                    obj.insert("error".to_string(), json!(err));
+                                }
+                            }
+                            (Arc::new(err_val), None)
+                        } else if let Some(obj) = err_val.as_object_mut() {
+                            if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                inner.insert("codeExecuted".to_string(), json!(true));
+                                inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                                inner.insert("error".to_string(), json!(err));
+                            }
+                            obj.insert("codeExecuted".to_string(), json!(true));
+                            obj.insert("runtimeUsed".to_string(), runtime_tag);
+                            obj.insert("error".to_string(), json!(err));
+                            (Arc::new(err_val), None)
+                        } else {
+                            (
+                                Arc::new(json!({
+                                    "codeExecuted": true,
+                                    "runtimeUsed": format!("{language}:{version}"),
+                                    "error": err
+                                })),
+                                None,
+                            )
+                        }
+                    }
                 }
             }
-            let mut val = (*input).clone();
-            if let Some(obj) = val.as_object_mut() {
-                if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
-                    inner.insert("codeExecuted".to_string(), json!(true));
-                }
-                obj.insert("codeExecuted".to_string(), json!(true));
-            }
-            (Arc::new(val), None)
         }
         NodeKind::HttpRequest => {
             let url = params_ref
