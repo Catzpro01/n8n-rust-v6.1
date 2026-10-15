@@ -512,28 +512,37 @@ fn prepare_target_input(
 fn traverse_node<'scope>(
     s: &rayon::Scope<'scope>,
     ctx: &'scope TraversalContext<'scope>,
+    current_idx: u32,
+    current_input: Arc<Value>,
+) {
+    let mut local_executed: u32 = 0;
+    traverse_node_inner(s, ctx, current_idx, current_input, &mut local_executed);
+    if local_executed > 0 {
+        ctx.executed_count.fetch_add(local_executed, Ordering::Relaxed);
+    }
+}
+
+fn traverse_node_inner<'scope>(
+    s: &rayon::Scope<'scope>,
+    ctx: &'scope TraversalContext<'scope>,
     mut current_idx: u32,
     mut current_input: Arc<Value>,
+    local_executed: &mut u32,
 ) {
     let expr_ctx = ExprContext::new(
         ctx.execution_id,
         Some(ctx.outputs),
         Some(&ctx.graph.node_index),
     );
-    let mut local_executed: u32 = 0;
 
     loop {
-        if (local_executed & 1023 == 0)
+        if (*local_executed == 0)
             && (ctx.cancel_flag.load(Ordering::Relaxed)
                 || ctx.timed_out.load(Ordering::Relaxed)
                 || ctx.start_time.elapsed() > ctx.timeout_duration)
         {
             if !ctx.cancel_flag.load(Ordering::Relaxed) {
                 ctx.timed_out.store(true, Ordering::Relaxed);
-            }
-            let rem = local_executed & 1023;
-            if rem > 0 {
-                ctx.executed_count.fetch_add(rem, Ordering::Relaxed);
             }
             return;
         }
@@ -569,19 +578,16 @@ fn traverse_node<'scope>(
             }
         }
 
-        local_executed += 1;
-        if local_executed & 1023 == 0 {
-            ctx.executed_count.fetch_add(1024, Ordering::Relaxed);
+        *local_executed += 1;
+        if *local_executed >= 1024 {
+            ctx.executed_count.fetch_add(*local_executed, Ordering::Relaxed);
+            *local_executed = 0;
         }
 
         let targets = &ctx.graph.edges[current_idx as usize];
         if targets.is_empty() {
             if let Ok(mut guard) = ctx.last_output_holder.lock() {
                 *guard = Arc::clone(&result_payload);
-            }
-            let rem = local_executed & 1023;
-            if rem > 0 {
-                ctx.executed_count.fetch_add(rem, Ordering::Relaxed);
             }
             return;
         }
@@ -613,10 +619,6 @@ fn traverse_node<'scope>(
                 prune_inactive_branch(ctx, edge.to_idx);
             }
 
-            let rem = local_executed & 1023;
-            if rem > 0 {
-                ctx.executed_count.fetch_add(rem, Ordering::Relaxed);
-            }
             return;
         }
 
@@ -649,10 +651,6 @@ fn traverse_node<'scope>(
         }
 
         if ready_targets.is_empty() {
-            let rem = local_executed & 1023;
-            if rem > 0 {
-                ctx.executed_count.fetch_add(rem, Ordering::Relaxed);
-            }
             return;
         }
 
