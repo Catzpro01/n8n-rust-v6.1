@@ -3492,6 +3492,7 @@ async fn test_vars_expression_and_flow_control_nodes() {
         let var_json: serde_json::Value = serde_json::from_slice(&bytes_var).unwrap();
         assert_eq!(var_json["data"]["key"], "API_HOST");
         assert_eq!(var_json["data"]["value"], "api.production.internal");
+        let var_id = var_json["data"]["id"].as_str().unwrap().to_string();
 
         // 2. Test $vars.API_HOST expression resolution in workflow Set node
         let vars_wf = json!({
@@ -3527,6 +3528,95 @@ async fn test_vars_expression_and_flow_control_nodes() {
         assert_eq!(run_json["data"]["status"], "success");
         let set_output = &run_json["data"]["resultData"]["runData"]["Set Target URL"][0]["data"]["main"][0][0]["json"];
         assert_eq!(set_output["target_url"], "https://api.production.internal/v1/users");
+
+        // 2a. Update variable via PUT /rest/variables/{var_id} and test bracket expression {{$vars['API_HOST']}}
+        let update_payload = json!({
+            "value": "api.staging.internal"
+        });
+
+        let res_put = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/variables/{}", var_id))
+                    .method("PUT")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(update_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_put.status(), StatusCode::OK);
+
+        let vars_wf_bracket = json!({
+            "nodes": [
+                {
+                    "id": "set-target",
+                    "name": "Set Target URL",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "target_url": "https://{{$vars['API_HOST']}}/v2/users"
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_run_bracket = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(vars_wf_bracket.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_bracket.status(), StatusCode::OK);
+        let bytes_run_bracket = res_run_bracket.into_body().collect().await.unwrap().to_bytes();
+        let run_json_bracket: serde_json::Value = serde_json::from_slice(&bytes_run_bracket).unwrap();
+        assert_eq!(run_json_bracket["data"]["status"], "success");
+        let set_output_bracket = &run_json_bracket["data"]["resultData"]["runData"]["Set Target URL"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(set_output_bracket["target_url"], "https://api.staging.internal/v2/users");
+
+        // 2b. Delete variable via DELETE /rest/variables/{var_id} and verify resolution fallback
+        let res_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/variables/{}", var_id))
+                    .method("DELETE")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_del.status(), StatusCode::OK);
+
+        let res_run_after_delete = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(vars_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_after_delete.status(), StatusCode::OK);
+        let bytes_run_del = res_run_after_delete.into_body().collect().await.unwrap().to_bytes();
+        let run_json_del: serde_json::Value = serde_json::from_slice(&bytes_run_del).unwrap();
+        assert_eq!(run_json_del["data"]["status"], "success");
+        let set_output_del = &run_json_del["data"]["resultData"]["runData"]["Set Target URL"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(set_output_del["target_url"], "https:///v1/users");
 
         // 3. Test SplitInBatches node with [1, 2, 3, 4, 5]
         let engine = HyperScaleEngine::new(Some(2)).expect("HyperScaleEngine init failed");
@@ -3834,6 +3924,8 @@ async fn test_error_trigger_and_error_workflow_handling() {
         let main_json: serde_json::Value = serde_json::from_slice(&bytes_main).unwrap();
 
         // 4. Verifications:
+        let main_exec_id = main_json["data"]["executionId"].as_str().unwrap();
+
         //    - Status eksekusi main workflow adalah "error"
         assert_eq!(
             main_json["data"]["status"], "error",
@@ -3855,6 +3947,19 @@ async fn test_error_trigger_and_error_workflow_handling() {
             error_wf_execution["workflowId"], "err-handler-wf-001",
             "Error workflow ID must match configured 'err-handler-wf-001'"
         );
+        assert_eq!(
+            error_wf_execution["finalOutput"]["error_message"],
+            "Critical DB Connection Failure",
+            "Captured error_message in error workflow finalOutput must match"
+        );
+        assert_eq!(
+            error_wf_execution["finalOutput"]["failed_execution_id"],
+            main_exec_id,
+            "Captured failed_execution_id in error workflow finalOutput must match main execution ID"
+        );
+        let captured_node_out = &error_wf_execution["resultData"]["runData"]["Capture Error Info"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(captured_node_out["error_message"], "Critical DB Connection Failure");
+        assert_eq!(captured_node_out["failed_execution_id"], main_exec_id);
 
         let _ = std::fs::remove_file(db_path);
     })

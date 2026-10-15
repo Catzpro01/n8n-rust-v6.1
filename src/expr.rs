@@ -265,12 +265,12 @@ pub fn evaluate_raw_expression(expr: &str, item_json: &Value, ctx: &ExprContext)
         return Value::String(val);
     }
     if let Some(var_name) = expr.strip_prefix("$vars.") {
-        let val = crate::engine::get_variable(var_name).unwrap_or_default();
+        let val = crate::engine::get_variable(var_name.trim()).unwrap_or_default();
         return Value::String(val);
     }
-    if expr.starts_with("$vars[") && expr.ends_with(']') {
-        let inner = expr[6..expr.len() - 1].trim_matches(|c| c == '\'' || c == '"');
-        let val = crate::engine::get_variable(inner).unwrap_or_default();
+    if let Some(inner) = expr.strip_prefix("$vars[").and_then(|s| s.strip_suffix(']')) {
+        let clean_key = inner.trim().trim_matches(|c| c == '\'' || c == '"');
+        let val = crate::engine::get_variable(clean_key).unwrap_or_default();
         return Value::String(val);
     }
 
