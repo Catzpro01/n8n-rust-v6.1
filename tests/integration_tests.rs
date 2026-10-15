@@ -2240,7 +2240,8 @@ async fn test_real_http_client_and_schedule_daemon() {
                     "type": "n8n-nodes-base.httpRequest",
                     "parameters": {
                         "url": "http://127.0.0.1:5678/healthz",
-                        "method": "GET"
+                        "method": "GET",
+                        "continueOnFail": true
                     }
                 }
             ],
@@ -2391,6 +2392,49 @@ async fn test_real_http_client_and_schedule_daemon() {
         let res_data = &dead_res["data"]["resultData"]["runData"]["Dead HTTP Request"][0]["data"]["main"][0][0]["json"];
         assert_eq!(res_data["statusCode"], 502, "Expected 502 Bad Gateway for dead port");
         assert_eq!(res_data["continueOnFail"], true, "Expected continueOnFail to be true");
+
+        // 5. Anti-regression check: Dead local port without continueOnFail (continueOnFail: false) must propagate global error
+        let dead_http_fail_wf = json!({
+            "nodes": [
+                {
+                    "id": "http-dead-fail",
+                    "name": "Dead HTTP Fail",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": "http://127.0.0.1:1",
+                        "method": "GET",
+                        "continueOnFail": false
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_dead_fail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(dead_http_fail_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_dead_fail.status(), StatusCode::OK);
+        let bytes_dead_fail = res_dead_fail.into_body().collect().await.unwrap().to_bytes();
+        let dead_res_fail: serde_json::Value = serde_json::from_slice(&bytes_dead_fail).unwrap();
+        assert_eq!(dead_res_fail["data"]["status"], "error");
+        let fail_run_entry = &dead_res_fail["data"]["resultData"]["runData"]["Dead HTTP Fail"][0];
+        assert_eq!(fail_run_entry["executionStatus"], "error");
+        assert!(
+            fail_run_entry["error"]["message"]
+                .as_str()
+                .is_some_and(|s| !s.is_empty()),
+            "Expected non-empty error message on failed node"
+        );
 
         let _ = std::fs::remove_file(db_path);
     })

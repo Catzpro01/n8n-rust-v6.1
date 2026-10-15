@@ -332,6 +332,7 @@ impl HyperScaleEngine {
         let outputs = DashMap::<u32, Arc<Value>>::new();
         let cancel_flag = cancel_token.unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let timed_out = AtomicBool::new(false);
+        let has_error = AtomicBool::new(false);
         let timeout_duration = std::time::Duration::from_secs(60);
 
         // Hyper-scale throttling flag (for > 1000 nodes, throttle UI websocket messages)
@@ -359,6 +360,7 @@ impl HyperScaleEngine {
             executed_count: &executed_count,
             cancel_flag: &cancel_flag,
             timed_out: &timed_out,
+            has_error: &has_error,
             start_time,
             timeout_duration,
             notifier: notifier.as_deref(),
@@ -397,6 +399,8 @@ impl HyperScaleEngine {
                 "Execution timed out by watchdog"
             );
             "timeout"
+        } else if has_error.load(Ordering::Relaxed) {
+            "error"
         } else {
             "success"
         };
@@ -510,6 +514,7 @@ struct TraversalContext<'a> {
     executed_count: &'a AtomicU32,
     cancel_flag: &'a AtomicBool,
     timed_out: &'a AtomicBool,
+    has_error: &'a AtomicBool,
     start_time: Instant,
     timeout_duration: std::time::Duration,
     notifier: Option<&'a dyn ExecutionNotifier>,
@@ -627,6 +632,10 @@ fn traverse_node_inner<'scope>(
             .unwrap_or(false);
 
         if has_node_error {
+            ctx.has_error.store(true, Ordering::Relaxed);
+            for edge in &ctx.graph.edges[current_idx as usize] {
+                prune_inactive_branch(ctx, edge.to_idx);
+            }
             if let Ok(mut guard) = ctx.last_output_holder.lock() {
                 *guard = Arc::clone(&result_payload);
             }
