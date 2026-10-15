@@ -477,6 +477,83 @@ pub async fn list_roles() -> impl IntoResponse {
     }))
 }
 
+fn get_code_node_type() -> Value {
+    json!({
+        "name": "n8n-nodes-base.code",
+        "displayName": "Code",
+        "icon": "fa:code",
+        "group": ["transform"],
+        "version": 2,
+        "description": "Runs custom JavaScript or Python code",
+        "defaults": { "name": "Code" },
+        "inputs": ["main"],
+        "outputs": ["main"],
+        "properties": [
+            {
+                "displayName": "Language",
+                "name": "language",
+                "type": "options",
+                "default": "javascript",
+                "options": [
+                    { "name": "JavaScript", "value": "javascript" },
+                    { "name": "Python", "value": "python" },
+                    { "name": "WebAssembly (WASM)", "value": "wasm" },
+                    { "name": "Rust Script", "value": "rust-script" }
+                ]
+            },
+            {
+                "displayName": "Runtime Version",
+                "name": "runtimeVersion",
+                "type": "options",
+                "default": "es2022-quickjs",
+                "options": [
+                    { "name": "JavaScript ES2022 (QuickJS)", "value": "es2022-quickjs" },
+                    { "name": "JavaScript ES2024 (V8 Compat)", "value": "es2024-v8-compat" },
+                    { "name": "Python 3.11 Sandbox", "value": "3.11-sandbox" },
+                    { "name": "Python 3.12 (PyO3)", "value": "3.12-pyo3" },
+                    { "name": "WASM (Wasmer 4.0)", "value": "wasm32-wasmer-4.0" },
+                    { "name": "WASM (WASI Preview 2)", "value": "wasm32-wasi" },
+                    { "name": "Rust Script Nightly", "value": "rust-script-nightly" }
+                ]
+            },
+            {
+                "displayName": "Mode",
+                "name": "mode",
+                "type": "options",
+                "default": "runOnceForAllItems",
+                "options": [
+                    { "name": "Run Once for All Items", "value": "runOnceForAllItems" },
+                    { "name": "Run Once for Each Item", "value": "runOnceForEachItem" }
+                ]
+            },
+            {
+                "displayName": "JavaScript Code",
+                "name": "jsCode",
+                "type": "string",
+                "default": "return $input.all();"
+            },
+            {
+                "displayName": "Python Code",
+                "name": "pythonCode",
+                "type": "string",
+                "default": "return _input.all()"
+            },
+            {
+                "displayName": "WASM / WASI Module Code",
+                "name": "wasmCode",
+                "type": "string",
+                "default": "return $input.all();"
+            },
+            {
+                "displayName": "Polyglot Script Code",
+                "name": "code",
+                "type": "string",
+                "default": ""
+            }
+        ]
+    })
+}
+
 pub fn get_core_node_types_array() -> Value {
     json!([
         {
@@ -628,66 +705,7 @@ pub fn get_core_node_types_array() -> Value {
                 }
             ]
         },
-        {
-            "name": "n8n-nodes-base.code",
-            "displayName": "Code",
-            "icon": "fa:code",
-            "group": ["transform"],
-            "version": 2,
-            "description": "Runs custom JavaScript or Python code",
-            "defaults": { "name": "Code" },
-            "inputs": ["main"],
-            "outputs": ["main"],
-            "properties": [
-                {
-                    "displayName": "Language",
-                    "name": "language",
-                    "type": "options",
-                    "default": "javascript",
-                    "options": [
-                        { "name": "JavaScript", "value": "javascript" },
-                        { "name": "Python", "value": "python" },
-                        { "name": "WebAssembly (WASM)", "value": "wasm" },
-                        { "name": "Rust Script", "value": "rust-script" }
-                    ]
-                },
-                {
-                    "displayName": "Runtime Version",
-                    "name": "runtimeVersion",
-                    "type": "options",
-                    "default": "es2022-quickjs",
-                    "options": [
-                        { "name": "JavaScript ES2022 (QuickJS)", "value": "es2022-quickjs" },
-                        { "name": "JavaScript ES2024 (V8 Compat)", "value": "es2024-v8-compat" },
-                        { "name": "Python 3.11 Sandbox", "value": "3.11-sandbox" },
-                        { "name": "Python 3.12 (PyO3)", "value": "3.12-pyo3" },
-                        { "name": "WASM (Wasmer 4.0)", "value": "wasm32-wasmer-4.0" }
-                    ]
-                },
-                {
-                    "displayName": "Mode",
-                    "name": "mode",
-                    "type": "options",
-                    "default": "runOnceForAllItems",
-                    "options": [
-                        { "name": "Run Once for All Items", "value": "runOnceForAllItems" },
-                        { "name": "Run Once for Each Item", "value": "runOnceForEachItem" }
-                    ]
-                },
-                {
-                    "displayName": "JavaScript Code",
-                    "name": "jsCode",
-                    "type": "string",
-                    "default": "return $input.all();"
-                },
-                {
-                    "displayName": "Python Code",
-                    "name": "pythonCode",
-                    "type": "string",
-                    "default": "return _input.all()"
-                }
-            ]
-        },
+        get_code_node_type(),
         {
             "name": "n8n-nodes-base.set",
             "displayName": "Edit Fields (Set)",

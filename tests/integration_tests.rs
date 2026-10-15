@@ -5205,7 +5205,8 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
                     "parameters": {
                         "language": "python",
                         "runtimeVersion": "3.13-jit",
-                        "pythonCode": "item['tax'] = item['price'] * 0.1\nreturn item"
+                        "jsCode": "return $input.all();",
+                        "pythonCode": "tax = item['price'] * 0.1\nif item['price'] >= 100:\n    item['tax'] = tax + 5\nreturn item"
                     }
                 }
             ],
@@ -5275,12 +5276,12 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
         let tax_val = py_item
             .get("tax")
             .or_else(|| py_item.get("json").and_then(|j| j.get("tax")));
-        let is_tax_10 = tax_val == Some(&json!(10.0))
-            || tax_val == Some(&json!(10))
-            || tax_val == Some(&json!(10.0f64));
+        let is_tax_15 = tax_val == Some(&json!(15.0))
+            || tax_val == Some(&json!(15))
+            || tax_val == Some(&json!(15.0f64));
         assert!(
-            is_tax_10,
-            "tax must be 10.0 or 10, got: {:?}",
+            is_tax_15,
+            "tax must be 15.0 or 15, got: {:?}",
             tax_val
         );
 
@@ -5319,7 +5320,7 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
                     "parameters": {
                         "language": "wasm",
                         "runtimeVersion": "wasm32-wasmer-4.0",
-                        "wasmCode": "transform"
+                        "wasmCode": "let bonus = 58;\nitem.computed = item.id + bonus;\nreturn item;"
                     }
                 }
             ],
@@ -5386,6 +5387,11 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
         assert!(!wasm_arr.is_empty(), "WASM Code output must not be empty");
         let wasm_item = &wasm_arr[0];
 
+        let wasm_computed = wasm_item
+            .get("computed")
+            .or_else(|| wasm_item.get("json").and_then(|j| j.get("computed")));
+        assert_eq!(wasm_computed, Some(&json!(100)), "WASM computed must be 100");
+
         let wasm_code_exec = wasm_item
             .get("codeExecuted")
             .or_else(|| wasm_item.get("json").and_then(|j| j.get("codeExecuted")));
@@ -5398,6 +5404,105 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
             wasm_runtime_used,
             Some(&json!("wasm:wasm32-wasmer-4.0")),
             "WASM runtimeUsed must be 'wasm:wasm32-wasmer-4.0'"
+        );
+
+        let wasm_processed = wasm_item
+            .get("wasmProcessed")
+            .or_else(|| wasm_item.get("json").and_then(|j| j.get("wasmProcessed")));
+        assert_eq!(wasm_processed, Some(&json!(true)), "WASM wasmProcessed must be true");
+
+        // -------------------------------------------------------------------
+        // 3d. Penolakan Eksekusi Runtime yang Sudah Dihapus
+        // -------------------------------------------------------------------
+        let del_py_wf_payload = json!({
+            "name": "Polyglot Deleted Runtime Rejection Pipeline",
+            "nodes": [
+                {
+                    "id": "node-del-trig",
+                    "name": "manualTrigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": [{ "json": { "price": 50 } }]
+                    }
+                },
+                {
+                    "id": "node-del-code",
+                    "name": "Code",
+                    "type": "n8n-nodes-base.code",
+                    "parameters": {
+                        "language": "python",
+                        "runtimeVersion": "3.11-sandbox",
+                        "pythonCode": "return item"
+                    }
+                }
+            ],
+            "connections": {
+                "manualTrigger": {
+                    "main": [
+                        [ { "node": "Code", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res_create_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(del_py_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_del.status(), StatusCode::OK);
+        let bytes_cdel = res_create_del.into_body().collect().await.unwrap().to_bytes();
+        let body_cdel: serde_json::Value = serde_json::from_slice(&bytes_cdel).unwrap();
+        let del_wf_id = body_cdel["data"]["id"]
+            .as_str()
+            .expect("Created Deleted Runtime workflow must have an id");
+
+        let run_del_payload = json!({
+            "pinData": {
+                "manualTrigger": [
+                    { "json": { "price": 50 } }
+                ]
+            }
+        });
+
+        let res_run_del = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{del_wf_id}/run"))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_del_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_del.status(), StatusCode::OK);
+        let bytes_rdel = res_run_del.into_body().collect().await.unwrap().to_bytes();
+        let body_rdel: serde_json::Value = serde_json::from_slice(&bytes_rdel).unwrap();
+
+        let del_out = &body_rdel["data"]["resultData"]["runData"]["Code"][0]["data"]["main"][0];
+        let del_arr = del_out.as_array().expect("Deleted runtime Code output must be an array");
+        assert!(!del_arr.is_empty(), "Deleted runtime Code output must not be empty");
+        let del_item = &del_arr[0];
+
+        let err_val = del_item
+            .get("error")
+            .or_else(|| del_item.get("json").and_then(|j| j.get("error")))
+            .and_then(|e| e.as_str())
+            .expect("Code node output must contain an 'error' message when runtime is deleted");
+        assert!(
+            err_val.contains("not installed") || err_val.contains("Please download it first"),
+            "Error message must indicate runtime is not installed or download required, got: {err_val}"
         );
 
         let _ = std::fs::remove_file(db_path);

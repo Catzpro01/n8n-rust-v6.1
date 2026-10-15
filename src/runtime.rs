@@ -3,6 +3,7 @@ use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
@@ -26,6 +27,11 @@ pub enum PolyglotInstruction {
         target: Vec<String>,
         expr: String,
     },
+    /// Assignment to a local variable in scope
+    AssignLocal {
+        name: String,
+        expr: String,
+    },
     /// Return statement targeting an expression or payload
     Return {
         expr: String,
@@ -35,6 +41,12 @@ pub enum PolyglotInstruction {
         item_var: String,
         collection_expr: String,
         body: Vec<PolyglotInstruction>,
+    },
+    /// Conditional branching if / else
+    IfElse {
+        condition: String,
+        then_body: Vec<PolyglotInstruction>,
+        else_body: Vec<PolyglotInstruction>,
     },
     /// Standalone expression statement
     ExprStatement {
@@ -244,26 +256,44 @@ impl PolyglotRuntimeManager {
         Ok(new_pkg)
     }
 
-    /// Deletes or uninstalls a runtime package from the registry
+    /// Checks whether a runtime package is registered and installed
+    pub fn is_runtime_installed(&self, language: &str, version: &str) -> bool {
+        self.get_runtime(language, version).is_some_and(|pkg| pkg.installed)
+    }
+
+    /// Deletes or uninstalls a runtime package from the registry and clears AST cache
     pub fn delete_runtime(&self, language: &str, version: &str) -> Result<(), String> {
         let (norm_lang, norm_ver) = self.resolve_runtime_version(language, version);
         let key = format!("{norm_lang}:{norm_ver}");
 
-        if let Some(mut existing) = self.registry.get_mut(&key) {
+        let found = if let Some(mut existing) = self.registry.get_mut(&key) {
             existing.installed = false;
-            return Ok(());
-        }
-
-        for mut existing in self.registry.iter_mut() {
-            if existing.language.eq_ignore_ascii_case(&norm_lang)
-                && existing.version.eq_ignore_ascii_case(&norm_ver)
-            {
-                existing.installed = false;
-                return Ok(());
+            true
+        } else {
+            let mut matched = false;
+            for mut existing in self.registry.iter_mut() {
+                if existing.language.eq_ignore_ascii_case(&norm_lang)
+                    && existing.version.eq_ignore_ascii_case(&norm_ver)
+                {
+                    existing.installed = false;
+                    matched = true;
+                    break;
+                }
             }
-        }
+            matched
+        };
 
-        Err(format!("Runtime not found for language '{language}' version '{version}'"))
+        if found {
+            self.ast_cache.retain(|_, v| {
+                !(v.language.eq_ignore_ascii_case(&norm_lang)
+                    && v.version.eq_ignore_ascii_case(&norm_ver))
+            });
+            Ok(())
+        } else {
+            Err(format!(
+                "Runtime not found for language '{language}' version '{version}'"
+            ))
+        }
     }
 
     /// Compiles code into an AST program
@@ -293,14 +323,15 @@ impl PolyglotRuntimeManager {
         self.ast_cache.len()
     }
 
-    /// 3-Tier Polyglot Execution Engine: Tier 0 Fast Path -> Tier 1 AST Cache -> Tier 2 Execution
-    pub fn execute_polyglot_code(
+    /// Executes code with specified mode: "runOnceForAllItems" (default) or "runOnceForEachItem"
+    pub fn execute_polyglot_code_with_mode(
         &self,
         language: &str,
         version: &str,
         code: &str,
         input: &Value,
         ctx: &ExprContext,
+        mode: &str,
     ) -> Result<Value, String> {
         let (effective_lang, effective_ver) = self.resolve_runtime_version(language, version);
         let runtime_used = format!("{effective_lang}:{effective_ver}");
@@ -314,6 +345,63 @@ impl PolyglotRuntimeManager {
             }
         }
 
+        let norm_mode = mode.trim();
+        if norm_mode.eq_ignore_ascii_case("runOnceForEachItem") {
+            if let Value::Array(arr) = input {
+                let mut results = Vec::with_capacity(arr.len());
+                for single_item in arr {
+                    let out = self.execute_polyglot_code_internal(
+                        &effective_lang,
+                        &effective_ver,
+                        code,
+                        single_item,
+                        ctx,
+                        &runtime_used,
+                    )?;
+                    results.push(out);
+                }
+                return Ok(Value::Array(results));
+            }
+        }
+
+        self.execute_polyglot_code_internal(
+            &effective_lang,
+            &effective_ver,
+            code,
+            input,
+            ctx,
+            &runtime_used,
+        )
+    }
+
+    /// 3-Tier Polyglot Execution Engine: Tier 0 Fast Path -> Tier 1 AST Cache -> Tier 2 Execution
+    pub fn execute_polyglot_code(
+        &self,
+        language: &str,
+        version: &str,
+        code: &str,
+        input: &Value,
+        ctx: &ExprContext,
+    ) -> Result<Value, String> {
+        self.execute_polyglot_code_with_mode(
+            language,
+            version,
+            code,
+            input,
+            ctx,
+            "runOnceForAllItems",
+        )
+    }
+
+    fn execute_polyglot_code_internal(
+        &self,
+        effective_lang: &str,
+        effective_ver: &str,
+        code: &str,
+        input: &Value,
+        ctx: &ExprContext,
+        runtime_used: &str,
+    ) -> Result<Value, String> {
         let trimmed = code.trim();
 
         // -------------------------------------------------------------
@@ -329,28 +417,30 @@ impl PolyglotRuntimeManager {
 
         if is_fast_path {
             let mut output = input.clone();
-            inject_metadata(&mut output, &runtime_used);
+            inject_metadata(&mut output, runtime_used);
             return Ok(output);
         }
 
         // -------------------------------------------------------------
         // Tier 1: AST / Bytecode Cache lookup
         // -------------------------------------------------------------
-        let code_hash = compute_program_hash(&effective_lang, &effective_ver, code);
+        let code_hash = compute_program_hash(effective_lang, effective_ver, code);
 
-        let program: Arc<CompiledPolyglotProgram> = if let Some(cached) = self.ast_cache.get(&code_hash) {
-            Arc::clone(cached.value())
-        } else {
-            let compiled = self.compile_program(&effective_lang, &effective_ver, code, code_hash)?;
-            let arc_prog = Arc::new(compiled);
-            self.ast_cache.insert(code_hash, Arc::clone(&arc_prog));
-            arc_prog
-        };
+        let program: Arc<CompiledPolyglotProgram> =
+            if let Some(cached) = self.ast_cache.get(&code_hash) {
+                Arc::clone(cached.value())
+            } else {
+                let compiled =
+                    self.compile_program(effective_lang, effective_ver, code, code_hash)?;
+                let arc_prog = Arc::new(compiled);
+                self.ast_cache.insert(code_hash, Arc::clone(&arc_prog));
+                arc_prog
+            };
 
         // -------------------------------------------------------------
         // Tier 2: Real Deterministic Execution
         // -------------------------------------------------------------
-        self.execute_program(&program, input, ctx, &runtime_used)
+        self.execute_program(&program, input, ctx, runtime_used)
     }
 
     fn execute_program(
@@ -366,25 +456,43 @@ impl PolyglotRuntimeManager {
             _ => vec![input.clone()],
         };
 
+        let mut local_vars_per_item: Vec<HashMap<String, Value>> =
+            vec![HashMap::new(); working_items.len()];
+
         let mut explicit_return: Option<Value> = None;
 
         for inst in &program.instructions {
             match inst {
                 PolyglotInstruction::ForLoop { body, .. } => {
-                    for item in &mut working_items {
+                    for (idx, item) in working_items.iter_mut().enumerate() {
+                        let locals = &mut local_vars_per_item[idx];
                         for sub_inst in body {
-                            execute_single_instruction(sub_inst, item, ctx)?;
+                            execute_single_instruction(sub_inst, item, locals, ctx)?;
                         }
                     }
                 }
                 PolyglotInstruction::Assign { .. } => {
-                    for item in &mut working_items {
-                        execute_single_instruction(inst, item, ctx)?;
+                    for (idx, item) in working_items.iter_mut().enumerate() {
+                        let locals = &mut local_vars_per_item[idx];
+                        execute_single_instruction(inst, item, locals, ctx)?;
+                    }
+                }
+                PolyglotInstruction::AssignLocal { .. } => {
+                    for (idx, item) in working_items.iter_mut().enumerate() {
+                        let locals = &mut local_vars_per_item[idx];
+                        execute_single_instruction(inst, item, locals, ctx)?;
+                    }
+                }
+                PolyglotInstruction::IfElse { .. } => {
+                    for (idx, item) in working_items.iter_mut().enumerate() {
+                        let locals = &mut local_vars_per_item[idx];
+                        execute_single_instruction(inst, item, locals, ctx)?;
                     }
                 }
                 PolyglotInstruction::ExprStatement { .. } => {
-                    for item in &mut working_items {
-                        execute_single_instruction(inst, item, ctx)?;
+                    for (idx, item) in working_items.iter_mut().enumerate() {
+                        let locals = &mut local_vars_per_item[idx];
+                        execute_single_instruction(inst, item, locals, ctx)?;
                     }
                 }
                 PolyglotInstruction::Return { expr } => {
@@ -422,8 +530,16 @@ impl PolyglotRuntimeManager {
                         }
                     }
 
+                    let empty_map = HashMap::new();
+                    let locals = local_vars_per_item.first().unwrap_or(&empty_map);
+                    let bare = trimmed_expr.strip_prefix('$').unwrap_or(trimmed_expr);
+                    if let Some(val) = locals.get(trimmed_expr).or_else(|| locals.get(bare)) {
+                        explicit_return = Some(val.clone());
+                        break;
+                    }
+
                     let context_item = working_items.first().cloned().unwrap_or(Value::Null);
-                    let eval_str = prepare_expr_for_eval(trimmed_expr);
+                    let eval_str = prepare_expr_with_locals(trimmed_expr, locals);
                     let evaluated = evaluate_raw_expression(&eval_str, &context_item, ctx);
                     explicit_return = Some(evaluated);
                     break;
@@ -474,21 +590,55 @@ fn enrich_wasm_payload(val: &mut Value) {
 fn execute_single_instruction(
     inst: &PolyglotInstruction,
     item: &mut Value,
+    local_vars: &mut HashMap<String, Value>,
     ctx: &ExprContext,
 ) -> Result<(), String> {
     match inst {
+        PolyglotInstruction::AssignLocal { name, expr } => {
+            let prepared = prepare_expr_with_locals(expr, local_vars);
+            let evaluated = evaluate_raw_expression(&prepared, item, ctx);
+            local_vars.insert(name.clone(), evaluated);
+        }
         PolyglotInstruction::Assign { target, expr } => {
-            let prepared = prepare_expr_for_eval(expr);
+            let prepared = prepare_expr_with_locals(expr, local_vars);
             let evaluated = evaluate_raw_expression(&prepared, item, ctx);
             apply_assignment(item, target, evaluated);
         }
+        PolyglotInstruction::IfElse {
+            condition,
+            then_body,
+            else_body,
+        } => {
+            let clean_cond = clean_condition(condition);
+            let prepared_cond = prepare_expr_with_locals(&clean_cond, local_vars);
+            let cond_val = evaluate_raw_expression(&prepared_cond, item, ctx);
+            if is_truthy(&cond_val) {
+                for sub_inst in then_body {
+                    execute_single_instruction(sub_inst, item, local_vars, ctx)?;
+                }
+            } else {
+                for sub_inst in else_body {
+                    execute_single_instruction(sub_inst, item, local_vars, ctx)?;
+                }
+            }
+        }
+        PolyglotInstruction::ForLoop { body, .. } => {
+            for sub_inst in body {
+                execute_single_instruction(sub_inst, item, local_vars, ctx)?;
+            }
+        }
         PolyglotInstruction::ExprStatement { expr } => {
-            let prepared = prepare_expr_for_eval(expr);
+            let prepared = prepare_expr_with_locals(expr, local_vars);
             let _ = evaluate_raw_expression(&prepared, item, ctx);
         }
-        _ => {}
+        PolyglotInstruction::Return { .. } => {}
     }
     Ok(())
+}
+
+/// Public API: checks whether a runtime package is installed
+pub fn is_runtime_installed(language: &str, version: &str) -> bool {
+    PolyglotRuntimeManager::global().is_runtime_installed(language, version)
 }
 
 /// Public API: list all registered runtime packages
@@ -504,6 +654,20 @@ pub fn download_runtime(language: &str, version: &str) -> Result<RuntimePackage,
 /// Public API: delete or uninstall a runtime package
 pub fn delete_runtime(language: &str, version: &str) -> Result<(), String> {
     PolyglotRuntimeManager::global().delete_runtime(language, version)
+}
+
+/// Public API: execute polyglot code with execution mode
+pub fn execute_polyglot_code_with_mode(
+    language: &str,
+    version: &str,
+    code: &str,
+    input: &Value,
+    ctx: &ExprContext,
+    mode: &str,
+) -> Result<Value, String> {
+    PolyglotRuntimeManager::global().execute_polyglot_code_with_mode(
+        language, version, code, input, ctx, mode,
+    )
 }
 
 /// Public API: execute polyglot code across 3-tier engine
@@ -597,6 +761,169 @@ fn normalize_bracket_access(input: &str, prefix: &str) -> String {
     }
     result.push_str(remaining);
     result
+}
+
+/// Checks if a JSON value is truthy according to JavaScript / Python semantics
+fn is_truthy(val: &Value) -> bool {
+    match val {
+        Value::Bool(b) => *b,
+        Value::Null => false,
+        Value::Number(n) => n.as_f64().map(|f| f != 0.0).unwrap_or(false),
+        Value::String(s) => !s.is_empty() && s != "false" && s != "0",
+        Value::Array(a) => !a.is_empty(),
+        Value::Object(o) => !o.is_empty(),
+    }
+}
+
+/// Strips outer enclosing parentheses from a conditional expression if fully enclosed
+fn clean_condition(cond: &str) -> String {
+    let mut c = cond.trim();
+    while c.starts_with('(') && c.ends_with(')') {
+        let mut depth = 0;
+        let mut fully_enclosed = false;
+        for (idx, ch) in c.char_indices() {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+                if depth == 0 {
+                    if idx == c.len() - 1 {
+                        fully_enclosed = true;
+                    }
+                    break;
+                }
+            }
+        }
+        if fully_enclosed {
+            c = c[1..c.len() - 1].trim();
+        } else {
+            break;
+        }
+    }
+    c.to_string()
+}
+
+/// Formats a JSON value into a literal suitable for raw expression evaluation
+fn format_local_value_for_expr(val: &Value) -> String {
+    match val {
+        Value::Null => "null".to_string(),
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        Value::Number(n) => n.to_string(),
+        Value::String(s) => {
+            serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
+        }
+        other => other.to_string(),
+    }
+}
+
+/// Substitutes local variable identifiers in an expression string with their literal representations
+pub fn substitute_local_vars(expr: &str, local_vars: &HashMap<String, Value>) -> String {
+    if local_vars.is_empty() {
+        return expr.to_string();
+    }
+
+    let mut result = String::with_capacity(expr.len() + 16);
+    let chars: Vec<char> = expr.chars().collect();
+    let len = chars.len();
+    let mut i = 0;
+    let mut in_string: Option<char> = None;
+
+    while i < len {
+        let c = chars[i];
+
+        if let Some(quote) = in_string {
+            result.push(c);
+            if c == '\\' && i + 1 < len {
+                i += 1;
+                result.push(chars[i]);
+            } else if c == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if c == '"' || c == '\'' || c == '`' {
+            in_string = Some(c);
+            result.push(c);
+            i += 1;
+            continue;
+        }
+
+        let is_ident_start = c.is_alphabetic() || c == '_' || c == '$';
+        if is_ident_start {
+            let prev_char = if i > 0 { Some(chars[i - 1]) } else { None };
+            let is_property_access = prev_char == Some('.');
+
+            let start = i;
+            while i < len && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '$') {
+                i += 1;
+            }
+            let token: String = chars[start..i].iter().collect();
+
+            if !is_property_access {
+                let bare_token = token.strip_prefix('$').unwrap_or(&token);
+                if let Some(val) = local_vars.get(&token).or_else(|| local_vars.get(bare_token)) {
+                    result.push_str(&format_local_value_for_expr(val));
+                    continue;
+                }
+            }
+
+            result.push_str(&token);
+            continue;
+        }
+
+        result.push(c);
+        i += 1;
+    }
+
+    result
+}
+
+/// Prepares expression for evaluation by normalizing prefixes and substituting local variables
+pub fn prepare_expr_with_locals(expr: &str, local_vars: &HashMap<String, Value>) -> String {
+    let base_prepared = prepare_expr_for_eval(expr);
+    substitute_local_vars(&base_prepared, local_vars)
+}
+/// Determines whether an assignment target string references an item property or a local variable
+fn is_item_target(target_str: &str) -> bool {
+    let mut cleaned = target_str.trim();
+    for prefix in ["let ", "const ", "var "] {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.trim();
+            break;
+        }
+    }
+    cleaned.starts_with("item.")
+        || cleaned.starts_with("item[")
+        || cleaned.starts_with("$json.")
+        || cleaned.starts_with("$json[")
+        || cleaned.starts_with("_item.")
+        || cleaned.starts_with("_item[")
+        || cleaned.starts_with("_json.")
+        || cleaned.starts_with("_json[")
+        || cleaned == "item"
+        || cleaned == "$json"
+        || cleaned == "_item"
+        || cleaned == "_json"
+}
+
+/// Extracts the clean variable name from a local variable assignment target (e.g. "let tax" -> "tax")
+fn extract_local_var_name(target_str: &str) -> String {
+    let mut cleaned = target_str.trim();
+    for prefix in ["let ", "const ", "var "] {
+        if let Some(rest) = cleaned.strip_prefix(prefix) {
+            cleaned = rest.trim();
+            break;
+        }
+    }
+    cleaned.trim_matches(|c| c == ';' || c == ' ').to_string()
 }
 
 fn parse_assignment_target(target_str: &str) -> Vec<String> {
@@ -778,10 +1105,20 @@ fn parse_for_header(header: &str) -> (String, String) {
 }
 
 fn find_assignment_eq(s: &str) -> Option<usize> {
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut in_backtick = false;
     let bytes = s.as_bytes();
     let len = bytes.len();
     for i in 0..len {
-        if bytes[i] == b'=' {
+        let b = bytes[i];
+        if b == b'\'' && !in_double && !in_backtick {
+            in_single = !in_single;
+        } else if b == b'"' && !in_single && !in_backtick {
+            in_double = !in_double;
+        } else if b == b'`' && !in_single && !in_double {
+            in_backtick = !in_backtick;
+        } else if !in_single && !in_double && !in_backtick && b == b'=' {
             let prev = if i > 0 { bytes[i - 1] } else { b' ' };
             let next = if i + 1 < len { bytes[i + 1] } else { b' ' };
 
@@ -790,6 +1127,139 @@ fn find_assignment_eq(s: &str) -> Option<usize> {
             }
         }
     }
+    None
+}
+
+fn find_first_char_outside_string(s: &str, target: u8) -> Option<usize> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string: Option<u8> = None;
+
+    while i < len {
+        let b = bytes[i];
+        if let Some(quote) = in_string {
+            if b == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            in_string = Some(b);
+            i += 1;
+            continue;
+        }
+
+        if b == target {
+            return Some(i);
+        }
+
+        i += 1;
+    }
+    None
+}
+
+fn find_matching_brace(s: &str, open_pos: usize) -> Option<usize> {
+    let mut depth = 0;
+    let mut in_string: Option<u8> = None;
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+
+    let mut i = open_pos;
+    while i < len {
+        let b = bytes[i];
+        if let Some(quote) = in_string {
+            if b == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            in_string = Some(b);
+            i += 1;
+            continue;
+        }
+
+        if b == b'{' {
+            depth += 1;
+        } else if b == b'}' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_control_keyword(s: &str) -> Option<(usize, &'static str)> {
+    let bytes = s.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    let mut in_string: Option<u8> = None;
+
+    while i < len {
+        let b = bytes[i];
+        if let Some(quote) = in_string {
+            if b == b'\\' && i + 1 < len {
+                i += 2;
+                continue;
+            }
+            if b == quote {
+                in_string = None;
+            }
+            i += 1;
+            continue;
+        }
+
+        if b == b'"' || b == b'\'' || b == b'`' {
+            in_string = Some(b);
+            i += 1;
+            continue;
+        }
+
+        let prev_ok = i == 0
+            || (!bytes[i - 1].is_ascii_alphanumeric()
+                && bytes[i - 1] != b'_'
+                && bytes[i - 1] != b'$'
+                && bytes[i - 1] != b'.');
+
+        if prev_ok {
+            if i + 2 <= len && &bytes[i..i + 2] == b"if" {
+                let next_ok = i + 2 == len
+                    || bytes[i + 2].is_ascii_whitespace()
+                    || bytes[i + 2] == b'(';
+                if next_ok {
+                    return Some((i, "if"));
+                }
+            }
+
+            if i + 3 <= len && &bytes[i..i + 3] == b"for" {
+                let next_ok = i + 3 == len
+                    || bytes[i + 3].is_ascii_whitespace()
+                    || bytes[i + 3] == b'(';
+                if next_ok {
+                    return Some((i, "for"));
+                }
+            }
+        }
+
+        i += 1;
+    }
+
     None
 }
 
@@ -821,12 +1291,21 @@ fn parse_linear_statements(raw: &str) -> Vec<PolyglotInstruction> {
         if let Some(eq_idx) = find_assignment_eq(trimmed) {
             let target_str = &trimmed[..eq_idx].trim();
             let expr_str = &trimmed[eq_idx + 1..].trim();
-            let target_path = parse_assignment_target(target_str);
             let expr_clean = expr_str.trim_end_matches(';').trim();
-            instructions.push(PolyglotInstruction::Assign {
-                target: target_path,
-                expr: expr_clean.to_string(),
-            });
+
+            if is_item_target(target_str) {
+                let target_path = parse_assignment_target(target_str);
+                instructions.push(PolyglotInstruction::Assign {
+                    target: target_path,
+                    expr: expr_clean.to_string(),
+                });
+            } else {
+                let var_name = extract_local_var_name(target_str);
+                instructions.push(PolyglotInstruction::AssignLocal {
+                    name: var_name,
+                    expr: expr_clean.to_string(),
+                });
+            }
             continue;
         }
 
@@ -840,84 +1319,203 @@ fn parse_linear_statements(raw: &str) -> Vec<PolyglotInstruction> {
 
 fn parse_statements_into_ast(code: &str) -> Vec<PolyglotInstruction> {
     let stripped = strip_comments(code);
-    let mut instructions = Vec::new();
+    parse_ast_block(&stripped)
+}
 
-    if let Some(for_idx) = stripped.find("for ") {
-        if let Some(brace_open) = stripped[for_idx..].find('{') {
-            let abs_open = for_idx + brace_open;
-            let header = &stripped[for_idx + 4..abs_open].trim();
-            if let Some(brace_close) = stripped[abs_open..].rfind('}') {
-                let abs_close = abs_open + brace_close;
-                let body_str = &stripped[abs_open + 1..abs_close];
+fn parse_ast_block(code: &str) -> Vec<PolyglotInstruction> {
+    let trimmed = code.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
 
-                let before = &stripped[..for_idx];
-                instructions.extend(parse_linear_statements(before));
+    if let Some((kw_pos, kw)) = find_control_keyword(code) {
+        let before = &code[..kw_pos];
+        let mut instructions = parse_linear_statements(before);
+        let rest = &code[kw_pos..];
 
+        let open_brace_idx = find_first_char_outside_string(rest, b'{');
+        let colon_idx = find_first_char_outside_string(rest, b':');
+
+        let is_brace = match (open_brace_idx, colon_idx) {
+            (Some(b), Some(c)) => b < c,
+            (Some(_), None) => true,
+            _ => false,
+        };
+
+        if kw == "if" {
+            if is_brace {
+                if let Some(brace_open) = open_brace_idx {
+                    let header = rest[2..brace_open].trim();
+                    let condition = clean_condition(header);
+                    if let Some(brace_close) = find_matching_brace(rest, brace_open) {
+                        let then_content = &rest[brace_open + 1..brace_close];
+                        let then_body = parse_statements_into_ast(then_content);
+
+                        let after_then = &rest[brace_close + 1..];
+                        let after_trimmed = after_then.trim_start();
+
+                        if let Some(after_else_kw) = after_trimmed.strip_prefix("else") {
+                            let next_char = after_else_kw.chars().next();
+                            let is_else_token = next_char.map(|c| c.is_whitespace() || c == '{').unwrap_or(true);
+
+                            if is_else_token {
+                                let after_else = after_else_kw.trim_start();
+                                if let Some(else_brace_open) = find_first_char_outside_string(after_else, b'{') {
+                                    if let Some(else_brace_close) = find_matching_brace(after_else, else_brace_open) {
+                                        let else_content = &after_else[else_brace_open + 1..else_brace_close];
+                                        let else_body = parse_statements_into_ast(else_content);
+
+                                        instructions.push(PolyglotInstruction::IfElse {
+                                            condition,
+                                            then_body,
+                                            else_body,
+                                        });
+
+                                        let remaining = &after_else[else_brace_close + 1..];
+                                        instructions.extend(parse_statements_into_ast(remaining));
+                                        return instructions;
+                                    }
+                                }
+                            }
+                        }
+
+                        instructions.push(PolyglotInstruction::IfElse {
+                            condition,
+                            then_body,
+                            else_body: Vec::new(),
+                        });
+                        instructions.extend(parse_statements_into_ast(after_then));
+                        return instructions;
+                    }
+                }
+            } else if let Some(col_pos) = colon_idx {
+                let header = rest[2..col_pos].trim();
+                let condition = clean_condition(header);
+                let block_lines = &rest[col_pos + 1..];
+
+                let mut then_lines = Vec::new();
+                let mut else_lines = Vec::new();
+                let mut after_lines = Vec::new();
+
+                enum PyIfState {
+                    Then,
+                    Else,
+                    After,
+                }
+                let mut state = PyIfState::Then;
+
+                for line in block_lines.lines() {
+                    let trimmed_line = line.trim();
+                    if trimmed_line.is_empty() {
+                        continue;
+                    }
+                    match state {
+                        PyIfState::Then => {
+                            if line.starts_with("    ")
+                                || line.starts_with('\t')
+                                || line.starts_with("  ")
+                            {
+                                then_lines.push(trimmed_line);
+                            } else if trimmed_line == "else:" || trimmed_line.starts_with("else:") {
+                                state = PyIfState::Else;
+                            } else {
+                                state = PyIfState::After;
+                                after_lines.push(trimmed_line);
+                            }
+                        }
+                        PyIfState::Else => {
+                            if line.starts_with("    ")
+                                || line.starts_with('\t')
+                                || line.starts_with("  ")
+                            {
+                                else_lines.push(trimmed_line);
+                            } else {
+                                state = PyIfState::After;
+                                after_lines.push(trimmed_line);
+                            }
+                        }
+                        PyIfState::After => {
+                            after_lines.push(trimmed_line);
+                        }
+                    }
+                }
+
+                let then_body = parse_statements_into_ast(&then_lines.join("\n"));
+                let else_body = parse_statements_into_ast(&else_lines.join("\n"));
+
+                instructions.push(PolyglotInstruction::IfElse {
+                    condition,
+                    then_body,
+                    else_body,
+                });
+
+                if !after_lines.is_empty() {
+                    instructions.extend(parse_statements_into_ast(&after_lines.join("\n")));
+                }
+                return instructions;
+            }
+        } else if kw == "for" {
+            if is_brace {
+                if let Some(brace_open) = open_brace_idx {
+                    let header = rest[3..brace_open].trim();
+                    let (item_var, coll_expr) = parse_for_header(header);
+                    if let Some(brace_close) = find_matching_brace(rest, brace_open) {
+                        let body_str = &rest[brace_open + 1..brace_close];
+                        let body = parse_statements_into_ast(body_str);
+
+                        instructions.push(PolyglotInstruction::ForLoop {
+                            item_var,
+                            collection_expr: coll_expr,
+                            body,
+                        });
+
+                        let remaining = &rest[brace_close + 1..];
+                        instructions.extend(parse_statements_into_ast(remaining));
+                        return instructions;
+                    }
+                }
+            } else if let Some(col_pos) = colon_idx {
+                let header = rest[3..col_pos].trim();
                 let (item_var, coll_expr) = parse_for_header(header);
-                let body_insts = parse_linear_statements(body_str);
+                let block_lines = &rest[col_pos + 1..];
 
+                let mut body_lines = Vec::new();
+                let mut after_lines = Vec::new();
+                let mut in_body = true;
+
+                for line in block_lines.lines() {
+                    let trimmed_line = line.trim();
+                    if trimmed_line.is_empty() {
+                        continue;
+                    }
+                    if in_body
+                        && (line.starts_with("    ")
+                            || line.starts_with('\t')
+                            || line.starts_with("  "))
+                    {
+                        body_lines.push(trimmed_line);
+                    } else {
+                        in_body = false;
+                        after_lines.push(trimmed_line);
+                    }
+                }
+
+                let body = parse_statements_into_ast(&body_lines.join("\n"));
                 instructions.push(PolyglotInstruction::ForLoop {
                     item_var,
                     collection_expr: coll_expr,
-                    body: body_insts,
+                    body,
                 });
 
-                let after = &stripped[abs_close + 1..];
-                instructions.extend(parse_linear_statements(after));
-
+                if !after_lines.is_empty() {
+                    instructions.extend(parse_statements_into_ast(&after_lines.join("\n")));
+                }
                 return instructions;
             }
         }
     }
 
-    if let Some(for_idx) = stripped.find("for ") {
-        if let Some(colon_idx) = stripped[for_idx..].find(':') {
-            let abs_colon = for_idx + colon_idx;
-            let header = &stripped[for_idx + 4..abs_colon].trim();
-            let rest = &stripped[abs_colon + 1..];
-
-            let mut body_lines = Vec::new();
-            let mut after_lines = Vec::new();
-            let mut in_body = true;
-
-            for line in rest.lines() {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if in_body
-                    && (line.starts_with("    ")
-                        || line.starts_with('\t')
-                        || line.starts_with("  "))
-                {
-                    body_lines.push(trimmed);
-                } else {
-                    in_body = false;
-                    after_lines.push(trimmed);
-                }
-            }
-
-            let before = &stripped[..for_idx];
-            instructions.extend(parse_linear_statements(before));
-
-            let (item_var, coll_expr) = parse_for_header(header);
-            let body_str = body_lines.join("\n");
-            let body_insts = parse_linear_statements(&body_str);
-
-            instructions.push(PolyglotInstruction::ForLoop {
-                item_var,
-                collection_expr: coll_expr,
-                body: body_insts,
-            });
-
-            let after_str = after_lines.join("\n");
-            instructions.extend(parse_linear_statements(&after_str));
-
-            return instructions;
-        }
-    }
-
-    parse_linear_statements(&stripped)
+    parse_linear_statements(code)
 }
 
 fn parse_lenient_json(raw: &str) -> Option<Value> {
@@ -1127,6 +1725,128 @@ mod tests {
             assert_eq!(val["runtimeUsed"], json!("wasm:wasm32-wasmer-4.0"));
             assert_eq!(val["wasmProcessed"], json!(true));
             assert_eq!(val["json"]["result"], json!(84));
+        }
+    }
+
+    #[test]
+    fn test_local_variables_evaluation() {
+        let ctx = ExprContext::empty("exec-local-vars");
+        let input = json!({
+            "json": { "price": 100 }
+        });
+        let code = "let tax = item.price * 0.1;\nitem.total = item.price + tax;\nreturn item;";
+        let res = execute_polyglot_code("javascript", "es2022-quickjs", code, &input, &ctx);
+        assert!(res.is_ok());
+        if let Ok(val) = res {
+            assert_eq!(val["codeExecuted"], json!(true));
+            assert_eq!(val["json"]["total"], json!(110));
+            // Verify local variable 'tax' was NOT added to item.json
+            assert!(val["json"].get("tax").is_none());
+            assert!(val.get("tax").is_none());
+        }
+    }
+
+    #[test]
+    fn test_if_else_branching() {
+        let ctx = ExprContext::empty("exec-if-else");
+        let input_high = json!({
+            "json": { "price": 100 }
+        });
+        let input_low = json!({
+            "json": { "price": 50 }
+        });
+        let code = "if (item.price >= 100) { item.tax = 15; } else { item.tax = 5; }\nreturn item;";
+
+        let res_high = execute_polyglot_code("javascript", "es2022-quickjs", code, &input_high, &ctx);
+        assert!(res_high.is_ok());
+        if let Ok(val) = res_high {
+            assert_eq!(val["json"]["tax"], json!(15));
+        }
+
+        let res_low = execute_polyglot_code("javascript", "es2022-quickjs", code, &input_low, &ctx);
+        assert!(res_low.is_ok());
+        if let Ok(val) = res_low {
+            assert_eq!(val["json"]["tax"], json!(5));
+        }
+    }
+
+    #[test]
+    fn test_runtime_not_installed_rejection() {
+        let ctx = ExprContext::empty("exec-not-installed");
+        let input = json!({ "json": { "a": 1 } });
+        // Ensure es2024-v8-compat is uninstalled
+        let _ = delete_runtime("javascript", "es2024-v8-compat");
+        assert!(!is_runtime_installed("javascript", "es2024-v8-compat"));
+
+        let res = execute_polyglot_code("javascript", "es2024-v8-compat", "return item;", &input, &ctx);
+        assert!(res.is_err());
+        if let Err(e) = res {
+            assert!(e.contains("is not installed"));
+        }
+    }
+
+    #[test]
+    fn test_execute_polyglot_code_with_mode_for_each_item() {
+        let ctx = ExprContext::empty("exec-mode-items");
+        let input = json!([
+            { "json": { "price": 100 } },
+            { "json": { "price": 200 } }
+        ]);
+        let code = "let tax = item.price * 0.1;\nitem.total = item.price + tax;\nreturn item;";
+        let res = execute_polyglot_code_with_mode(
+            "javascript",
+            "es2022-quickjs",
+            code,
+            &input,
+            &ctx,
+            "runOnceForEachItem",
+        );
+        assert!(res.is_ok());
+        if let Ok(Value::Array(items)) = res {
+            assert_eq!(items.len(), 2);
+            assert_eq!(items[0]["json"]["total"], json!(110));
+            assert_eq!(items[1]["json"]["total"], json!(220));
+            assert!(items[0]["json"].get("tax").is_none());
+            assert!(items[1]["json"].get("tax").is_none());
+        } else {
+            panic!("Expected array output from runOnceForEachItem");
+        }
+    }
+
+    #[test]
+    fn test_delete_runtime_cache_invalidation() {
+        let ctx = ExprContext::empty("exec-inval");
+        let input = json!({ "json": { "x": 10 } });
+        let code = "item.x = item.x * 2;\nreturn item;";
+
+        let pkg = download_runtime("javascript", "es2024-v8-compat");
+        assert!(pkg.is_ok());
+        assert!(is_runtime_installed("javascript", "es2024-v8-compat"));
+
+        let res = execute_polyglot_code("javascript", "es2024-v8-compat", code, &input, &ctx);
+        assert!(res.is_ok());
+
+        let manager = PolyglotRuntimeManager::global();
+        let code_hash = compute_program_hash("javascript", "es2024-v8-compat", code);
+        assert!(manager.ast_cache.contains_key(&code_hash));
+
+        let del_res = delete_runtime("javascript", "es2024-v8-compat");
+        assert!(del_res.is_ok());
+        assert!(!is_runtime_installed("javascript", "es2024-v8-compat"));
+
+        // AST cache for this language:version MUST be cleared
+        assert!(!manager.ast_cache.contains_key(&code_hash));
+    }
+
+    #[test]
+    fn test_python_if_else_syntax() {
+        let ctx = ExprContext::empty("exec-py-if");
+        let input = json!({ "json": { "price": 120 } });
+        let code = "if item['price'] >= 100:\n    item['tax'] = 20\nelse:\n    item['tax'] = 5\nreturn item";
+        let res = execute_polyglot_code("python", "3.11-sandbox", code, &input, &ctx);
+        assert!(res.is_ok());
+        if let Ok(val) = res {
+            assert_eq!(val["json"]["tax"], json!(20));
         }
     }
 }

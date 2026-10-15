@@ -155,6 +155,10 @@ impl ArenaNode {
     }
 }
 
+thread_local! {
+    static CURRENT_SUBWORKFLOW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub trait NodeExecutor: Send + Sync {
     fn execute(
         &self,
@@ -175,7 +179,8 @@ impl NodeExecutor for DefaultNodeExecutor {
         ctx: &ExprContext,
         is_hyperscale: bool,
     ) -> (Arc<Value>, Option<u16>) {
-        execute_node_logic(node, input, ctx, is_hyperscale, 0)
+        let depth = CURRENT_SUBWORKFLOW_DEPTH.with(|d| d.get());
+        execute_node_logic(node, input, ctx, is_hyperscale, depth)
     }
 }
 
@@ -701,8 +706,10 @@ fn traverse_node_inner<'scope>(
         }
 
         // Execute node transformation with zero-copy Arc<Value> & conditional port routing
+        CURRENT_SUBWORKFLOW_DEPTH.with(|d| d.set(ctx.subworkflow_depth));
+        let executor = DefaultNodeExecutor;
         let (result_payload, active_port) =
-            execute_node_logic(node, current_input, &expr_ctx, ctx.is_hyperscale, ctx.subworkflow_depth);
+            executor.execute(node, current_input, &expr_ctx, ctx.is_hyperscale);
 
         // Store output for UI runData ONLY when not compact logging (saves massive allocations in hyperscale)
         if !ctx.is_compact_logging {
@@ -1473,14 +1480,16 @@ fn execute_node_logic(
             }
         }
         NodeKind::Code => {
-            let language = params_ref
+            let raw_lang = params_ref
                 .get("language")
                 .and_then(|v| v.as_str())
                 .unwrap_or("javascript");
+            let language = crate::runtime::normalize_language(raw_lang);
 
             let default_version = match language {
                 "python" => "3.11-sandbox",
                 "wasm" => "wasm32-wasmer-4.0",
+                "rust" => "rust-script-nightly",
                 _ => "es2022-quickjs",
             };
 
@@ -1490,23 +1499,82 @@ fn execute_node_logic(
                 .and_then(|v| v.as_str())
                 .unwrap_or(default_version);
 
-            let code_str = params_ref
-                .get("jsCode")
-                .or_else(|| params_ref.get("pythonCode"))
-                .or_else(|| params_ref.get("wasmCode"))
-                .or_else(|| params_ref.get("code"))
+            let code_val = match language {
+                "python" => params_ref
+                    .get("pythonCode")
+                    .or_else(|| params_ref.get("code"))
+                    .or_else(|| params_ref.get("jsCode")),
+                "wasm" => params_ref
+                    .get("wasmCode")
+                    .or_else(|| params_ref.get("code"))
+                    .or_else(|| params_ref.get("jsCode")),
+                "rust" => params_ref
+                    .get("code")
+                    .or_else(|| params_ref.get("jsCode")),
+                _ => params_ref
+                    .get("jsCode")
+                    .or_else(|| params_ref.get("code")),
+            };
+
+            let code_str = code_val
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .trim();
 
-            let is_default_bypass = is_hyperscale
-                || code_str.is_empty()
+            let mode = params_ref
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("runOnceForAllItems");
+
+            let is_default_bypass = code_str.is_empty()
                 || code_str == "return $input.all();"
                 || code_str == "return _input.all();"
                 || code_str == "return $input.all()"
                 || code_str == "return _input.all()";
 
-            if is_default_bypass {
+            if !is_hyperscale && !crate::runtime::is_runtime_installed(language, version) {
+                let err_msg = format!(
+                    "Runtime package '{language}:{version}' is not installed. Please download it first."
+                );
+                let runtime_tag = json!(format!("{language}:{version}"));
+                let mut err_val = (*input).clone();
+                if let Some(arr) = err_val.as_array_mut() {
+                    for item in arr {
+                        if let Some(obj) = item.as_object_mut() {
+                            if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                inner.insert("codeExecuted".to_string(), json!(true));
+                                inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                                inner.insert("error".to_string(), json!(err_msg));
+                            }
+                            obj.insert("codeExecuted".to_string(), json!(true));
+                            obj.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                            obj.insert("error".to_string(), json!(err_msg));
+                        }
+                    }
+                    return (Arc::new(err_val), None);
+                } else if let Some(obj) = err_val.as_object_mut() {
+                    if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                        inner.insert("codeExecuted".to_string(), json!(true));
+                        inner.insert("runtimeUsed".to_string(), runtime_tag.clone());
+                        inner.insert("error".to_string(), json!(err_msg));
+                    }
+                    obj.insert("codeExecuted".to_string(), json!(true));
+                    obj.insert("runtimeUsed".to_string(), runtime_tag);
+                    obj.insert("error".to_string(), json!(err_msg));
+                    return (Arc::new(err_val), None);
+                } else {
+                    return (
+                        Arc::new(json!({
+                            "codeExecuted": true,
+                            "runtimeUsed": format!("{language}:{version}"),
+                            "error": err_msg
+                        })),
+                        None,
+                    );
+                }
+            }
+
+            if is_hyperscale || is_default_bypass {
                 let runtime_tag = json!(format!("{language}:{version}"));
                 if let Some(arr) = input.as_array() {
                     let all_executed = arr.iter().all(|item| {
@@ -1563,7 +1631,9 @@ fn execute_node_logic(
                     )
                 }
             } else {
-                match crate::runtime::execute_polyglot_code(language, version, code_str, &input, expr_ctx) {
+                match crate::runtime::execute_polyglot_code_with_mode(
+                    language, version, code_str, &input, expr_ctx, mode,
+                ) {
                     Ok(result) => (Arc::new(result), None),
                     Err(err) => {
                         let mut err_val = (*input).clone();
