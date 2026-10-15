@@ -319,6 +319,42 @@ async fn test_node_types_and_credential_types_contracts() {
             );
         }
 
+        // Contract verification: every property with type "options" must have a non-empty options array with valid items
+        for n in nodes {
+            if let Some(props) = n.get("properties").and_then(|p| p.as_array()) {
+                for prop in props {
+                    if prop.get("type").and_then(|t| t.as_str()) == Some("options") {
+                        let opt_arr = prop
+                            .get("options")
+                            .and_then(|o| o.as_array())
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Property '{}' on node '{}' has type 'options' but missing 'options' array",
+                                    prop["name"], n["name"]
+                                )
+                            });
+                        assert!(
+                            !opt_arr.is_empty(),
+                            "Property '{}' on node '{}' must have non-empty 'options' array",
+                            prop["name"], n["name"]
+                        );
+                        for opt in opt_arr {
+                            assert!(
+                                opt.get("name").is_some(),
+                                "Option item on property '{}' of node '{}' must contain 'name'",
+                                prop["name"], n["name"]
+                            );
+                            assert!(
+                                opt.get("value").is_some(),
+                                "Option item on property '{}' of node '{}' must contain 'value'",
+                                prop["name"], n["name"]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         // Test GET /rest/credential-types
         let res = app
             .clone()

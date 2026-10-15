@@ -827,6 +827,8 @@ fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params:
             return;
         }
 
+        let mut to_insert: Vec<(String, Value)> = Vec::new();
+
         // 1. Format n8n v1/v2: "values": { "string": [...], "number": [...], "boolean": [...] }
         if let Some(values_obj) = params_obj.get("values").and_then(|v| v.as_object()) {
             for type_arr in values_obj.values() {
@@ -835,7 +837,7 @@ fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params:
                         if let (Some(k), Some(v)) =
                             (item.get("name").and_then(|n| n.as_str()), item.get("value"))
                         {
-                            target_obj.insert(k.to_string(), v.clone());
+                            to_insert.push((k.to_string(), v.clone()));
                         }
                     }
                 }
@@ -852,7 +854,7 @@ fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params:
                 if let (Some(k), Some(v)) =
                     (item.get("name").and_then(|n| n.as_str()), item.get("value"))
                 {
-                    target_obj.insert(k.to_string(), v.clone());
+                    to_insert.push((k.to_string(), v.clone()));
                 }
             }
         }
@@ -860,7 +862,18 @@ fn apply_set_parameters(target_obj: &mut serde_json::Map<String, Value>, params:
         // 3. Parameter key-value langsung lainnya (selain internal fields)
         for (k, v) in params_obj {
             if k != "values" && k != "assignments" && k != "options" && k != "keepOnlySet" {
-                target_obj.insert(k.clone(), v.clone());
+                to_insert.push((k.clone(), v.clone()));
+            }
+        }
+
+        // Terapkan ke target_obj dan ke inner target_obj["json"] jika ada
+        let has_inner_json = target_obj.get("json").is_some_and(|j| j.is_object());
+        for (k, v) in to_insert {
+            target_obj.insert(k.clone(), v.clone());
+            if has_inner_json {
+                if let Some(inner) = target_obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                    inner.insert(k, v);
+                }
             }
         }
     }
@@ -1054,11 +1067,14 @@ fn is_set_idempotent(obj: &serde_json::Map<String, Value>, params: &Value) -> bo
         if params_obj.contains_key("values") || params_obj.contains_key("assignments") {
             return false;
         }
+        let inner_obj = obj.get("json").and_then(|j| j.as_object());
         let mut checked_any = false;
         for (k, v) in params_obj {
             if k != "options" && k != "keepOnlySet" {
                 checked_any = true;
-                if obj.get(k) != Some(v) {
+                let matches_top = obj.get(k) == Some(v);
+                let matches_inner = inner_obj.and_then(|j| j.get(k)) == Some(v);
+                if !matches_top && !matches_inner {
                     return false;
                 }
             }

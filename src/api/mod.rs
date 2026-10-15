@@ -550,13 +550,24 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "HTTP Method",
                     "name": "httpMethod",
                     "type": "options",
-                    "default": "GET"
+                    "default": "GET",
+                    "options": [
+                        { "name": "GET", "value": "GET" },
+                        { "name": "POST", "value": "POST" },
+                        { "name": "PUT", "value": "PUT" },
+                        { "name": "DELETE", "value": "DELETE" },
+                        { "name": "PATCH", "value": "PATCH" }
+                    ]
                 },
                 {
                     "displayName": "Response Mode",
                     "name": "responseMode",
                     "type": "options",
-                    "default": "onReceived"
+                    "default": "onReceived",
+                    "options": [
+                        { "name": "On Received", "value": "onReceived" },
+                        { "name": "When Last Node Finishes", "value": "responseNode" }
+                    ]
                 }
             ]
         },
@@ -581,7 +592,15 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Method",
                     "name": "method",
                     "type": "options",
-                    "default": "GET"
+                    "default": "GET",
+                    "options": [
+                        { "name": "GET", "value": "GET" },
+                        { "name": "POST", "value": "POST" },
+                        { "name": "PUT", "value": "PUT" },
+                        { "name": "DELETE", "value": "DELETE" },
+                        { "name": "PATCH", "value": "PATCH" },
+                        { "name": "HEAD", "value": "HEAD" }
+                    ]
                 },
                 {
                     "displayName": "Headers",
@@ -693,7 +712,14 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Fallback Output",
                     "name": "fallbackOutput",
                     "type": "options",
-                    "default": "extra"
+                    "default": -1,
+                    "options": [
+                        { "name": "None", "value": -1 },
+                        { "name": "Output 0", "value": 0 },
+                        { "name": "Output 1", "value": 1 },
+                        { "name": "Output 2", "value": 2 },
+                        { "name": "Output 3", "value": 3 }
+                    ]
                 }
             ]
         },
@@ -712,7 +738,12 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Mode",
                     "name": "mode",
                     "type": "options",
-                    "default": "append"
+                    "default": "append",
+                    "options": [
+                        { "name": "Append", "value": "append" },
+                        { "name": "Combine", "value": "combine" },
+                        { "name": "Choose Branch", "value": "chooseBranch" }
+                    ]
                 }
             ]
         },
@@ -926,7 +957,11 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Order",
                     "name": "order",
                     "type": "options",
-                    "default": "ascending"
+                    "default": "ascending",
+                    "options": [
+                        { "name": "Ascending", "value": "ascending" },
+                        { "name": "Descending", "value": "descending" }
+                    ]
                 }
             ]
         },
@@ -951,7 +986,11 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Keep",
                     "name": "keep",
                     "type": "options",
-                    "default": "firstItems"
+                    "default": "firstItems",
+                    "options": [
+                        { "name": "First Items", "value": "firstItems" },
+                        { "name": "Last Items", "value": "lastItems" }
+                    ]
                 }
             ]
         },
@@ -976,7 +1015,17 @@ pub fn get_core_node_types_array() -> Value {
                     "displayName": "Operator",
                     "name": "operator",
                     "type": "options",
-                    "default": "equals"
+                    "default": "equals",
+                    "options": [
+                        { "name": "Equals", "value": "equals" },
+                        { "name": "Not Equals", "value": "notEquals" },
+                        { "name": "Contains", "value": "contains" },
+                        { "name": "Larger", "value": "larger" },
+                        { "name": "Larger Equal", "value": "largerEqual" },
+                        { "name": "Smaller", "value": "smaller" },
+                        { "name": "Smaller Equal", "value": "smallerEqual" },
+                        { "name": "Exists", "value": "exists" }
+                    ]
                 },
                 {
                     "displayName": "Value",
