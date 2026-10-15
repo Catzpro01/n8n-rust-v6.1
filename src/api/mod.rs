@@ -646,6 +646,54 @@ pub fn get_core_node_types_array() -> Value {
             "inputs": ["main"],
             "outputs": ["main"],
             "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.splitInBatches",
+            "displayName": "Split In Batches",
+            "icon": "fa:th-large",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Splits data into batches and iterates over them",
+            "defaults": { "name": "Split In Batches" },
+            "inputs": ["main"],
+            "outputs": ["main", "main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.wait",
+            "displayName": "Wait",
+            "icon": "fa:clock",
+            "group": ["flow"],
+            "version": 1,
+            "description": "Waits for a specified amount of time or resume event",
+            "defaults": { "name": "Wait" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.stopAndError",
+            "displayName": "Stop And Error",
+            "icon": "fa:stop-circle",
+            "group": ["flow"],
+            "version": 1,
+            "description": "Stops workflow execution and throws an error",
+            "defaults": { "name": "Stop And Error" },
+            "inputs": ["main"],
+            "outputs": [],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.errorTrigger",
+            "displayName": "Error Trigger",
+            "icon": "fa:exclamation-triangle",
+            "group": ["trigger"],
+            "version": 1,
+            "description": "Triggers workflow when another workflow encounters an error",
+            "defaults": { "name": "Error Trigger" },
+            "inputs": [],
+            "outputs": ["main"],
+            "properties": []
         }
     ])
 }
@@ -1472,7 +1520,10 @@ pub async fn create_variable(
         var_type: payload.var_type.unwrap_or_else(|| "string".to_string()),
     };
     match state.db.save_variable(&var) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": var }))).into_response(),
+        Ok(()) => {
+            crate::engine::register_variable(&var.key, &var.value);
+            (StatusCode::OK, Json(json!({ "data": var }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1512,6 +1563,7 @@ pub async fn update_variable(
         }
     };
 
+    let existing_key = existing.key.clone();
     let var = VariableRecord {
         id,
         key: payload.key.unwrap_or(existing.key),
@@ -1519,7 +1571,13 @@ pub async fn update_variable(
         var_type: payload.var_type.unwrap_or(existing.var_type),
     };
     match state.db.save_variable(&var) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": var }))).into_response(),
+        Ok(()) => {
+            if existing_key != var.key {
+                crate::engine::unregister_variable(&existing_key);
+            }
+            crate::engine::register_variable(&var.key, &var.value);
+            (StatusCode::OK, Json(json!({ "data": var }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1532,8 +1590,14 @@ pub async fn delete_variable(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    let existing_key = state.db.get_variable(&id).ok().flatten().map(|v| v.key);
     match state.db.delete_variable(&id) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(true) => {
+            if let Some(k) = existing_key {
+                crate::engine::unregister_variable(&k);
+            }
+            (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Variable not found" })),
@@ -1771,6 +1835,7 @@ pub struct RunWorkflowPayload {
     pub pin_data: Option<Value>,
     pub nodes: Option<Value>,
     pub connections: Option<Value>,
+    pub settings: Option<Value>,
 }
 
 pub async fn run_workflow_by_id(
@@ -1818,7 +1883,18 @@ pub async fn run_workflow_by_id(
         })
         .unwrap_or(wf.connections);
 
-    execute_workflow_helper(state, Some(id), nodes, connections).await
+    let settings = payload
+        .as_ref()
+        .and_then(|p| {
+            p.settings.clone().or_else(|| {
+                p.workflow_data
+                    .as_ref()
+                    .and_then(|w| w.get("settings").cloned())
+            })
+        })
+        .or(Some(wf.settings));
+
+    execute_workflow_helper(state, Some(id), nodes, connections, settings).await
 }
 
 pub async fn run_workflow_direct(
@@ -1848,7 +1924,17 @@ pub async fn run_workflow_direct(
         })
         .unwrap_or_else(|| json!({}));
 
-    execute_workflow_helper(state, None, nodes, connections).await
+    let settings = payload
+        .settings
+        .clone()
+        .or_else(|| {
+            payload
+                .workflow_data
+                .as_ref()
+                .and_then(|w| w.get("settings").cloned())
+        });
+
+    execute_workflow_helper(state, None, nodes, connections, settings).await
 }
 
 async fn execute_workflow_helper(
@@ -1856,6 +1942,7 @@ async fn execute_workflow_helper(
     workflow_id: Option<String>,
     nodes: Value,
     connections: Value,
+    settings: Option<Value>,
 ) -> axum::response::Response {
     let graph = match CompiledGraph::compile(&nodes, &connections) {
         Ok(g) => g,
@@ -1886,8 +1973,8 @@ async fn execute_workflow_helper(
             workflow_id.as_deref(),
             &graph,
             Arc::new(json!({})),
-            Some(notifier),
-            Some(cancel_token),
+            Some(Arc::clone(&notifier)),
+            Some(Arc::clone(&cancel_token)),
         )
         .await
     {
@@ -1917,20 +2004,101 @@ async fn execute_workflow_helper(
     };
     let _ = state.db.record_execution_async(write_msg);
 
+    let mut error_workflow_execution: Option<Value> = None;
+    if exec_res.status == "error" {
+        let error_workflow_id = settings
+            .as_ref()
+            .and_then(|s| s.get("errorWorkflow"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .or_else(|| {
+                workflow_id.as_ref().and_then(|w_id| {
+                    state.db.get_workflow(w_id).ok().flatten().and_then(|w| {
+                        w.settings.get("errorWorkflow").and_then(|v| v.as_str()).map(|s| s.to_string())
+                    })
+                })
+            });
+
+        if let Some(err_wf_id) = error_workflow_id {
+            let err_wf_data = crate::engine::get_subworkflow(&err_wf_id)
+                .map(|val| {
+                    let err_nodes = val.get("nodes").cloned().unwrap_or_else(|| json!([]));
+                    let err_conns = val.get("connections").cloned().unwrap_or_else(|| json!({}));
+                    (err_nodes, err_conns)
+                })
+                .or_else(|| {
+                    state
+                        .db
+                        .get_workflow(&err_wf_id)
+                        .ok()
+                        .flatten()
+                        .map(|wf_rec| (wf_rec.nodes, wf_rec.connections))
+                });
+
+            if let Some((err_nodes, err_conns)) = err_wf_data {
+                if let Ok(err_graph) = CompiledGraph::compile(&err_nodes, &err_conns) {
+                    let err_execution_id = format!("exec-{}", new_id());
+                    let err_cancel_token = Arc::new(AtomicBool::new(false));
+                    state
+                        .active_executions
+                        .insert(err_execution_id.clone(), Arc::clone(&err_cancel_token));
+
+                    let err_input = json!({
+                        "execution": { "id": execution_id, "status": "error" },
+                        "workflow": { "id": workflow_id.clone().unwrap_or_default() },
+                        "error": exec_res.final_output.get("error").cloned().unwrap_or_else(|| exec_res.final_output.clone())
+                    });
+
+                    if let Ok(err_exec_res) = state
+                        .engine
+                        .execute(
+                            &err_execution_id,
+                            Some(&err_wf_id),
+                            &err_graph,
+                            Arc::new(err_input),
+                            Some(Arc::clone(&notifier)),
+                            Some(err_cancel_token),
+                        )
+                        .await
+                    {
+                        state.active_executions.remove(&err_execution_id);
+                        error_workflow_execution = Some(json!({
+                            "workflowId": err_wf_id,
+                            "status": err_exec_res.status,
+                            "executedNodes": err_exec_res.executed_nodes,
+                            "durationMs": err_exec_res.duration_ms
+                        }));
+                    } else {
+                        state.active_executions.remove(&err_execution_id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mut data_obj = json!({
+        "executionId": execution_id,
+        "status": exec_res.status,
+        "executedNodes": exec_res.executed_nodes,
+        "durationMs": exec_res.duration_ms,
+        "resultData": exec_res
+            .payload
+            .get("resultData")
+            .cloned()
+            .unwrap_or_else(|| exec_res.payload.clone())
+    });
+
+    if let Some(err_exec) = error_workflow_execution {
+        if let Some(obj) = data_obj.as_object_mut() {
+            obj.insert("errorWorkflowExecution".to_string(), err_exec);
+        }
+    }
+
     (
         StatusCode::OK,
         Json(json!({
-            "data": {
-                "executionId": execution_id,
-                "status": exec_res.status,
-                "executedNodes": exec_res.executed_nodes,
-                "durationMs": exec_res.duration_ms,
-                "resultData": exec_res
-                    .payload
-                    .get("resultData")
-                    .cloned()
-                    .unwrap_or_else(|| exec_res.payload.clone())
-            }
+            "data": data_obj
         })),
     )
         .into_response()
@@ -2397,9 +2565,10 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
                     let wf_id = wf.id.clone();
                     let nodes = wf.nodes.clone();
                     let connections = wf.connections.clone();
+                    let settings = Some(wf.settings.clone());
 
                     tokio::spawn(async move {
-                        let _ = execute_workflow_helper(state_clone, Some(wf_id.clone()), nodes, connections)
+                        let _ = execute_workflow_helper(state_clone, Some(wf_id.clone()), nodes, connections, settings)
                             .await;
                         in_flight_clone.remove(&wf_id);
                     });

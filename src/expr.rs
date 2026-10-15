@@ -264,6 +264,15 @@ pub fn evaluate_raw_expression(expr: &str, item_json: &Value, ctx: &ExprContext)
         let val = std::env::var(var_name).unwrap_or_default();
         return Value::String(val);
     }
+    if let Some(var_name) = expr.strip_prefix("$vars.") {
+        let val = crate::engine::get_variable(var_name).unwrap_or_default();
+        return Value::String(val);
+    }
+    if expr.starts_with("$vars[") && expr.ends_with(']') {
+        let inner = expr[6..expr.len() - 1].trim_matches(|c| c == '\'' || c == '"');
+        let val = crate::engine::get_variable(inner).unwrap_or_default();
+        return Value::String(val);
+    }
 
     // 6. Upstream Node Access ($node["NodeName"].json.prop or $('NodeName').item.json.prop)
     if expr.starts_with("$node[") || expr.starts_with("$('") || expr.starts_with("$(\"") {

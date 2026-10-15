@@ -3458,4 +3458,409 @@ async fn test_respond_to_webhook_and_collection_transform_nodes() {
     .expect("Test 22 timed out!");
 }
 
+// ---------------------------------------------------------------------------
+// 23. Variables Expression Resolution & Flow Control Nodes Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_vars_expression_and_flow_control_nodes() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Create global variable via REST API POST /rest/variables
+        let var_payload = json!({
+            "key": "API_HOST",
+            "value": "api.production.internal",
+            "type": "string"
+        });
+
+        let res_var = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/variables")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(var_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_var.status(), StatusCode::OK);
+        let bytes_var = res_var.into_body().collect().await.unwrap().to_bytes();
+        let var_json: serde_json::Value = serde_json::from_slice(&bytes_var).unwrap();
+        assert_eq!(var_json["data"]["key"], "API_HOST");
+        assert_eq!(var_json["data"]["value"], "api.production.internal");
+
+        // 2. Test $vars.API_HOST expression resolution in workflow Set node
+        let vars_wf = json!({
+            "nodes": [
+                {
+                    "id": "set-target",
+                    "name": "Set Target URL",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "target_url": "https://{{$vars.API_HOST}}/v1/users"
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(vars_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run.status(), StatusCode::OK);
+        let bytes_run = res_run.into_body().collect().await.unwrap().to_bytes();
+        let run_json: serde_json::Value = serde_json::from_slice(&bytes_run).unwrap();
+        assert_eq!(run_json["data"]["status"], "success");
+        let set_output = &run_json["data"]["resultData"]["runData"]["Set Target URL"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(set_output["target_url"], "https://api.production.internal/v1/users");
+
+        // 3. Test SplitInBatches node with [1, 2, 3, 4, 5]
+        let engine = HyperScaleEngine::new(Some(2)).expect("HyperScaleEngine init failed");
+
+        // batchSize: 2, batchIndex: 0 -> port 0, [1, 2]
+        let split_node_0 = json!({
+            "nodes": [
+                {
+                    "id": "split-0",
+                    "name": "Split Batch 0",
+                    "type": "n8n-nodes-base.splitInBatches",
+                    "parameters": {
+                        "batchSize": 2,
+                        "batchIndex": 0
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let graph_0 = CompiledGraph::compile(&split_node_0["nodes"], &split_node_0["connections"]).unwrap();
+        let res_0 = engine.execute(
+            "exec-split-0",
+            None,
+            &graph_0,
+            Arc::new(json!([1, 2, 3, 4, 5])),
+            None,
+            None,
+        ).await.unwrap();
+        assert_eq!(res_0.status, "success");
+        assert_eq!(res_0.final_output, json!([1, 2]));
+
+        // batchSize: 2, batchIndex: 2 -> port 0, [5]
+        let split_node_2 = json!({
+            "nodes": [
+                {
+                    "id": "split-2",
+                    "name": "Split Batch 2",
+                    "type": "n8n-nodes-base.splitInBatches",
+                    "parameters": {
+                        "batchSize": 2,
+                        "batchIndex": 2
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let graph_2 = CompiledGraph::compile(&split_node_2["nodes"], &split_node_2["connections"]).unwrap();
+        let res_2 = engine.execute(
+            "exec-split-2",
+            None,
+            &graph_2,
+            Arc::new(json!([1, 2, 3, 4, 5])),
+            None,
+            None,
+        ).await.unwrap();
+        assert_eq!(res_2.status, "success");
+        assert_eq!(res_2.final_output, json!([5]));
+
+        // batchSize: 2, batchIndex: 3 -> port 1 (done), []
+        let split_node_3 = json!({
+            "nodes": [
+                {
+                    "id": "split-3",
+                    "name": "Split Batch 3",
+                    "type": "n8n-nodes-base.splitInBatches",
+                    "parameters": {
+                        "batchSize": 2,
+                        "batchIndex": 3
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let graph_3 = CompiledGraph::compile(&split_node_3["nodes"], &split_node_3["connections"]).unwrap();
+        let res_3 = engine.execute(
+            "exec-split-3",
+            None,
+            &graph_3,
+            Arc::new(json!([1, 2, 3, 4, 5])),
+            None,
+            None,
+        ).await.unwrap();
+        assert_eq!(res_3.status, "success");
+        assert_eq!(res_3.final_output, json!([]));
+
+        // 4. Test Wait node
+        let wait_wf = json!({
+            "nodes": [
+                {
+                    "id": "wait-node",
+                    "name": "Wait Node",
+                    "type": "n8n-nodes-base.wait",
+                    "parameters": {
+                        "amount": 50
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let wait_start = Instant::now();
+        let res_wait = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(wait_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let elapsed_wait = wait_start.elapsed();
+        assert_eq!(res_wait.status(), StatusCode::OK);
+        assert!(
+            elapsed_wait >= Duration::from_millis(40),
+            "Wait node with amount 50 must sleep >= 40ms, got {:?}",
+            elapsed_wait
+        );
+
+        // 5. Test StopAndError node
+        // Case A: Without continueOnFail -> workflow status "error", node produces __node_error: true
+        let stop_err_wf = json!({
+            "nodes": [
+                {
+                    "id": "stop-err-node",
+                    "name": "Stop and Error Node",
+                    "type": "n8n-nodes-base.stopAndError",
+                    "parameters": {
+                        "errorMessage": "Emergency Stop Triggered"
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let res_stop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(stop_err_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_stop.status(), StatusCode::OK);
+        let bytes_stop = res_stop.into_body().collect().await.unwrap().to_bytes();
+        let stop_json: serde_json::Value = serde_json::from_slice(&bytes_stop).unwrap();
+        assert_eq!(stop_json["data"]["status"], "error");
+        let stop_out = &stop_json["data"]["resultData"]["runData"]["Stop and Error Node"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(stop_out["__node_error"], true);
+        assert_eq!(stop_out["error"]["message"], "Emergency Stop Triggered");
+
+        // Case B: With continueOnFail: true -> workflow status "success", output node has continueOnFail: true
+        let stop_cof_wf = json!({
+            "nodes": [
+                {
+                    "id": "stop-cof-node",
+                    "name": "Stop and Error Continue",
+                    "type": "n8n-nodes-base.stopAndError",
+                    "continueOnFail": true,
+                    "parameters": {
+                        "errorMessage": "Emergency Stop Triggered",
+                        "continueOnFail": true
+                    }
+                }
+            ],
+            "connections": {}
+        });
+        let res_cof = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(stop_cof_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_cof.status(), StatusCode::OK);
+        let bytes_cof = res_cof.into_body().collect().await.unwrap().to_bytes();
+        let cof_json: serde_json::Value = serde_json::from_slice(&bytes_cof).unwrap();
+        assert_eq!(cof_json["data"]["status"], "success");
+        let cof_out = &cof_json["data"]["resultData"]["runData"]["Stop and Error Continue"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(cof_out["continueOnFail"], true);
+        assert_eq!(cof_out["error"]["message"], "Emergency Stop Triggered");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 23 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 24. Error Trigger & Error Workflow Handling Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_error_trigger_and_error_workflow_handling() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Create error handler workflow:
+        //    Node 1: Error Trigger (n8n-nodes-base.errorTrigger)
+        //    Node 2: Set (n8n-nodes-base.set) that captures $json.error.message and $json.execution.id
+        let error_handler_wf = json!({
+            "name": "Global Error Handler Workflow",
+            "nodes": [
+                {
+                    "id": "err-trigger",
+                    "name": "Error Trigger",
+                    "type": "n8n-nodes-base.errorTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "err-set",
+                    "name": "Capture Error Info",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "error_message": "={{$json.error.message}}",
+                        "failed_execution_id": "={{$json.execution.id}}"
+                    }
+                }
+            ],
+            "connections": {
+                "Error Trigger": {
+                    "main": [
+                        [
+                            { "node": "Capture Error Info", "type": "main", "index": 0 }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        // Save to DB with ID "err-handler-wf-001" and activate
+        let err_wf_record = n8n_rust_v5::db::WorkflowRecord {
+            id: "err-handler-wf-001".to_string(),
+            name: "Global Error Handler Workflow".to_string(),
+            active: true,
+            is_archived: false,
+            nodes: error_handler_wf["nodes"].clone(),
+            connections: error_handler_wf["connections"].clone(),
+            settings: json!({}),
+            static_data: json!({}),
+            pin_data: json!({}),
+            meta: json!({}),
+            version_id: "v1".to_string(),
+            trigger_count: 1,
+            tags: json!([]),
+            parent_folder_id: None,
+            created_at: "2026-10-15T00:00:00Z".to_string(),
+            updated_at: "2026-10-15T00:00:00Z".to_string(),
+        };
+        db.insert_or_update_workflow(&err_wf_record).unwrap();
+        n8n_rust_v5::engine::register_subworkflow(
+            "err-handler-wf-001",
+            json!({
+                "nodes": err_wf_record.nodes,
+                "connections": err_wf_record.connections
+            }),
+        );
+
+        // 2. Create main workflow:
+        //    Node: StopAndError (errorMessage: "Critical DB Connection Failure", continueOnFail: false)
+        //    Settings: { "errorWorkflow": "err-handler-wf-001" }
+        let main_wf = json!({
+            "nodes": [
+                {
+                    "id": "main-stop-err",
+                    "name": "Stop on Critical DB Error",
+                    "type": "n8n-nodes-base.stopAndError",
+                    "parameters": {
+                        "errorMessage": "Critical DB Connection Failure",
+                        "continueOnFail": false
+                    }
+                }
+            ],
+            "connections": {},
+            "settings": {
+                "errorWorkflow": "err-handler-wf-001"
+            }
+        });
+
+        // 3. Execute main workflow via POST /rest/workflows/run
+        let res_main = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(main_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_main.status(), StatusCode::OK);
+        let bytes_main = res_main.into_body().collect().await.unwrap().to_bytes();
+        let main_json: serde_json::Value = serde_json::from_slice(&bytes_main).unwrap();
+
+        // 4. Verifications:
+        //    - Status eksekusi main workflow adalah "error"
+        assert_eq!(
+            main_json["data"]["status"], "error",
+            "Main workflow execution status must be 'error'"
+        );
+
+        //    - Respon API mengandung "errorWorkflowExecution" dengan status: "success" dan workflowId: "err-handler-wf-001"
+        let error_wf_execution = &main_json["data"]["errorWorkflowExecution"];
+        assert!(
+            !error_wf_execution.is_null(),
+            "Response data must contain 'errorWorkflowExecution': {:?}",
+            main_json
+        );
+        assert_eq!(
+            error_wf_execution["status"], "success",
+            "Error workflow execution status must be 'success'"
+        );
+        assert_eq!(
+            error_wf_execution["workflowId"], "err-handler-wf-001",
+            "Error workflow ID must match configured 'err-handler-wf-001'"
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 24 timed out!");
+}
+
+
 

@@ -35,6 +35,10 @@ pub enum NodeKind {
     SplitOut = 14,
     Aggregate = 15,
     RemoveDuplicates = 16,
+    SplitInBatches = 17,
+    Wait = 18,
+    StopAndError = 19,
+    ErrorTrigger = 20,
     Unknown = 255,
 }
 
@@ -58,6 +62,10 @@ impl NodeKind {
             "n8n-nodes-base.splitOut" | "splitOut" => NodeKind::SplitOut,
             "n8n-nodes-base.aggregate" | "aggregate" => NodeKind::Aggregate,
             "n8n-nodes-base.removeDuplicates" | "removeDuplicates" => NodeKind::RemoveDuplicates,
+            "n8n-nodes-base.splitInBatches" | "splitInBatches" => NodeKind::SplitInBatches,
+            "n8n-nodes-base.wait" | "wait" => NodeKind::Wait,
+            "n8n-nodes-base.stopAndError" | "stopAndError" => NodeKind::StopAndError,
+            "n8n-nodes-base.errorTrigger" | "errorTrigger" => NodeKind::ErrorTrigger,
             _ => NodeKind::Unknown,
         }
     }
@@ -96,6 +104,24 @@ pub fn get_credential(credential_id: &str) -> Option<Value> {
 pub fn unregister_credential(credential_id: &str) {
     if let Some(registry) = CREDENTIAL_REGISTRY.get() {
         registry.remove(credential_id);
+    }
+}
+
+static VARIABLE_REGISTRY: OnceLock<DashMap<String, String>> = OnceLock::new();
+
+pub fn register_variable(key: &str, value: &str) {
+    let registry = VARIABLE_REGISTRY.get_or_init(DashMap::new);
+    registry.insert(key.to_string(), value.to_string());
+}
+
+pub fn get_variable(key: &str) -> Option<String> {
+    let registry = VARIABLE_REGISTRY.get_or_init(DashMap::new);
+    registry.get(key).map(|v| v.clone())
+}
+
+pub fn unregister_variable(key: &str) {
+    if let Some(registry) = VARIABLE_REGISTRY.get() {
+        registry.remove(key);
     }
 }
 
@@ -1571,6 +1597,84 @@ fn execute_node_logic(
             }
 
             (Arc::new(Value::Array(out_items)), None)
+        }
+        NodeKind::SplitInBatches => {
+            let batch_size = params_ref
+                .get("batchSize")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .max(1) as usize;
+            let batch_index = params_ref
+                .get("batchIndex")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0) as usize;
+
+            let items: Vec<Value> = if let Some(arr) = input.as_array() {
+                arr.clone()
+            } else {
+                vec![(*input).clone()]
+            };
+
+            let start = batch_index.saturating_mul(batch_size);
+            let slice: Vec<Value> = if start < items.len() {
+                let end = (start + batch_size).min(items.len());
+                items[start..end].to_vec()
+            } else {
+                Vec::new()
+            };
+
+            if slice.is_empty() {
+                (Arc::new(Value::Array(Vec::new())), Some(1))
+            } else {
+                (Arc::new(Value::Array(slice)), Some(0))
+            }
+        }
+        NodeKind::Wait => {
+            let wait_ms = params_ref
+                .get("amount")
+                .or_else(|| params_ref.get("waitMs"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(10)
+                .clamp(0, 2000);
+            if wait_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+            }
+            (input, None)
+        }
+        NodeKind::StopAndError => {
+            let err_msg = params_ref
+                .get("errorMessage")
+                .or_else(|| params_ref.get("message"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Workflow stopped by StopAndError node");
+
+            let continue_on_fail = params_ref
+                .get("continueOnFail")
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    params_ref
+                        .get("options")
+                        .and_then(|o| o.get("continueOnFail"))
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(false);
+
+            if continue_on_fail {
+                let payload = json!({
+                    "continueOnFail": true,
+                    "error": { "message": err_msg }
+                });
+                (Arc::new(payload), None)
+            } else {
+                let payload = json!({
+                    "__node_error": true,
+                    "error": { "message": err_msg }
+                });
+                (Arc::new(payload), None)
+            }
+        }
+        NodeKind::ErrorTrigger => {
+            (input, None)
         }
         _ => (input, None),
     }
