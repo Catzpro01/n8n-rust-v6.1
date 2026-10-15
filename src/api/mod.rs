@@ -652,6 +652,25 @@ pub async fn install_community_package(
         )
             .into_response();
     }
+    if let Some(ref m) = payload.manifest {
+        let valid_manifest = m
+            .get("nodeTypes")
+            .and_then(|n| n.as_array())
+            .is_some_and(|arr| {
+                arr.iter().all(|item| {
+                    item.get("name")
+                        .and_then(|n| n.as_str())
+                        .is_some_and(|s| !s.trim().is_empty())
+                })
+            });
+        if !valid_manifest {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": "Invalid manifest: nodeTypes must be an array of objects with non-empty 'name'" })),
+            )
+                .into_response();
+        }
+    }
     let now = Utc::now().to_rfc3339();
     let pkg = CommunityPackageRecord {
         name: payload.name.trim().to_string(),
@@ -2126,6 +2145,8 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
                     continue;
                 }
             };
+
+            last_runs.retain(|id, _| active_wfs.iter().any(|w| &w.id == id));
 
             for wf in active_wfs {
                 if in_flight.contains(&wf.id) {

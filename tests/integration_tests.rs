@@ -2003,6 +2003,69 @@ async fn test_spatial_lod_viewport_clustering() {
         assert_eq!(map_zero["data"]["totalOriginalNodes"], 10);
         assert_eq!(map_zero["data"]["isClustered"], true);
 
+        // 5. Anti-regression check: Extreme coordinates [1e100, -1e100] with gridSize=0
+        let extreme_nodes_wf = json!({
+            "name": "Extreme Coordinates Spatial Workflow",
+            "nodes": [
+                {
+                    "id": "extreme-1",
+                    "name": "Extreme Node 1",
+                    "type": "n8n-nodes-base.set",
+                    "position": [1e100, -1e100]
+                },
+                {
+                    "id": "extreme-2",
+                    "name": "Extreme Node 2",
+                    "type": "n8n-nodes-base.set",
+                    "position": [-1e100, 1e100]
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_ext = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(extreme_nodes_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_ext.status(), StatusCode::OK);
+        let ext_bytes = res_ext.into_body().collect().await.unwrap().to_bytes();
+        let ext_wf: serde_json::Value = serde_json::from_slice(&ext_bytes).unwrap();
+        let ext_id = ext_wf["data"]["id"].as_str().unwrap();
+
+        let res_ext_map = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{ext_id}/spatial-map?gridSize=0"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_ext_map.status(), StatusCode::OK);
+        let ext_map_bytes = res_ext_map.into_body().collect().await.unwrap().to_bytes();
+        let ext_map: serde_json::Value = serde_json::from_slice(&ext_map_bytes).unwrap();
+        let rendered = ext_map["data"]["nodes"].as_array().unwrap();
+        assert!(!rendered.is_empty());
+        for n in rendered {
+            if let Some(pos) = n.get("position").and_then(|p| p.as_array()) {
+                let px = pos[0].as_f64().unwrap();
+                let py = pos[1].as_f64().unwrap();
+                assert!(px.is_finite(), "X coordinate must be finite, got {}", px);
+                assert!(py.is_finite(), "Y coordinate must be finite, got {}", py);
+            }
+        }
+
         let _ = std::fs::remove_file(db_path);
     })
     .await
@@ -2128,6 +2191,30 @@ async fn test_community_packages_registry_and_node_types_merge() {
             .unwrap();
 
         assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
+
+        // 6. Anti-regression check: Install package with malformed manifest nodeTypes must return 400 Bad Request
+        let bad_manifest_pkg = json!({
+            "name": "bad-pkg",
+            "manifest": {
+                "nodeTypes": [
+                    { "noName": 123 }
+                ]
+            }
+        });
+        let res_bad_m = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/community-packages")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(bad_manifest_pkg.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_bad_m.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_file(db_path);
     })
@@ -2266,6 +2353,44 @@ async fn test_real_http_client_and_schedule_daemon() {
                 "Plain-text response must be preserved as Value::String and not dropped to Null"
             );
         }
+
+        // 4. Anti-regression check: Dead local port with continueOnFail must return statusCode 502 and continueOnFail: true
+        let dead_http_wf = json!({
+            "nodes": [
+                {
+                    "id": "http-dead",
+                    "name": "Dead HTTP Request",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": "http://127.0.0.1:1",
+                        "method": "GET",
+                        "continueOnFail": true
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_dead = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(dead_http_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_dead.status(), StatusCode::OK);
+        let bytes_dead = res_dead.into_body().collect().await.unwrap().to_bytes();
+        let dead_res: serde_json::Value = serde_json::from_slice(&bytes_dead).unwrap();
+        assert_eq!(dead_res["data"]["status"], "success");
+        let res_data = &dead_res["data"]["resultData"]["runData"]["Dead HTTP Request"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(res_data["statusCode"], 502, "Expected 502 Bad Gateway for dead port");
+        assert_eq!(res_data["continueOnFail"], true, "Expected continueOnFail to be true");
 
         let _ = std::fs::remove_file(db_path);
     })
