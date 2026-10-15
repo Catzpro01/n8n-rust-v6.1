@@ -1237,17 +1237,19 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
         let mut nodes = Vec::with_capacity(total_nodes);
         let mut edges = vec![Vec::new(); total_nodes];
 
-        let static_set_params = json!({ "step": "processed", "verified": true });
+        let static_set_params = json!({ "step": "processed", "verified": true, "codeExecuted": true });
         let static_if_params = json!({ "value1": 10, "value2": 5, "operation": "largerEqual" });
         let static_filter_params = json!({ "field": "verified", "operator": "equals", "value": true });
         let static_switch_params = json!({ "rules": [{ "field": "step", "operator": "equals", "value": "processed", "outputPort": 0 }] });
         let static_sort_params = json!({ "sortField": "step", "order": "asc" });
         let static_limit_params = json!({ "maxItems": 10, "keep": "firstItems" });
+        let static_aggregate_params = json!({ "destinationFieldName": "items" });
         let static_split_out_params = json!({ "fieldToSplitOut": "items" });
         let static_remove_dup_params = json!({ "compareField": "step" });
-        let static_aggregate_params = json!({ "destinationFieldName": "items" });
         let static_split_batch_params = json!({ "batchSize": 10, "batchIndex": 0 });
         let static_code_params = json!({});
+
+        let mut type_counts: std::collections::BTreeMap<&'static str, usize> = std::collections::BTreeMap::new();
 
         // Build 1,000 parallel independent real heterogeneous n8n pipelines
         for c in 0..chains_count {
@@ -1256,6 +1258,8 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
                 let idx = base + s;
                 let (node_type, params) = if s == 0 {
                     ("n8n-nodes-base.manualTrigger", json!({}))
+                } else if s == nodes_per_chain - 1 {
+                    ("n8n-nodes-base.set", static_set_params.clone())
                 } else {
                     match idx % 12 {
                         1 => ("n8n-nodes-base.set", static_set_params.clone()),
@@ -1264,14 +1268,16 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
                         4 => ("n8n-nodes-base.switch", static_switch_params.clone()),
                         5 => ("n8n-nodes-base.sort", static_sort_params.clone()),
                         6 => ("n8n-nodes-base.limit", static_limit_params.clone()),
-                        7 => ("n8n-nodes-base.splitOut", static_split_out_params.clone()),
-                        8 => ("n8n-nodes-base.removeDuplicates", static_remove_dup_params.clone()),
-                        9 => ("n8n-nodes-base.aggregate", static_aggregate_params.clone()),
+                        7 => ("n8n-nodes-base.aggregate", static_aggregate_params.clone()),
+                        8 => ("n8n-nodes-base.splitOut", static_split_out_params.clone()),
+                        9 => ("n8n-nodes-base.removeDuplicates", static_remove_dup_params.clone()),
                         10 => ("n8n-nodes-base.splitInBatches", static_split_batch_params.clone()),
                         11 => ("n8n-nodes-base.code", static_code_params.clone()),
                         _ => ("n8n-nodes-base.set", static_set_params.clone()),
                     }
                 };
+
+                *type_counts.entry(node_type).or_insert(0) += 1;
 
                 nodes.push(ArenaNode {
                     id: format!("n_{idx}"),
@@ -1299,6 +1305,10 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
             graph.nodes.len(),
             graph.roots.len()
         );
+        println!(">>> Node Type Distribution:");
+        for (ntype, count) in &type_counts {
+            println!("    - {}: {}", ntype, count);
+        }
         assert_eq!(graph.nodes.len(), 1_000_000);
         assert_eq!(graph.roots.len(), 1_000);
 
@@ -1343,7 +1353,19 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
 
         assert_eq!(result.executed_nodes, 1_000_000, "Must execute exactly 1,000,000 nodes");
         assert_eq!(result.status, "success", "Execution status must be success");
-        assert!(exec_ms < 30000, "Execution took {} ms", exec_ms);
+        assert!(
+            exec_ms < 5000,
+            "Execution of 1,000,000 nodes took {} ms (must be under 5,000 ms)",
+            exec_ms
+        );
+        let final_item = result
+            .final_output
+            .as_array()
+            .and_then(|a| a.first())
+            .unwrap_or(&result.final_output);
+        assert_eq!(final_item["step"], "processed", "Final output must contain step == processed");
+        assert_eq!(final_item["verified"], true, "Final output must contain verified == true");
+        assert_eq!(final_item["codeExecuted"], true, "Final output must contain codeExecuted == true");
 
         // Save to SQLite via write-behind buffer and flush
         let write_msg = ExecutionWriteMessage {
@@ -4079,6 +4101,148 @@ async fn test_switch_sort_limit_and_filter_nodes() {
         assert_eq!(limit_arr[2]["json"]["name"], "Task 5");
         assert_eq!(limit_arr[2]["json"]["score"], 60);
 
+        // 1b. Test Limit dengan keep: "lastItems" dari input 5 item
+        let five_items = json!([
+            { "id": 101, "name": "Item 1" },
+            { "id": 102, "name": "Item 2" },
+            { "id": 103, "name": "Item 3" },
+            { "id": 104, "name": "Item 4" },
+            { "id": 105, "name": "Item 5" }
+        ]);
+
+        let limit_last_wf = json!({
+            "name": "Limit Keep LastItems Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-limit-last",
+                    "name": "TriggerLimitLast",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": five_items
+                    }
+                },
+                {
+                    "id": "node-limit-last",
+                    "name": "LimitLast2",
+                    "type": "n8n-nodes-base.limit",
+                    "parameters": {
+                        "maxItems": 2,
+                        "keep": "lastItems"
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerLimitLast": {
+                    "main": [
+                        [ { "node": "LimitLast2", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "TriggerLimitLast": five_items
+            }
+        });
+
+        let res_limit_last = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(limit_last_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_limit_last.status(), StatusCode::OK);
+        let bytes_ll = res_limit_last.into_body().collect().await.unwrap().to_bytes();
+        let res_ll_json: serde_json::Value = serde_json::from_slice(&bytes_ll).unwrap();
+        assert_eq!(
+            res_ll_json["data"]["status"], "success",
+            "Limit lastItems pipeline execution status must be success"
+        );
+
+        let limit_last_out = &res_ll_json["data"]["resultData"]["runData"]["LimitLast2"][0]["data"]["main"][0];
+        let limit_last_arr = limit_last_out.as_array().expect("LimitLast2 output must be an array");
+        assert_eq!(limit_last_arr.len(), 2, "LimitLast2 must return exactly 2 items");
+        assert_eq!(limit_last_arr[0]["json"]["id"], 104, "First of last 2 items must be id 104");
+        assert_eq!(limit_last_arr[1]["json"]["id"], 105, "Second of last 2 items must be id 105");
+
+        // 1c. Test Filter dengan operator: "exists" untuk field "score"
+        let filter_exists_items = json!([
+            { "id": 1, "name": "Alpha", "score": 100 },
+            { "id": 2, "name": "Beta" },
+            { "id": 3, "name": "Gamma", "score": 250 },
+            { "id": 4, "name": "Delta", "score": null },
+            { "id": 5, "name": "Epsilon", "score": 300 }
+        ]);
+
+        let filter_exists_wf = json!({
+            "name": "Filter Exists Score Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-filter-exists",
+                    "name": "TriggerFilterExists",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": filter_exists_items
+                    }
+                },
+                {
+                    "id": "node-filter-exists",
+                    "name": "FilterScoreExists",
+                    "type": "n8n-nodes-base.filter",
+                    "parameters": {
+                        "field": "score",
+                        "operator": "exists"
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerFilterExists": {
+                    "main": [
+                        [ { "node": "FilterScoreExists", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "TriggerFilterExists": filter_exists_items
+            }
+        });
+
+        let res_filter_exists = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(filter_exists_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_filter_exists.status(), StatusCode::OK);
+        let bytes_fe = res_filter_exists.into_body().collect().await.unwrap().to_bytes();
+        let res_fe_json: serde_json::Value = serde_json::from_slice(&bytes_fe).unwrap();
+        assert_eq!(
+            res_fe_json["data"]["status"], "success",
+            "Filter exists pipeline execution status must be success"
+        );
+
+        let filter_fe_out = &res_fe_json["data"]["resultData"]["runData"]["FilterScoreExists"][0]["data"]["main"][0];
+        let filter_fe_arr = filter_fe_out.as_array().expect("FilterScoreExists output must be an array");
+        assert_eq!(filter_fe_arr.len(), 3, "FilterScoreExists must return exactly 3 items with existing score");
+        assert_eq!(filter_fe_arr[0]["json"]["id"], 1);
+        assert_eq!(filter_fe_arr[0]["json"]["score"], 100);
+        assert_eq!(filter_fe_arr[1]["json"]["id"], 3);
+        assert_eq!(filter_fe_arr[1]["json"]["score"], 250);
+        assert_eq!(filter_fe_arr[2]["json"]["id"], 5);
+        assert_eq!(filter_fe_arr[2]["json"]["score"], 300);
+
         // 2. Multi-branch Switch Routing + Downstream Merge Node
         let switch_input_data = json!({ "tier": "silver", "amount": 250 });
 
@@ -4098,6 +4262,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "name": "SwitchTier",
                     "type": "n8n-nodes-base.switch",
                     "parameters": {
+                        "fallbackOutput": 2,
                         "rules": [
                             { "field": "tier", "operator": "equals", "value": "bronze", "outputPort": 0 },
                             { "field": "tier", "operator": "equals", "value": "silver", "outputPort": 1 },
@@ -4222,6 +4387,152 @@ async fn test_switch_sort_limit_and_filter_nodes() {
             silver_found,
             "MergeResults output must contain reward 'silver_medal', got: {:?}",
             merge_arr
+        );
+
+        // 3. Switch fallbackOutput Routing Test (Platinum -> fallbackOutput: 2 -> BranchGold)
+        let switch_fallback_input = json!({ "tier": "platinum", "amount": 999 });
+
+        let switch_fallback_wf = json!({
+            "name": "Switch Fallback Output Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-fb",
+                    "name": "Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": switch_fallback_input
+                    }
+                },
+                {
+                    "id": "node-switch-fb",
+                    "name": "SwitchTier",
+                    "type": "n8n-nodes-base.switch",
+                    "parameters": {
+                        "fallbackOutput": 2,
+                        "rules": [
+                            { "field": "tier", "operator": "equals", "value": "bronze", "outputPort": 0 },
+                            { "field": "tier", "operator": "equals", "value": "silver", "outputPort": 1 },
+                            { "field": "tier", "operator": "equals", "value": "gold", "outputPort": 2 }
+                        ]
+                    }
+                },
+                {
+                    "id": "node-branch-bronze-fb",
+                    "name": "BranchBronze",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "reward": "bronze_medal"
+                    }
+                },
+                {
+                    "id": "node-branch-silver-fb",
+                    "name": "BranchSilver",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "reward": "silver_medal"
+                    }
+                },
+                {
+                    "id": "node-branch-gold-fb",
+                    "name": "BranchGold",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "reward": "gold_medal"
+                    }
+                },
+                {
+                    "id": "node-merge-fb",
+                    "name": "MergeResults",
+                    "type": "n8n-nodes-base.merge",
+                    "parameters": {}
+                }
+            ],
+            "connections": {
+                "Trigger": {
+                    "main": [
+                        [ { "node": "SwitchTier", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "SwitchTier": {
+                    "main": [
+                        [ { "node": "BranchBronze", "type": "main", "index": 0 } ],
+                        [ { "node": "BranchSilver", "type": "main", "index": 0 } ],
+                        [ { "node": "BranchGold", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "BranchBronze": {
+                    "main": [
+                        [ { "node": "MergeResults", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "BranchSilver": {
+                    "main": [
+                        [ { "node": "MergeResults", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "BranchGold": {
+                    "main": [
+                        [ { "node": "MergeResults", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "Trigger": [ { "json": switch_fallback_input } ]
+            }
+        });
+
+        let res_fallback = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(switch_fallback_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_fallback.status(), StatusCode::OK);
+        let bytes_fb = res_fallback.into_body().collect().await.unwrap().to_bytes();
+        let res_fb_json: serde_json::Value = serde_json::from_slice(&bytes_fb).unwrap();
+        assert_eq!(
+            res_fb_json["data"]["status"], "success",
+            "Switch fallback workflow execution status must be success"
+        );
+
+        let run_data_fb = &res_fb_json["data"]["resultData"]["runData"];
+
+        // Verifikasi bahwa fallbackOutput: 2 mengalihkan routing ke BranchGold (port 2)
+        assert!(
+            run_data_fb.get("BranchGold").is_some(),
+            "BranchGold must be executed when tier is platinum via fallbackOutput: 2"
+        );
+        assert!(
+            run_data_fb.get("BranchBronze").is_none(),
+            "BranchBronze must be pruned for platinum tier fallback"
+        );
+        assert!(
+            run_data_fb.get("BranchSilver").is_none(),
+            "BranchSilver must be pruned for platinum tier fallback"
+        );
+
+        // Verifikasi output MergeResults memuat reward "gold_medal" dari BranchGold
+        assert!(
+            run_data_fb.get("MergeResults").is_some(),
+            "MergeResults must be executed following fallbackOutput to BranchGold"
+        );
+        let merge_fb_out = &run_data_fb["MergeResults"][0]["data"]["main"][0];
+        let merge_fb_arr = merge_fb_out.as_array().expect("MergeResults output must be an array");
+        assert!(!merge_fb_arr.is_empty(), "MergeResults must contain merged output for fallback run");
+        let gold_found = merge_fb_arr.iter().any(|item| {
+            item["json"]["reward"] == "gold_medal"
+        });
+        assert!(
+            gold_found,
+            "MergeResults output must contain reward 'gold_medal' via fallbackOutput, got: {:?}",
+            merge_fb_arr
         );
 
         let _ = std::fs::remove_file(db_path);

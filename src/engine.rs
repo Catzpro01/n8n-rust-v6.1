@@ -1069,7 +1069,17 @@ fn execute_node_logic(
             (payload, None)
         }
         NodeKind::Set => {
-            let payload = if let Some(arr) = input.as_array() {
+            if let Some(arr) = input.as_array() {
+                let all_idempotent = arr.iter().all(|item| {
+                    if let Some(obj) = item.as_object() {
+                        is_set_idempotent(obj, params_ref)
+                    } else {
+                        false
+                    }
+                });
+                if all_idempotent {
+                    return (Arc::clone(&input), None);
+                }
                 let mut new_arr = Vec::with_capacity(arr.len());
                 for elem in arr {
                     let mut merged = elem.clone();
@@ -1084,8 +1094,9 @@ fn execute_node_logic(
                     }
                     new_arr.push(merged);
                 }
-                Arc::new(Value::Array(new_arr))
-            } else if let Some(obj) = input.as_object() {
+                return (Arc::new(Value::Array(new_arr)), None);
+            }
+            let payload = if let Some(obj) = input.as_object() {
                 if is_set_idempotent(obj, params_ref) {
                     Arc::clone(&input)
                 } else {
@@ -1123,29 +1134,41 @@ fn execute_node_logic(
                 if !rules.is_empty() {
                     let test_item = input.as_array().and_then(|a| a.first()).unwrap_or(&*input);
                     for (i, rule) in rules.iter().enumerate() {
-                        let field = rule.get("field").and_then(|f| f.as_str()).unwrap_or("");
-                        let actual = if !field.is_empty() {
-                            test_item.get(field).unwrap_or(&Value::Null)
+                        if let Some(conditions) = rule.get("conditions") {
+                            if evaluate_if_condition(conditions, test_item, expr_ctx, node.has_expressions) {
+                                let target_port = rule
+                                    .get("outputPort")
+                                    .or_else(|| rule.get("output"))
+                                    .and_then(|v| v.as_u64())
+                                    .map(|p| p as u16)
+                                    .unwrap_or(i as u16);
+                                return (input, Some(target_port));
+                            }
                         } else {
-                            rule.get("value1").unwrap_or(&Value::Null)
-                        };
-                        let op = rule
-                            .get("operator")
-                            .or_else(|| rule.get("operation"))
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("equals");
-                        let expected = rule
-                            .get("value")
-                            .or_else(|| rule.get("value2"))
-                            .unwrap_or(&Value::Null);
-                        if check_op(actual, expected, op) {
-                            let target_port = rule
-                                .get("outputPort")
-                                .or_else(|| rule.get("output"))
-                                .and_then(|v| v.as_u64())
-                                .map(|p| p as u16)
-                                .unwrap_or(i as u16);
-                            return (input, Some(target_port));
+                            let field = rule.get("field").and_then(|f| f.as_str()).unwrap_or("");
+                            let actual = if !field.is_empty() {
+                                test_item.get(field).unwrap_or(&Value::Null)
+                            } else {
+                                rule.get("value1").unwrap_or(&Value::Null)
+                            };
+                            let op = rule
+                                .get("operator")
+                                .or_else(|| rule.get("operation"))
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("equals");
+                            let expected = rule
+                                .get("value")
+                                .or_else(|| rule.get("value2"))
+                                .unwrap_or(&Value::Null);
+                            if check_op(actual, expected, op) {
+                                let target_port = rule
+                                    .get("outputPort")
+                                    .or_else(|| rule.get("output"))
+                                    .and_then(|v| v.as_u64())
+                                    .map(|p| p as u16)
+                                    .unwrap_or(i as u16);
+                                return (input, Some(target_port));
+                            }
                         }
                     }
                     let fallback = params_ref
@@ -1239,6 +1262,26 @@ fn execute_node_logic(
                 .get("field")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
+
+            if field.is_empty()
+                && (params_ref.get("conditions").is_some() || params_ref.get("value1").is_some())
+            {
+                if let Some(arr) = input.as_array() {
+                    let filtered: Vec<Value> = arr
+                        .iter()
+                        .filter(|item| {
+                            evaluate_if_condition(params_ref, item, expr_ctx, node.has_expressions)
+                        })
+                        .cloned()
+                        .collect();
+                    return (Arc::new(Value::Array(filtered)), None);
+                } else if evaluate_if_condition(params_ref, &input, expr_ctx, node.has_expressions) {
+                    return (input, None);
+                } else {
+                    return (Arc::new(Value::Array(vec![])), None);
+                }
+            }
+
             let op = params_ref
                 .get("operator")
                 .or_else(|| params_ref.get("operation"))
@@ -1281,6 +1324,24 @@ fn execute_node_logic(
             }
         }
         NodeKind::Code => {
+            if let Some(arr) = input.as_array() {
+                let all_executed = arr.iter().all(|item| {
+                    item.as_object()
+                        .and_then(|o| o.get("codeExecuted"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                });
+                if all_executed {
+                    return (Arc::clone(&input), None);
+                }
+                let mut new_arr = arr.clone();
+                for item in &mut new_arr {
+                    if let Some(obj) = item.as_object_mut() {
+                        obj.insert("codeExecuted".to_string(), json!(true));
+                    }
+                }
+                return (Arc::new(Value::Array(new_arr)), None);
+            }
             if let Some(obj) = input.as_object() {
                 if obj.get("codeExecuted") == Some(&json!(true)) {
                     return (Arc::clone(&input), None);

@@ -1874,6 +1874,32 @@ pub struct RunWorkflowPayload {
     pub settings: Option<Value>,
 }
 
+pub fn apply_pin_data_to_nodes(nodes: &mut Value, pin_data: Option<&Value>) {
+    if let (Some(pin), Some(nodes_arr)) = (pin_data, nodes.as_array_mut()) {
+        for n in nodes_arr {
+            let name = n.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(pin_val) = pin.get(name) {
+                let items: Vec<Value> = if let Some(arr) = pin_val.as_array() {
+                    arr.iter().map(|item| {
+                        if let Some(j) = item.get("json") {
+                            j.clone()
+                        } else {
+                            item.clone()
+                        }
+                    }).collect()
+                } else if let Some(j) = pin_val.get("json") {
+                    vec![j.clone()]
+                } else {
+                    vec![pin_val.clone()]
+                };
+                if let Some(params) = n.get_mut("parameters").and_then(|p| p.as_object_mut()) {
+                    params.entry("data".to_string()).or_insert_with(|| json!(items));
+                }
+            }
+        }
+    }
+}
+
 pub async fn run_workflow_by_id(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1897,7 +1923,7 @@ pub async fn run_workflow_by_id(
         }
     };
 
-    let nodes = payload
+    let mut nodes = payload
         .as_ref()
         .and_then(|p| {
             p.nodes.clone().or_else(|| {
@@ -1907,6 +1933,12 @@ pub async fn run_workflow_by_id(
             })
         })
         .unwrap_or(wf.nodes);
+
+    let pin_data = payload
+        .as_ref()
+        .and_then(|p| p.pin_data.clone().or_else(|| p.workflow_data.as_ref().and_then(|w| w.get("pinData").cloned())))
+        .or_else(|| Some(wf.pin_data.clone()));
+    apply_pin_data_to_nodes(&mut nodes, pin_data.as_ref());
 
     let connections = payload
         .as_ref()
@@ -1956,29 +1988,7 @@ pub async fn run_workflow_direct(
         })
         .unwrap_or_else(|| json!([]));
 
-    if let (Some(pin), Some(nodes_arr)) = (&pin_data, nodes.as_array_mut()) {
-        for n in nodes_arr {
-            let name = n.get("name").and_then(|v| v.as_str()).unwrap_or("");
-            if let Some(pin_val) = pin.get(name) {
-                let items: Vec<Value> = if let Some(arr) = pin_val.as_array() {
-                    arr.iter().map(|item| {
-                        if let Some(j) = item.get("json") {
-                            j.clone()
-                        } else {
-                            item.clone()
-                        }
-                    }).collect()
-                } else if let Some(j) = pin_val.get("json") {
-                    vec![j.clone()]
-                } else {
-                    vec![pin_val.clone()]
-                };
-                if let Some(params) = n.get_mut("parameters").and_then(|p| p.as_object_mut()) {
-                    params.entry("data".to_string()).or_insert_with(|| json!(items));
-                }
-            }
-        }
-    }
+    apply_pin_data_to_nodes(&mut nodes, pin_data.as_ref());
 
     let connections = payload
         .connections
