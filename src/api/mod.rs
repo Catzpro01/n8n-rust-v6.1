@@ -822,8 +822,22 @@ pub fn slice_workflow_spatial(
         if x >= min_x && x <= max_x && y >= min_y && y <= max_y {
             inside_nodes.push(node.clone());
         } else {
-            let gx = (x / grid_size).floor() as i64;
-            let gy = (y / grid_size).floor() as i64;
+            let gx_f = (x / grid_size).floor();
+            let gy_f = (y / grid_size).floor();
+            let gx = if gx_f > 1_000_000_000.0 {
+                1_000_000_000
+            } else if gx_f < -1_000_000_000.0 {
+                -1_000_000_000
+            } else {
+                gx_f as i64
+            };
+            let gy = if gy_f > 1_000_000_000.0 {
+                1_000_000_000
+            } else if gy_f < -1_000_000_000.0 {
+                -1_000_000_000
+            } else {
+                gy_f as i64
+            };
             clusters.entry((gx, gy)).or_default().push(node.clone());
         }
     }
@@ -847,9 +861,9 @@ pub fn slice_workflow_spatial(
                     "gridY": gy,
                     "bounds": [
                         (gx as f64) * grid_size,
-                        ((gx + 1) as f64) * grid_size,
+                        ((gx as f64) + 1.0) * grid_size,
                         (gy as f64) * grid_size,
-                        ((gy + 1) as f64) * grid_size,
+                        ((gy as f64) + 1.0) * grid_size,
                     ]
                 }
             }));
@@ -2088,6 +2102,7 @@ pub fn router(app_state: Arc<AppState>) -> Router {
 
 /// Spawns a background Tokio task to evaluate and trigger active workflows with scheduleTrigger
 pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHandle<()> {
+    let weak_state = Arc::downgrade(&state);
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let last_runs: Arc<DashMap<String, std::time::Instant>> = Arc::new(DashMap::new());
@@ -2095,6 +2110,14 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
 
         loop {
             interval.tick().await;
+
+            let state = match weak_state.upgrade() {
+                Some(s) => s,
+                None => {
+                    // AppState dropped: server shut down or tests finished, terminate daemon cleanly
+                    break;
+                }
+            };
 
             let active_wfs = match state.db.list_active_workflows() {
                 Ok(wfs) => wfs,

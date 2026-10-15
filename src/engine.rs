@@ -1267,23 +1267,19 @@ pub fn execute_real_http_request(
         }
     };
 
-    if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::scope(|s| {
-            s.spawn(|| rt.block_on(async_work))
-                .join()
-                .unwrap_or_else(|_| {
-                    json!({
-                        "statusCode": 500,
-                        "url": url,
-                        "method": method,
-                        "error": "Thread execution panicked",
-                        "data": Value::Null
-                    })
-                })
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    rt.spawn(async move {
+        let _ = tx.send(async_work.await);
+    });
+    rx.recv().unwrap_or_else(|_| {
+        json!({
+            "statusCode": 500,
+            "url": url,
+            "method": method,
+            "error": "Shared HTTP runtime channel closed",
+            "data": Value::Null
         })
-    } else {
-        rt.block_on(async_work)
-    }
+    })
 }
 
 fn num_cpus_available() -> usize {
