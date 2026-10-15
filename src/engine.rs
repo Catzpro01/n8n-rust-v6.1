@@ -873,6 +873,12 @@ fn evaluate_if_condition(
     ctx: &ExprContext,
     has_expressions: bool,
 ) -> bool {
+    let actual_item = if let Some(inner) = item_json.get("json") {
+        inner
+    } else {
+        item_json
+    };
+
     // 1. Simple format: value1 vs value2
     if let (Some(v1), Some(v2)) = (params.get("value1"), params.get("value2")) {
         let op = params
@@ -882,71 +888,120 @@ fn evaluate_if_condition(
         if !has_expressions {
             return check_op(v1, v2, op);
         }
-        let left = expr::resolve_parameters(v1, item_json, ctx);
-        let right = expr::resolve_parameters(v2, item_json, ctx);
+        let left = expr::resolve_parameters(v1, actual_item, ctx);
+        let right = expr::resolve_parameters(v2, actual_item, ctx);
         return check_op(&left, &right, op);
     }
 
-    // 2. n8n conditions object (v1 & v2 formats)
-    if let Some(conds) = params.get("conditions") {
-        if let Some(arr) = conds.get("conditions").and_then(|c| c.as_array()) {
-            if arr.is_empty() {
-                return true;
-            }
-            for c in arr {
-                let left = c
-                    .get("leftValue")
-                    .map(|v| expr::resolve_parameters(v, item_json, ctx))
-                    .unwrap_or(Value::Null);
-                let right = c
-                    .get("rightValue")
-                    .map(|v| expr::resolve_parameters(v, item_json, ctx))
-                    .unwrap_or(Value::Null);
-                let op = c
-                    .get("operator")
-                    .and_then(|o| o.get("operation"))
-                    .and_then(|op| op.as_str())
-                    .or_else(|| c.get("operation").and_then(|op| op.as_str()))
-                    .unwrap_or("equals");
-                if !check_op(&left, &right, op) {
-                    return false;
-                }
-            }
+    // 2. Locate conditions container: either params["conditions"] or params itself
+    let cond_target = if let Some(inner_conds) = params.get("conditions") {
+        inner_conds
+    } else {
+        params
+    };
+
+    // 2a. Direct array of conditions or cond_target["conditions"] as array
+    let conditions_array = if let Some(arr) = cond_target.as_array() {
+        Some(arr)
+    } else {
+        cond_target.get("conditions").and_then(|c| c.as_array())
+    };
+
+    if let Some(arr) = conditions_array {
+        if arr.is_empty() {
             return true;
         }
+        let is_or = cond_target
+            .get("combinator")
+            .and_then(|c| c.as_str())
+            .map(|s| s.eq_ignore_ascii_case("or") || s.eq_ignore_ascii_case("any"))
+            .unwrap_or(false);
 
-        // v1 type groups: boolean, string, number
+        for c in arr {
+            let left = c
+                .get("leftValue")
+                .or_else(|| c.get("value1"))
+                .map(|v| expr::resolve_parameters(v, actual_item, ctx))
+                .unwrap_or(Value::Null);
+            let right = c
+                .get("rightValue")
+                .or_else(|| c.get("value2"))
+                .map(|v| expr::resolve_parameters(v, actual_item, ctx))
+                .unwrap_or(Value::Null);
+            let op = c
+                .get("operator")
+                .and_then(|o| {
+                    if let Some(s) = o.as_str() {
+                        Some(s)
+                    } else {
+                        o.get("operation").and_then(|op| op.as_str())
+                    }
+                })
+                .or_else(|| c.get("operation").and_then(|op| op.as_str()))
+                .unwrap_or("equals");
+            let matched = check_op(&left, &right, op);
+            if is_or {
+                if matched {
+                    return true;
+                }
+            } else if !matched {
+                return false;
+            }
+        }
+        return !is_or;
+    }
+
+    // 2b. v1 type groups: boolean, string, number, dateTime
+    if let Some(obj) = cond_target.as_object() {
         let mut evaluated_any = false;
-        for (_type_name, list) in conds.as_object().into_iter().flatten() {
-            if let Some(items) = list.as_array() {
-                for item in items {
-                    evaluated_any = true;
-                    let left = item
-                        .get("value1")
-                        .map(|v| expr::resolve_parameters(v, item_json, ctx))
-                        .unwrap_or(Value::Null);
-                    let right = item
-                        .get("value2")
-                        .map(|v| expr::resolve_parameters(v, item_json, ctx))
-                        .unwrap_or(Value::Null);
-                    let op = item
-                        .get("operation")
-                        .and_then(|o| o.as_str())
-                        .unwrap_or("equal");
-                    if !check_op(&left, &right, op) {
-                        return false;
+        let is_or = obj
+            .get("combinator")
+            .and_then(|c| c.as_str())
+            .map(|s| s.eq_ignore_ascii_case("or") || s.eq_ignore_ascii_case("any"))
+            .unwrap_or(false);
+
+        for (key, list) in obj {
+            if (key == "boolean" || key == "string" || key == "number" || key == "dateTime")
+                && list.is_array()
+            {
+                if let Some(items) = list.as_array() {
+                    for item in items {
+                        evaluated_any = true;
+                        let left = item
+                            .get("value1")
+                            .or_else(|| item.get("leftValue"))
+                            .map(|v| expr::resolve_parameters(v, actual_item, ctx))
+                            .unwrap_or(Value::Null);
+                        let right = item
+                            .get("value2")
+                            .or_else(|| item.get("rightValue"))
+                            .map(|v| expr::resolve_parameters(v, actual_item, ctx))
+                            .unwrap_or(Value::Null);
+                        let op = item
+                            .get("operation")
+                            .or_else(|| item.get("operator").and_then(|o| o.get("operation")))
+                            .and_then(|o| o.as_str())
+                            .unwrap_or("equal");
+                        let matched = check_op(&left, &right, op);
+                        if is_or {
+                            if matched {
+                                return true;
+                            }
+                        } else if !matched {
+                            return false;
+                        }
                     }
                 }
             }
         }
         if evaluated_any {
-            return true;
+            return !is_or;
         }
     }
 
     // 3. Fallback boolean parameter
-    if let Some(b) = params.get("boolean") {
-        let resolved = expr::resolve_parameters(b, item_json, ctx);
+    if let Some(b) = params.get("boolean").or_else(|| cond_target.get("boolean")) {
+        let resolved = expr::resolve_parameters(b, actual_item, ctx);
         return resolved.as_bool().unwrap_or(false);
     }
 
@@ -1070,6 +1125,20 @@ fn execute_node_logic(
         }
         NodeKind::Set => {
             if let Some(arr) = input.as_array() {
+                if !is_hyperscale && node.has_expressions {
+                    let mut new_arr = Vec::with_capacity(arr.len());
+                    for elem in arr {
+                        let mut merged = elem.clone();
+                        if let Some(obj) = merged.as_object_mut() {
+                            let item_resolved =
+                                crate::expr::resolve_parameters(&node.parameters, elem, expr_ctx);
+                            apply_set_parameters(obj, &item_resolved);
+                        }
+                        new_arr.push(merged);
+                    }
+                    return (Arc::new(Value::Array(new_arr)), None);
+                }
+
                 let all_idempotent = arr.iter().all(|item| {
                     if let Some(obj) = item.as_object() {
                         is_set_idempotent(obj, params_ref)
@@ -1084,13 +1153,7 @@ fn execute_node_logic(
                 for elem in arr {
                     let mut merged = elem.clone();
                     if let Some(obj) = merged.as_object_mut() {
-                        if !is_hyperscale && node.has_expressions {
-                            let item_resolved =
-                                expr::resolve_parameters(&node.parameters, elem, expr_ctx);
-                            apply_set_parameters(obj, &item_resolved);
-                        } else {
-                            apply_set_parameters(obj, params_ref);
-                        }
+                        apply_set_parameters(obj, params_ref);
                     }
                     new_arr.push(merged);
                 }
@@ -1121,7 +1184,12 @@ fn execute_node_logic(
             (input, Some(port))
         }
         NodeKind::Switch => {
-            let rules_arr = params_ref
+            let switch_params = if node.has_expressions {
+                &node.parameters
+            } else {
+                params_ref
+            };
+            let rules_arr = switch_params
                 .get("rules")
                 .and_then(|r| {
                     if r.is_array() {
@@ -1132,14 +1200,22 @@ fn execute_node_logic(
                 });
             if let Some(rules) = rules_arr {
                 if !rules.is_empty() {
-                    let test_item = input.as_array().and_then(|a| a.first()).unwrap_or(&*input);
+                    let raw_item = input.as_array().and_then(|a| a.first()).unwrap_or(&*input);
+                    let test_item = if let Some(inner) = raw_item.get("json") {
+                        inner
+                    } else {
+                        raw_item
+                    };
                     for (i, rule) in rules.iter().enumerate() {
                         if let Some(conditions) = rule.get("conditions") {
                             if evaluate_if_condition(conditions, test_item, expr_ctx, node.has_expressions) {
                                 let target_port = rule
                                     .get("outputPort")
                                     .or_else(|| rule.get("output"))
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(|v| {
+                                        v.as_u64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                    })
                                     .map(|p| p as u16)
                                     .unwrap_or(i as u16);
                                 return (input, Some(target_port));
@@ -1164,16 +1240,31 @@ fn execute_node_logic(
                                 let target_port = rule
                                     .get("outputPort")
                                     .or_else(|| rule.get("output"))
-                                    .and_then(|v| v.as_u64())
+                                    .and_then(|v| {
+                                        v.as_u64()
+                                            .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                                    })
                                     .map(|p| p as u16)
                                     .unwrap_or(i as u16);
                                 return (input, Some(target_port));
                             }
                         }
                     }
-                    let fallback = params_ref
+                    let fallback = switch_params
                         .get("fallbackOutput")
-                        .and_then(|v| v.as_u64())
+                        .or_else(|| {
+                            switch_params.get("fallback").and_then(|f| {
+                                if f.is_object() {
+                                    f.get("output").or_else(|| f.get("outputPort"))
+                                } else {
+                                    Some(f)
+                                }
+                            })
+                        })
+                        .and_then(|v| {
+                            v.as_u64()
+                                .or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                        })
                         .map(|p| p as u16);
                     return (input, fallback);
                 }
@@ -1258,51 +1349,59 @@ fn execute_node_logic(
             }
         }
         NodeKind::Filter => {
-            let field = params_ref
-                .get("field")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            if field.is_empty()
-                && (params_ref.get("conditions").is_some() || params_ref.get("value1").is_some())
-            {
+            let filter_params = if node.has_expressions {
+                &node.parameters
+            } else {
+                params_ref
+            };
+            if filter_params.get("conditions").is_some() || filter_params.get("value1").is_some() {
                 if let Some(arr) = input.as_array() {
                     let filtered: Vec<Value> = arr
                         .iter()
                         .filter(|item| {
-                            evaluate_if_condition(params_ref, item, expr_ctx, node.has_expressions)
+                            evaluate_if_condition(filter_params, item, expr_ctx, node.has_expressions)
                         })
                         .cloned()
                         .collect();
                     return (Arc::new(Value::Array(filtered)), None);
-                } else if evaluate_if_condition(params_ref, &input, expr_ctx, node.has_expressions) {
+                } else if evaluate_if_condition(filter_params, &input, expr_ctx, node.has_expressions) {
                     return (input, None);
                 } else {
                     return (Arc::new(Value::Array(vec![])), None);
                 }
             }
 
-            let op = params_ref
+            let field = filter_params
+                .get("field")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+
+            let op = filter_params
                 .get("operator")
-                .or_else(|| params_ref.get("operation"))
+                .or_else(|| filter_params.get("operation"))
                 .and_then(|v| v.as_str())
                 .unwrap_or("equals");
-            let expected = params_ref
+            let expected = filter_params
                 .get("value")
-                .or_else(|| params_ref.get("value2"))
+                .or_else(|| filter_params.get("value2"))
                 .unwrap_or(&Value::Null);
 
             if let Some(arr) = input.as_array() {
                 let filtered: Vec<Value> = arr
                     .iter()
                     .filter(|item| {
+                        let actual_item = if let Some(inner) = item.get("json") {
+                            inner
+                        } else {
+                            item
+                        };
                         if op == "exists" {
-                            item.get(field).is_some_and(|v| !v.is_null())
+                            actual_item.get(field).is_some_and(|v| !v.is_null())
                         } else {
                             let actual = if !field.is_empty() {
-                                item.get(field).unwrap_or(&Value::Null)
+                                actual_item.get(field).unwrap_or(&Value::Null)
                             } else {
-                                item
+                                actual_item
                             };
                             check_op(actual, expected, op)
                         }
@@ -1311,12 +1410,22 @@ fn execute_node_logic(
                     .collect();
                 (Arc::new(Value::Array(filtered)), None)
             } else {
-                let actual = if !field.is_empty() {
-                    input.get(field).unwrap_or(&Value::Null)
+                let actual_item = if let Some(inner) = input.get("json") {
+                    inner
                 } else {
                     &*input
                 };
-                if check_op(actual, expected, op) {
+                let actual = if !field.is_empty() {
+                    actual_item.get(field).unwrap_or(&Value::Null)
+                } else {
+                    actual_item
+                };
+                let matches = if op == "exists" {
+                    actual_item.get(field).is_some_and(|v| !v.is_null())
+                } else {
+                    check_op(actual, expected, op)
+                };
+                if matches {
                     (input, None)
                 } else {
                     (Arc::new(Value::Array(vec![])), None)
@@ -1327,7 +1436,10 @@ fn execute_node_logic(
             if let Some(arr) = input.as_array() {
                 let all_executed = arr.iter().all(|item| {
                     item.as_object()
-                        .and_then(|o| o.get("codeExecuted"))
+                        .and_then(|o| {
+                            o.get("codeExecuted")
+                                .or_else(|| o.get("json").and_then(|j| j.get("codeExecuted")))
+                        })
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false)
                 });
@@ -1337,18 +1449,28 @@ fn execute_node_logic(
                 let mut new_arr = arr.clone();
                 for item in &mut new_arr {
                     if let Some(obj) = item.as_object_mut() {
+                        if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                            inner.insert("codeExecuted".to_string(), json!(true));
+                        }
                         obj.insert("codeExecuted".to_string(), json!(true));
                     }
                 }
                 return (Arc::new(Value::Array(new_arr)), None);
             }
             if let Some(obj) = input.as_object() {
-                if obj.get("codeExecuted") == Some(&json!(true)) {
+                let executed = obj
+                    .get("codeExecuted")
+                    .or_else(|| obj.get("json").and_then(|j| j.get("codeExecuted")))
+                    == Some(&json!(true));
+                if executed {
                     return (Arc::clone(&input), None);
                 }
             }
             let mut val = (*input).clone();
             if let Some(obj) = val.as_object_mut() {
+                if let Some(inner) = obj.get_mut("json").and_then(|j| j.as_object_mut()) {
+                    inner.insert("codeExecuted".to_string(), json!(true));
+                }
                 obj.insert("codeExecuted".to_string(), json!(true));
             }
             (Arc::new(val), None)

@@ -489,7 +489,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "When clicking ‘Test workflow’" },
             "inputs": [],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Notice",
+                    "name": "notice",
+                    "type": "notice",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.scheduleTrigger",
@@ -501,7 +508,26 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Schedule Trigger" },
             "inputs": [],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Trigger Rules",
+                    "name": "rule",
+                    "type": "fixedCollection",
+                    "default": {}
+                },
+                {
+                    "displayName": "Interval (Seconds)",
+                    "name": "intervalSecs",
+                    "type": "number",
+                    "default": 60
+                },
+                {
+                    "displayName": "Cron Expression",
+                    "name": "cronExpression",
+                    "type": "string",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.webhook",
@@ -513,7 +539,26 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Webhook" },
             "inputs": [],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Path",
+                    "name": "path",
+                    "type": "string",
+                    "default": ""
+                },
+                {
+                    "displayName": "HTTP Method",
+                    "name": "httpMethod",
+                    "type": "options",
+                    "default": "GET"
+                },
+                {
+                    "displayName": "Response Mode",
+                    "name": "responseMode",
+                    "type": "options",
+                    "default": "onReceived"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.httpRequest",
@@ -525,7 +570,44 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "HTTP Request" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "URL",
+                    "name": "url",
+                    "type": "string",
+                    "default": "https://api.example.com"
+                },
+                {
+                    "displayName": "Method",
+                    "name": "method",
+                    "type": "options",
+                    "default": "GET"
+                },
+                {
+                    "displayName": "Headers",
+                    "name": "headers",
+                    "type": "fixedCollection",
+                    "default": {}
+                },
+                {
+                    "displayName": "Body",
+                    "name": "body",
+                    "type": "string",
+                    "default": ""
+                },
+                {
+                    "displayName": "Max Tries",
+                    "name": "maxTries",
+                    "type": "number",
+                    "default": 1
+                },
+                {
+                    "displayName": "Wait Between Tries (ms)",
+                    "name": "waitBetweenTries",
+                    "type": "number",
+                    "default": 1000
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.code",
@@ -537,7 +619,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Code" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "JavaScript Code",
+                    "name": "jsCode",
+                    "type": "string",
+                    "default": "return $input.all();"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.set",
@@ -549,7 +638,20 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Edit Fields" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Values to Set",
+                    "name": "values",
+                    "type": "fixedCollection",
+                    "default": {}
+                },
+                {
+                    "displayName": "Keep Only Set",
+                    "name": "keepOnlySet",
+                    "type": "boolean",
+                    "default": false
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.if",
@@ -561,7 +663,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "If" },
             "inputs": ["main"],
             "outputs": ["main", "main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Conditions",
+                    "name": "conditions",
+                    "type": "filter",
+                    "default": {}
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.switch",
@@ -573,7 +682,20 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Switch" },
             "inputs": ["main"],
             "outputs": ["main", "main", "main", "main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Rules",
+                    "name": "rules",
+                    "type": "fixedCollection",
+                    "default": []
+                },
+                {
+                    "displayName": "Fallback Output",
+                    "name": "fallbackOutput",
+                    "type": "options",
+                    "default": "extra"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.merge",
@@ -585,7 +707,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Merge" },
             "inputs": ["main", "main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Mode",
+                    "name": "mode",
+                    "type": "options",
+                    "default": "append"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.executeWorkflow",
@@ -597,7 +726,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Execute Workflow" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Workflow ID",
+                    "name": "workflowId",
+                    "type": "string",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.respondToWebhook",
@@ -609,7 +745,26 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Respond to Webhook" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Response Code",
+                    "name": "responseCode",
+                    "type": "number",
+                    "default": 200
+                },
+                {
+                    "displayName": "Response Headers",
+                    "name": "responseHeaders",
+                    "type": "fixedCollection",
+                    "default": {}
+                },
+                {
+                    "displayName": "Response Body",
+                    "name": "responseBody",
+                    "type": "string",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.splitOut",
@@ -621,7 +776,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Split Out" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Field to Split Out",
+                    "name": "fieldToSplitOut",
+                    "type": "string",
+                    "default": "items"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.aggregate",
@@ -633,7 +795,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Aggregate" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Destination Field Name",
+                    "name": "destinationFieldName",
+                    "type": "string",
+                    "default": "data"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.removeDuplicates",
@@ -645,7 +814,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Remove Duplicates" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Compare Field",
+                    "name": "compareField",
+                    "type": "string",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.splitInBatches",
@@ -657,7 +833,20 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Split In Batches" },
             "inputs": ["main"],
             "outputs": ["main", "main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Batch Size",
+                    "name": "batchSize",
+                    "type": "number",
+                    "default": 10
+                },
+                {
+                    "displayName": "Batch Index",
+                    "name": "batchIndex",
+                    "type": "number",
+                    "default": 0
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.wait",
@@ -669,7 +858,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Wait" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Wait Amount (ms)",
+                    "name": "amount",
+                    "type": "number",
+                    "default": 1000
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.stopAndError",
@@ -681,7 +877,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Stop And Error" },
             "inputs": ["main"],
             "outputs": [],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Error Message",
+                    "name": "errorMessage",
+                    "type": "string",
+                    "default": "Workflow stopped by StopAndError node"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.errorTrigger",
@@ -693,7 +896,14 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Error Trigger" },
             "inputs": [],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Notice",
+                    "name": "notice",
+                    "type": "notice",
+                    "default": ""
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.sort",
@@ -705,7 +915,20 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Sort" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Sort Field",
+                    "name": "sortField",
+                    "type": "string",
+                    "default": "id"
+                },
+                {
+                    "displayName": "Order",
+                    "name": "order",
+                    "type": "options",
+                    "default": "ascending"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.limit",
@@ -717,7 +940,20 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Limit" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Max Items",
+                    "name": "maxItems",
+                    "type": "number",
+                    "default": 1
+                },
+                {
+                    "displayName": "Keep",
+                    "name": "keep",
+                    "type": "options",
+                    "default": "firstItems"
+                }
+            ]
         },
         {
             "name": "n8n-nodes-base.filter",
@@ -729,7 +965,32 @@ pub fn get_core_node_types_array() -> Value {
             "defaults": { "name": "Filter" },
             "inputs": ["main"],
             "outputs": ["main"],
-            "properties": []
+            "properties": [
+                {
+                    "displayName": "Field",
+                    "name": "field",
+                    "type": "string",
+                    "default": ""
+                },
+                {
+                    "displayName": "Operator",
+                    "name": "operator",
+                    "type": "options",
+                    "default": "equals"
+                },
+                {
+                    "displayName": "Value",
+                    "name": "value",
+                    "type": "string",
+                    "default": ""
+                },
+                {
+                    "displayName": "Conditions",
+                    "name": "conditions",
+                    "type": "filter",
+                    "default": {}
+                }
+            ]
         }
     ])
 }
@@ -1892,8 +2153,11 @@ pub fn apply_pin_data_to_nodes(nodes: &mut Value, pin_data: Option<&Value>) {
                 } else {
                     vec![pin_val.clone()]
                 };
+                if !n.get("parameters").is_some_and(|p| p.is_object()) {
+                    n["parameters"] = json!({});
+                }
                 if let Some(params) = n.get_mut("parameters").and_then(|p| p.as_object_mut()) {
-                    params.entry("data".to_string()).or_insert_with(|| json!(items));
+                    params.insert("data".to_string(), json!(items));
                 }
             }
         }

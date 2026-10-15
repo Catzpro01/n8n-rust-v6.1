@@ -280,18 +280,52 @@ pub fn evaluate_raw_expression(expr: &str, item_json: &Value, ctx: &ExprContext)
     }
 
     // 7. Input item access ($json.path or chained transformations)
+    let effective_item = if let Some(inner) = item_json.get("json") {
+        inner
+    } else {
+        item_json
+    };
+
     if expr == "$json" {
-        return item_json.clone();
+        return effective_item.clone();
     }
     if let Some(path) = expr.strip_prefix("$json.") {
-        return evaluate_path_with_methods(item_json, path);
+        let val = evaluate_path_with_methods(effective_item, path);
+        if val.is_null() && effective_item != item_json {
+            return evaluate_path_with_methods(item_json, path);
+        }
+        return val;
     }
     if let Some(path) = expr.strip_prefix("$json[") {
-        return evaluate_path_with_methods(item_json, path);
+        if let Some(closing_bracket) = path.find(']') {
+            let key_part = &path[..closing_bracket];
+            let clean_key = key_part.trim().trim_matches(|c| c == '\'' || c == '"');
+            let after = path[closing_bracket + 1..].trim_start_matches('.');
+            let val = if let Some(obj) = effective_item.as_object() {
+                obj.get(clean_key).cloned().unwrap_or(Value::Null)
+            } else if let Some(obj) = item_json.as_object() {
+                obj.get(clean_key).cloned().unwrap_or(Value::Null)
+            } else {
+                Value::Null
+            };
+            if !after.is_empty() {
+                return evaluate_path_with_methods(&val, after);
+            }
+            return val;
+        }
+        let val = evaluate_path_with_methods(effective_item, path);
+        if val.is_null() && effective_item != item_json {
+            return evaluate_path_with_methods(item_json, path);
+        }
+        return val;
     }
 
     // Fallback: evaluate path directly on item_json
-    evaluate_path_with_methods(item_json, expr)
+    let val = evaluate_path_with_methods(effective_item, expr);
+    if val.is_null() && effective_item != item_json {
+        return evaluate_path_with_methods(item_json, expr);
+    }
+    val
 }
 
 /// Evaluates upstream node expressions like:

@@ -288,6 +288,37 @@ async fn test_node_types_and_credential_types_contracts() {
         assert!(names.contains(&"n8n-nodes-base.webhook".to_string()));
         assert!(names.contains(&"n8n-nodes-base.code".to_string()));
 
+        // Contract verification: functional nodes must have non-empty properties array
+        let functional_nodes = [
+            "n8n-nodes-base.switch",
+            "n8n-nodes-base.filter",
+            "n8n-nodes-base.sort",
+            "n8n-nodes-base.limit",
+            "n8n-nodes-base.executeWorkflow",
+            "n8n-nodes-base.respondToWebhook",
+            "n8n-nodes-base.splitOut",
+            "n8n-nodes-base.aggregate",
+            "n8n-nodes-base.removeDuplicates",
+            "n8n-nodes-base.splitInBatches",
+            "n8n-nodes-base.wait",
+            "n8n-nodes-base.stopAndError",
+        ];
+
+        for target in functional_nodes {
+            let node_def = nodes
+                .iter()
+                .find(|n| n["name"].as_str() == Some(target))
+                .unwrap_or_else(|| panic!("Functional node {} must exist in catalog", target));
+            let props = node_def["properties"]
+                .as_array()
+                .expect("Field 'properties' must be an array");
+            assert!(
+                !props.is_empty(),
+                "Functional node {} field 'properties' must NOT be empty",
+                target
+            );
+        }
+
         // Test GET /rest/credential-types
         let res = app
             .clone()
@@ -1237,7 +1268,7 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
         let mut nodes = Vec::with_capacity(total_nodes);
         let mut edges = vec![Vec::new(); total_nodes];
 
-        let static_set_params = json!({ "step": "processed", "verified": true, "codeExecuted": true });
+        let static_set_params = json!({ "step": "processed", "verified": true });
         let static_if_params = json!({ "value1": 10, "value2": 5, "operation": "largerEqual" });
         let static_filter_params = json!({ "field": "verified", "operator": "equals", "value": true });
         let static_switch_params = json!({ "rules": [{ "field": "step", "operator": "equals", "value": "processed", "outputPort": 0 }] });
@@ -1258,21 +1289,19 @@ async fn test_hyperscale_one_million_nodes_arena_execution() {
                 let idx = base + s;
                 let (node_type, params) = if s == 0 {
                     ("n8n-nodes-base.manualTrigger", json!({}))
-                } else if s == nodes_per_chain - 1 {
-                    ("n8n-nodes-base.set", static_set_params.clone())
                 } else {
-                    match idx % 12 {
+                    match (s - 1) % 12 {
                         1 => ("n8n-nodes-base.set", static_set_params.clone()),
                         2 => ("n8n-nodes-base.if", static_if_params.clone()),
                         3 => ("n8n-nodes-base.filter", static_filter_params.clone()),
                         4 => ("n8n-nodes-base.switch", static_switch_params.clone()),
                         5 => ("n8n-nodes-base.sort", static_sort_params.clone()),
                         6 => ("n8n-nodes-base.limit", static_limit_params.clone()),
-                        7 => ("n8n-nodes-base.aggregate", static_aggregate_params.clone()),
-                        8 => ("n8n-nodes-base.splitOut", static_split_out_params.clone()),
-                        9 => ("n8n-nodes-base.removeDuplicates", static_remove_dup_params.clone()),
-                        10 => ("n8n-nodes-base.splitInBatches", static_split_batch_params.clone()),
-                        11 => ("n8n-nodes-base.code", static_code_params.clone()),
+                        7 => ("n8n-nodes-base.code", static_code_params.clone()),
+                        8 => ("n8n-nodes-base.aggregate", static_aggregate_params.clone()),
+                        9 => ("n8n-nodes-base.splitOut", static_split_out_params.clone()),
+                        10 => ("n8n-nodes-base.removeDuplicates", static_remove_dup_params.clone()),
+                        11 => ("n8n-nodes-base.splitInBatches", static_split_batch_params.clone()),
                         _ => ("n8n-nodes-base.set", static_set_params.clone()),
                     }
                 };
@@ -4009,9 +4038,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "id": "node-trigger-1",
                     "name": "Trigger",
                     "type": "n8n-nodes-base.manualTrigger",
-                    "parameters": {
-                        "data": pipeline_items
-                    }
+                    "parameters": {}
                 },
                 {
                     "id": "node-filter-1",
@@ -4117,9 +4144,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "id": "node-trigger-limit-last",
                     "name": "TriggerLimitLast",
                     "type": "n8n-nodes-base.manualTrigger",
-                    "parameters": {
-                        "data": five_items
-                    }
+                    "parameters": {}
                 },
                 {
                     "id": "node-limit-last",
@@ -4186,9 +4211,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "id": "node-trigger-filter-exists",
                     "name": "TriggerFilterExists",
                     "type": "n8n-nodes-base.manualTrigger",
-                    "parameters": {
-                        "data": filter_exists_items
-                    }
+                    "parameters": {}
                 },
                 {
                     "id": "node-filter-exists",
@@ -4253,9 +4276,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "id": "node-trigger-2",
                     "name": "Trigger",
                     "type": "n8n-nodes-base.manualTrigger",
-                    "parameters": {
-                        "data": switch_input_data
-                    }
+                    "parameters": {}
                 },
                 {
                     "id": "node-switch-1",
@@ -4399,9 +4420,7 @@ async fn test_switch_sort_limit_and_filter_nodes() {
                     "id": "node-trigger-fb",
                     "name": "Trigger",
                     "type": "n8n-nodes-base.manualTrigger",
-                    "parameters": {
-                        "data": switch_fallback_input
-                    }
+                    "parameters": {}
                 },
                 {
                     "id": "node-switch-fb",
@@ -4533,6 +4552,343 @@ async fn test_switch_sort_limit_and_filter_nodes() {
             gold_found,
             "MergeResults output must contain reward 'gold_medal' via fallbackOutput, got: {:?}",
             merge_fb_arr
+        );
+
+        // 4. Test PinData Override & run_workflow_by_id via DB persistence
+        let override_wf_def = json!({
+            "name": "PinData Override Persistence Test",
+            "nodes": [
+                {
+                    "id": "node-override-trig",
+                    "name": "TriggerOverride",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {
+                        "data": [{ "id": 999 }]
+                    }
+                },
+                {
+                    "id": "node-override-set",
+                    "name": "SetCapture",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "captured_id": "={{ $json.id }}"
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerOverride": {
+                    "main": [
+                        [ { "node": "SetCapture", "type": "main", "index": 0 } ]
+                    ]
+                }
+            }
+        });
+
+        let res_create_override = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(override_wf_def.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_override.status(), StatusCode::OK);
+        let bytes_co = res_create_override.into_body().collect().await.unwrap().to_bytes();
+        let res_co_json: serde_json::Value = serde_json::from_slice(&bytes_co).unwrap();
+        let wf_override_id = res_co_json["data"]["id"]
+            .as_str()
+            .expect("Created workflow must have an id");
+
+        // Run workflow via POST /rest/workflows/{id}/run with new pinData overriding old 999
+        let run_override_payload = json!({
+            "pinData": {
+                "TriggerOverride": [
+                    { "id": 888, "override": true }
+                ]
+            }
+        });
+
+        let res_run_override = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{}/run", wf_override_id))
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(run_override_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_override.status(), StatusCode::OK);
+        let bytes_ro = res_run_override.into_body().collect().await.unwrap().to_bytes();
+        let res_ro_json: serde_json::Value = serde_json::from_slice(&bytes_ro).unwrap();
+        assert_eq!(
+            res_ro_json["data"]["status"], "success",
+            "Workflow execution with overridden pinData must succeed"
+        );
+
+        let override_out = &res_ro_json["data"]["resultData"]["runData"]["SetCapture"][0]["data"]["main"][0];
+        let override_arr = override_out.as_array().expect("SetCapture output must be an array");
+        assert_eq!(override_arr.len(), 1, "Must contain exactly 1 output item");
+        assert_eq!(override_arr[0]["json"]["id"], 888, "pinData must override 999 with 888");
+        assert_eq!(override_arr[0]["json"]["override"], true, "pinData fields must be present");
+        assert_eq!(override_arr[0]["json"]["captured_id"], 888, "Expression captured_id must evaluate to 888");
+
+        // 5. Structure "conditions" on Filter and Switch + Per-Item Expression on Set
+        // 5a. Filter using "conditions": { "number": [{ "value1": "={{ $json.score }}", "operation": "largerEqual", "value2": 80 }] }
+        let filter_cond_items = json!([
+            { "id": 10, "score": 75 },
+            { "id": 20, "score": 85 },
+            { "id": 30, "score": 60 },
+            { "id": 40, "score": 92 }
+        ]);
+
+        let filter_cond_wf = json!({
+            "name": "Filter Conditions Number Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-fc",
+                    "name": "TriggerFilterCond",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "node-filter-cond",
+                    "name": "FilterScoreLargerEqual80",
+                    "type": "n8n-nodes-base.filter",
+                    "parameters": {
+                        "conditions": {
+                            "number": [
+                                {
+                                    "value1": "={{ $json.score }}",
+                                    "operation": "largerEqual",
+                                    "value2": 80
+                                }
+                            ]
+                        }
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerFilterCond": {
+                    "main": [
+                        [ { "node": "FilterScoreLargerEqual80", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "TriggerFilterCond": filter_cond_items
+            }
+        });
+
+        let res_fc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(filter_cond_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_fc.status(), StatusCode::OK);
+        let bytes_fc = res_fc.into_body().collect().await.unwrap().to_bytes();
+        let res_fc_json: serde_json::Value = serde_json::from_slice(&bytes_fc).unwrap();
+        assert_eq!(
+            res_fc_json["data"]["status"], "success",
+            "Filter conditions pipeline execution status must be success"
+        );
+
+        let fc_out = &res_fc_json["data"]["resultData"]["runData"]["FilterScoreLargerEqual80"][0]["data"]["main"][0];
+        let fc_arr = fc_out.as_array().expect("FilterScoreLargerEqual80 output must be an array");
+        assert_eq!(fc_arr.len(), 2, "Filter must return exactly 2 items with score >= 80");
+        assert_eq!(fc_arr[0]["json"]["id"], 20);
+        assert_eq!(fc_arr[0]["json"]["score"], 85);
+        assert_eq!(fc_arr[1]["json"]["id"], 40);
+        assert_eq!(fc_arr[1]["json"]["score"], 92);
+
+        // 5b. Switch using "rules": [{ "conditions": { "string": [{ "value1": "={{ $json.tier }}", "operation": "equals", "value2": "vip" }] }, "outputPort": 0 }]
+        let switch_cond_input = json!([
+            { "tier": "vip", "user": "alice" }
+        ]);
+
+        let switch_cond_wf = json!({
+            "name": "Switch Conditions Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-sc",
+                    "name": "TriggerSwitchCond",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "node-switch-cond",
+                    "name": "SwitchVip",
+                    "type": "n8n-nodes-base.switch",
+                    "parameters": {
+                        "fallbackOutput": 1,
+                        "rules": [
+                            {
+                                "conditions": {
+                                    "string": [
+                                        {
+                                            "value1": "={{ $json.tier }}",
+                                            "operation": "equals",
+                                            "value2": "vip"
+                                        }
+                                    ]
+                                },
+                                "outputPort": 0
+                            }
+                        ]
+                    }
+                },
+                {
+                    "id": "node-branch-vip",
+                    "name": "BranchVip",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "status": "vip_access"
+                    }
+                },
+                {
+                    "id": "node-branch-regular",
+                    "name": "BranchRegular",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "status": "standard_access"
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerSwitchCond": {
+                    "main": [
+                        [ { "node": "SwitchVip", "type": "main", "index": 0 } ]
+                    ]
+                },
+                "SwitchVip": {
+                    "main": [
+                        [ { "node": "BranchVip", "type": "main", "index": 0 } ],
+                        [ { "node": "BranchRegular", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "TriggerSwitchCond": switch_cond_input
+            }
+        });
+
+        let res_sc = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(switch_cond_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_sc.status(), StatusCode::OK);
+        let bytes_sc = res_sc.into_body().collect().await.unwrap().to_bytes();
+        let res_sc_json: serde_json::Value = serde_json::from_slice(&bytes_sc).unwrap();
+        assert_eq!(
+            res_sc_json["data"]["status"], "success",
+            "Switch conditions workflow execution status must be success"
+        );
+
+        let run_data_sc = &res_sc_json["data"]["resultData"]["runData"];
+        assert!(
+            run_data_sc.get("BranchVip").is_some(),
+            "BranchVip must be executed when tier == vip via rule conditions"
+        );
+        assert!(
+            run_data_sc.get("BranchRegular").is_none(),
+            "BranchRegular must be pruned when rule 0 matches"
+        );
+        let vip_out = &run_data_sc["BranchVip"][0]["data"]["main"][0];
+        let vip_arr = vip_out.as_array().expect("BranchVip output must be array");
+        assert_eq!(vip_arr[0]["json"]["status"], "vip_access");
+
+        // 5c. Set node receiving Value::Array (>1 element) and evaluating per-item expression "computed_label": "Item-{{ $json.id }}"
+        let set_array_items = json!([
+            { "id": 1 },
+            { "id": 2 }
+        ]);
+
+        let set_array_wf = json!({
+            "name": "Set Per-Item Expression Array Test Pipeline",
+            "nodes": [
+                {
+                    "id": "node-trigger-set-arr",
+                    "name": "TriggerSetArr",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "node-set-per-item",
+                    "name": "SetPerItemLabel",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "computed_label": "Item-{{ $json.id }}"
+                    }
+                }
+            ],
+            "connections": {
+                "TriggerSetArr": {
+                    "main": [
+                        [ { "node": "SetPerItemLabel", "type": "main", "index": 0 } ]
+                    ]
+                }
+            },
+            "pinData": {
+                "TriggerSetArr": set_array_items
+            }
+        });
+
+        let res_sa = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(set_array_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_sa.status(), StatusCode::OK);
+        let bytes_sa = res_sa.into_body().collect().await.unwrap().to_bytes();
+        let res_sa_json: serde_json::Value = serde_json::from_slice(&bytes_sa).unwrap();
+        assert_eq!(
+            res_sa_json["data"]["status"], "success",
+            "Set per-item expression array pipeline execution status must be success"
+        );
+
+        let sa_out = &res_sa_json["data"]["resultData"]["runData"]["SetPerItemLabel"][0]["data"]["main"][0];
+        let sa_arr = sa_out.as_array().expect("SetPerItemLabel output must be an array");
+        assert_eq!(sa_arr.len(), 2, "SetPerItemLabel must preserve both array elements");
+        assert_eq!(
+            sa_arr[0]["json"]["computed_label"], "Item-1",
+            "Element 0 must evaluate expression to 'Item-1'"
+        );
+        assert_eq!(
+            sa_arr[1]["json"]["computed_label"], "Item-2",
+            "Element 1 must evaluate expression to 'Item-2'"
         );
 
         let _ = std::fs::remove_file(db_path);
