@@ -423,33 +423,56 @@ impl HyperScaleEngine {
         } else {
             let now_ms = Utc::now().timestamp_millis();
             let start_time_ms = now_ms.saturating_sub(duration_ms as i64);
-            let node_status = if status == "success" {
-                "success"
-            } else {
-                "error"
-            };
 
             let mut run_data = serde_json::Map::new();
             for (idx, node) in graph.nodes.iter().enumerate() {
                 if let Some(out) = outputs.get(&(idx as u32)) {
+                    let is_node_error = out
+                        .value()
+                        .as_object()
+                        .and_then(|o| o.get("__node_error"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+
+                    let (node_status, error_val) = if is_node_error {
+                        let err_obj = out
+                            .value()
+                            .as_object()
+                            .and_then(|o| o.get("error"))
+                            .cloned()
+                            .unwrap_or_else(|| json!({ "message": "Node execution failed" }));
+                        ("error", Some(err_obj))
+                    } else if status == "success" {
+                        ("success", None)
+                    } else {
+                        ("error", None)
+                    };
+
                     let main_items: Vec<Value> = if let Some(arr) = out.value().as_array() {
                         arr.iter().map(|item| json!({ "json": item })).collect()
                     } else {
                         vec![json!({ "json": *out.value() })]
                     };
+
+                    let mut node_execution_entry = json!({
+                        "startTime": start_time_ms,
+                        "executionTime": duration_ms.max(1),
+                        "executionStatus": node_status,
+                        "source": [],
+                        "data": {
+                            "main": [ main_items ]
+                        }
+                    });
+
+                    if let Some(err) = error_val {
+                        if let Some(obj) = node_execution_entry.as_object_mut() {
+                            obj.insert("error".to_string(), err);
+                        }
+                    }
+
                     run_data.insert(
                         node.name.clone(),
-                        json!([
-                            {
-                                "startTime": start_time_ms,
-                                "executionTime": duration_ms.max(1),
-                                "executionStatus": node_status,
-                                "source": [],
-                                "data": {
-                                    "main": [ main_items ]
-                                }
-                            }
-                        ]),
+                        json!([ node_execution_entry ]),
                     );
                 }
             }
@@ -595,6 +618,19 @@ fn traverse_node_inner<'scope>(
         if *local_executed >= 1024 {
             ctx.executed_count.fetch_add(*local_executed, Ordering::Relaxed);
             *local_executed = 0;
+        }
+
+        let has_node_error = result_payload
+            .as_object()
+            .and_then(|o| o.get("__node_error"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        if has_node_error {
+            if let Ok(mut guard) = ctx.last_output_holder.lock() {
+                *guard = Arc::clone(&result_payload);
+            }
+            return;
         }
 
         let targets = &ctx.graph.edges[current_idx as usize];
@@ -1120,14 +1156,23 @@ fn execute_node_logic(
                 })
                 .unwrap_or(false);
 
-            if continue_on_fail {
+            let status = res
+                .get("statusCode")
+                .and_then(|s| s.as_u64())
+                .unwrap_or(200);
+
+            if status >= 400 {
                 if let Some(res_obj) = res.as_object_mut() {
-                    let status = res_obj
-                        .get("statusCode")
-                        .and_then(|s| s.as_u64())
-                        .unwrap_or(200);
-                    if status >= 400 {
+                    if continue_on_fail {
                         res_obj.insert("continueOnFail".to_string(), json!(true));
+                    } else {
+                        res_obj.insert("__node_error".to_string(), json!(true));
+                        let err_msg = res_obj
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .unwrap_or("HTTP request failed with status >= 400")
+                            .to_string();
+                        res_obj.insert("error".to_string(), json!({ "message": err_msg }));
                     }
                 }
             }
