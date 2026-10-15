@@ -598,6 +598,54 @@ pub fn get_core_node_types_array() -> Value {
             "inputs": ["main"],
             "outputs": ["main"],
             "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.respondToWebhook",
+            "displayName": "Respond to Webhook",
+            "icon": "fa:reply",
+            "group": ["action"],
+            "version": 1.1,
+            "description": "Responds directly to the HTTP request that triggered the webhook",
+            "defaults": { "name": "Respond to Webhook" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.splitOut",
+            "displayName": "Split Out",
+            "icon": "fa:expand-arrows-alt",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Splits a list of items into separate individual items",
+            "defaults": { "name": "Split Out" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.aggregate",
+            "displayName": "Aggregate",
+            "icon": "fa:object-group",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Aggregates multiple items into a single item containing a list",
+            "defaults": { "name": "Aggregate" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.removeDuplicates",
+            "displayName": "Remove Duplicates",
+            "icon": "fa:filter",
+            "group": ["transform"],
+            "version": 1.2,
+            "description": "Removes duplicate items while preserving original item ordering",
+            "defaults": { "name": "Remove Duplicates" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
         }
     ])
 }
@@ -1229,7 +1277,10 @@ pub async fn create_credential(
     };
 
     match state.db.save_credential(&cred) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": cred }))).into_response(),
+        Ok(()) => {
+            crate::engine::register_credential(&cred.id, cred.data.clone());
+            (StatusCode::OK, Json(json!({ "data": cred }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1271,7 +1322,10 @@ pub async fn update_credential(
     };
 
     match state.db.save_credential(&updated) {
-        Ok(()) => (StatusCode::OK, Json(json!({ "data": updated }))).into_response(),
+        Ok(()) => {
+            crate::engine::register_credential(&updated.id, updated.data.clone());
+            (StatusCode::OK, Json(json!({ "data": updated }))).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "message": format!("Database error: {}", e) })),
@@ -1285,7 +1339,10 @@ pub async fn delete_credential(
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.delete_credential(&id) {
-        Ok(true) => (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response(),
+        Ok(true) => {
+            crate::engine::unregister_credential(&id);
+            (StatusCode::OK, Json(json!({ "data": { "success": true } }))).into_response()
+        }
         Ok(false) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Credential not found" })),
@@ -2044,6 +2101,98 @@ pub async fn handle_webhook(
         data_json: exec_res.payload.clone(),
     };
     let _ = state.db.record_execution_async(write_msg);
+
+    // Check if the workflow produced a custom webhook response via RespondToWebhook node
+    let mut custom_webhook_response = None;
+
+    if let Some(obj) = exec_res.final_output.as_object() {
+        if let Some(r) = obj.get("__webhook_response") {
+            custom_webhook_response = Some(r.clone());
+        }
+    } else if let Some(arr) = exec_res.final_output.as_array() {
+        for item in arr {
+            if let Some(r) = item.get("__webhook_response").or_else(|| {
+                item.get("json").and_then(|j| j.get("__webhook_response"))
+            }) {
+                custom_webhook_response = Some(r.clone());
+                break;
+            }
+        }
+    }
+
+    if custom_webhook_response.is_none() {
+        if let Some(run_data) = exec_res
+            .payload
+            .get("resultData")
+            .and_then(|rd| rd.get("runData"))
+            .and_then(|rd| rd.as_object())
+        {
+            for runs in run_data.values() {
+                if let Some(run_arr) = runs.as_array() {
+                    for run_entry in run_arr {
+                        if let Some(main_outputs) = run_entry
+                            .get("data")
+                            .and_then(|d| d.get("main"))
+                            .and_then(|m| m.as_array())
+                        {
+                            for port_items in main_outputs {
+                                if let Some(items) = port_items.as_array() {
+                                    for item in items {
+                                        if let Some(r) = item.get("__webhook_response").or_else(|| {
+                                            item.get("json").and_then(|j| j.get("__webhook_response"))
+                                        }) {
+                                            custom_webhook_response = Some(r.clone());
+                                            break;
+                                        }
+                                    }
+                                }
+                                if custom_webhook_response.is_some() {
+                                    break;
+                                }
+                            }
+                        }
+                        if custom_webhook_response.is_some() {
+                            break;
+                        }
+                    }
+                }
+                if custom_webhook_response.is_some() {
+                    break;
+                }
+            }
+        }
+    }
+
+    if let Some(resp_val) = custom_webhook_response {
+        let status_code = resp_val
+            .get("statusCode")
+            .and_then(|c| c.as_u64())
+            .and_then(|c| StatusCode::from_u16(c as u16).ok())
+            .unwrap_or(StatusCode::OK);
+
+        let mut res_headers = axum::http::HeaderMap::new();
+        if let Some(h_obj) = resp_val.get("headers").and_then(|h| h.as_object()) {
+            for (k, v) in h_obj {
+                if let (Ok(h_name), Some(h_str)) = (
+                    axum::http::HeaderName::from_bytes(k.as_bytes()),
+                    v.as_str(),
+                ) {
+                    if let Ok(h_val) = axum::http::HeaderValue::from_str(h_str) {
+                        res_headers.insert(h_name, h_val);
+                    }
+                }
+            }
+        }
+
+        let body_val = resp_val.get("body").unwrap_or(&Value::Null);
+        let body_bytes = match body_val {
+            Value::String(s) => s.as_bytes().to_vec(),
+            Value::Null => Vec::new(),
+            other => serde_json::to_vec(other).unwrap_or_default(),
+        };
+
+        return (status_code, res_headers, body_bytes).into_response();
+    }
 
     (StatusCode::OK, Json(exec_res.final_output)).into_response()
 }

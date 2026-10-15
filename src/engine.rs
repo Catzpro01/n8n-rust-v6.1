@@ -31,6 +31,10 @@ pub enum NodeKind {
     Merge = 10,
     HttpRequest = 11,
     ExecuteWorkflow = 12,
+    RespondToWebhook = 13,
+    SplitOut = 14,
+    Aggregate = 15,
+    RemoveDuplicates = 16,
     Unknown = 255,
 }
 
@@ -50,6 +54,10 @@ impl NodeKind {
             "n8n-nodes-base.merge" | "merge" => NodeKind::Merge,
             "n8n-nodes-base.httpRequest" | "httpRequest" => NodeKind::HttpRequest,
             "n8n-nodes-base.executeWorkflow" | "executeWorkflow" => NodeKind::ExecuteWorkflow,
+            "n8n-nodes-base.respondToWebhook" | "respondToWebhook" => NodeKind::RespondToWebhook,
+            "n8n-nodes-base.splitOut" | "splitOut" => NodeKind::SplitOut,
+            "n8n-nodes-base.aggregate" | "aggregate" => NodeKind::Aggregate,
+            "n8n-nodes-base.removeDuplicates" | "removeDuplicates" => NodeKind::RemoveDuplicates,
             _ => NodeKind::Unknown,
         }
     }
@@ -70,6 +78,24 @@ pub fn get_subworkflow(workflow_id: &str) -> Option<Value> {
 pub fn unregister_subworkflow(workflow_id: &str) {
     if let Some(registry) = SUBWORKFLOW_REGISTRY.get() {
         registry.remove(workflow_id);
+    }
+}
+
+static CREDENTIAL_REGISTRY: OnceLock<DashMap<String, Value>> = OnceLock::new();
+
+pub fn register_credential(credential_id: &str, data: Value) {
+    let registry = CREDENTIAL_REGISTRY.get_or_init(DashMap::new);
+    registry.insert(credential_id.to_string(), data);
+}
+
+pub fn get_credential(credential_id: &str) -> Option<Value> {
+    let registry = CREDENTIAL_REGISTRY.get_or_init(DashMap::new);
+    registry.get(credential_id).map(|v| v.clone())
+}
+
+pub fn unregister_credential(credential_id: &str) {
+    if let Some(registry) = CREDENTIAL_REGISTRY.get() {
+        registry.remove(credential_id);
     }
 }
 
@@ -155,6 +181,11 @@ impl CompiledGraph {
                     if let Some(obj) = parameters.as_object_mut() {
                         obj.entry("continueOnFail".to_string()).or_insert(json!(true));
                     }
+                }
+            }
+            if let Some(creds) = n.get("credentials") {
+                if let Some(obj) = parameters.as_object_mut() {
+                    obj.entry("credentials".to_string()).or_insert_with(|| creds.clone());
                 }
             }
             let has_expressions = crate::expr::has_potential_expression(&parameters);
@@ -1176,6 +1207,62 @@ fn execute_node_logic(
             let headers = params_ref.get("headers");
             let body = params_ref.get("body").or_else(|| params_ref.get("data"));
 
+            // Resolve and inject credentials if provided
+            let cred_id = params_ref
+                .get("credentialId")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    params_ref.get("credentials").and_then(|c| {
+                        if let Some(s) = c.as_str() {
+                            Some(s)
+                        } else if let Some(obj) = c.as_object() {
+                            if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                                Some(id)
+                            } else {
+                                obj.values().find_map(|v| v.get("id").and_then(|id| id.as_str()))
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                });
+
+            let mut effective_headers = match headers {
+                Some(Value::Object(m)) => m.clone(),
+                _ => serde_json::Map::new(),
+            };
+
+            if let Some(cred_data) = cred_id.and_then(get_credential) {
+                if let (Some(k), Some(v)) = (
+                    cred_data
+                        .get("name")
+                        .or_else(|| cred_data.get("headerName"))
+                        .and_then(|v| v.as_str()),
+                    cred_data
+                        .get("value")
+                        .or_else(|| cred_data.get("headerValue"))
+                        .and_then(|v| v.as_str()),
+                ) {
+                    effective_headers.insert(k.to_string(), json!(v));
+                }
+
+                if let Some(token) = cred_data
+                    .get("token")
+                    .or_else(|| cred_data.get("bearerToken"))
+                    .and_then(|v| v.as_str())
+                {
+                    effective_headers
+                        .insert("Authorization".to_string(), json!(format!("Bearer {token}")));
+                } else if let Some(api_key) = cred_data.get("apiKey").and_then(|v| v.as_str()) {
+                    effective_headers
+                        .entry("X-API-Key".to_string())
+                        .or_insert_with(|| json!(api_key));
+                }
+            }
+
+            let effective_headers_val = Value::Object(effective_headers);
+            let effective_headers_ref = Some(&effective_headers_val);
+
             let max_tries = params_ref
                 .get("maxTries")
                 .and_then(|v| v.as_u64())
@@ -1205,7 +1292,7 @@ fn execute_node_logic(
 
             loop {
                 attempts += 1;
-                res = execute_real_http_request(url, method, headers, body);
+                res = execute_real_http_request(url, method, effective_headers_ref, body);
                 let status = res
                     .get("statusCode")
                     .and_then(|s| s.as_u64())
@@ -1336,6 +1423,138 @@ fn execute_node_logic(
             }
 
             (sub_out, port)
+        }
+        NodeKind::RespondToWebhook => {
+            let code = params_ref
+                .get("responseCode")
+                .or_else(|| params_ref.get("responseStatusCode"))
+                .and_then(|v| {
+                    v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse::<u64>().ok()))
+                })
+                .unwrap_or(200)
+                .clamp(100, 599) as u16;
+
+            let headers_obj = params_ref
+                .get("responseHeaders")
+                .cloned()
+                .unwrap_or_else(|| json!({}));
+
+            let body_val = params_ref
+                .get("responseBody")
+                .or_else(|| params_ref.get("body"))
+                .cloned()
+                .unwrap_or_else(|| (*input).clone());
+
+            let resp_payload = json!({
+                "statusCode": code,
+                "headers": headers_obj,
+                "body": body_val
+            });
+
+            let mut output_obj = if let Some(obj) = input.as_object() {
+                obj.clone()
+            } else {
+                serde_json::Map::new()
+            };
+            output_obj.insert("__webhook_response".to_string(), resp_payload);
+            (Arc::new(Value::Object(output_obj)), None)
+        }
+        NodeKind::SplitOut => {
+            let field = params_ref
+                .get("fieldToSplitOut")
+                .and_then(|v| v.as_str())
+                .unwrap_or("items");
+
+            let input_items: Vec<Value> = if let Some(arr) = input.as_array() {
+                arr.clone()
+            } else {
+                vec![(*input).clone()]
+            };
+
+            let mut out_items = Vec::new();
+            for item in input_items {
+                if let Some(obj) = item.as_object() {
+                    let maybe_sub_arr = obj.get(field).and_then(|v| v.as_array()).or_else(|| {
+                        obj.get("body").and_then(|b| b.get(field)).and_then(|v| v.as_array())
+                    }).or_else(|| {
+                        obj.get("json").and_then(|j| j.get(field)).and_then(|v| v.as_array())
+                    });
+
+                    if let Some(sub_arr) = maybe_sub_arr {
+                        for sub in sub_arr {
+                            let mut new_item = obj.clone();
+                            new_item.remove(field);
+                            if let Some(sub_obj) = sub.as_object() {
+                                for (k, v) in sub_obj {
+                                    new_item.insert(k.clone(), v.clone());
+                                }
+                            } else {
+                                new_item.insert(field.to_string(), sub.clone());
+                            }
+                            out_items.push(Value::Object(new_item));
+                        }
+                    } else {
+                        out_items.push(item);
+                    }
+                } else {
+                    out_items.push(item);
+                }
+            }
+
+            (Arc::new(Value::Array(out_items)), None)
+        }
+        NodeKind::Aggregate => {
+            let dest_field = params_ref
+                .get("destinationFieldName")
+                .and_then(|v| v.as_str())
+                .unwrap_or("data");
+
+            let items_to_aggregate: Vec<Value> = if let Some(arr) = input.as_array() {
+                arr.clone()
+            } else {
+                vec![(*input).clone()]
+            };
+
+            let mut map = serde_json::Map::new();
+            map.insert(dest_field.to_string(), Value::Array(items_to_aggregate));
+            (Arc::new(Value::Array(vec![Value::Object(map)])), None)
+        }
+        NodeKind::RemoveDuplicates => {
+            let compare_field = params_ref
+                .get("compareField")
+                .or_else(|| params_ref.get("fieldToCompare"))
+                .or_else(|| params_ref.get("fieldsToCompare"))
+                .and_then(|v| v.as_str());
+
+            let input_items: Vec<Value> = if let Some(arr) = input.as_array() {
+                arr.clone()
+            } else {
+                vec![(*input).clone()]
+            };
+
+            let mut seen = std::collections::HashSet::new();
+            let mut out_items = Vec::new();
+
+            for item in input_items {
+                let key = if let Some(field) = compare_field {
+                    item.get(field)
+                        .or_else(|| item.get("json").and_then(|j| j.get(field)))
+                        .or_else(|| item.get("body").and_then(|b| b.get(field)))
+                        .map(|v| match v {
+                            Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        })
+                        .unwrap_or_default()
+                } else {
+                    serde_json::to_string(&item).unwrap_or_default()
+                };
+
+                if seen.insert(key) {
+                    out_items.push(item);
+                }
+            }
+
+            (Arc::new(Value::Array(out_items)), None)
         }
         _ => (input, None),
     }

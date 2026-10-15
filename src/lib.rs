@@ -27,6 +27,12 @@ pub fn build_app(ui_dist_path: &Path, db: StorageEngine) -> Router {
         }
     }
 
+    if let Ok(credentials) = db.list_credentials() {
+        for cred in credentials {
+            engine::register_credential(&cred.id, cred.data);
+        }
+    }
+
     let engine = HyperScaleEngine::new(None)
         .unwrap_or_else(|e| panic!("Failed to initialize HyperScaleEngine: {e}"));
     let push_hub = Arc::new(PushHub::new());

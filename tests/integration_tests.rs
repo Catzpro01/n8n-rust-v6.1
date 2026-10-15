@@ -2880,3 +2880,403 @@ async fn test_http_request_retry_policy() {
     .expect("Test 20 timed out!");
 }
 
+// ---------------------------------------------------------------------------
+// 21. Credential Vault At-Rest Encryption & HTTP Auth Injection Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_credential_vault_encryption_and_http_auth_injection() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        let secret_token = "super-secret-vault-token-xyz-12345";
+        let cred_payload = json!({
+            "name": "Production Vault Secret",
+            "type": "customAuth",
+            "data": {
+                "token": secret_token,
+                "custom_field": "confidential_value"
+            }
+        });
+
+        // 1. Create credential via REST API
+        let res_create = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/credentials")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(cred_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create.status(), StatusCode::OK);
+        let bytes_create = res_create.into_body().collect().await.unwrap().to_bytes();
+        let created_json: serde_json::Value = serde_json::from_slice(&bytes_create).unwrap();
+        let cred_id = created_json["data"]["id"].as_str().unwrap().to_string();
+        assert!(!cred_id.is_empty());
+
+        // 2. Direct SQLite Inspection: Verify at-rest encryption format ("enc:v1:") and zero plaintext leak
+        {
+            let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
+            let mut stmt = raw_conn
+                .prepare("SELECT data FROM credentials WHERE id = ?1")
+                .unwrap();
+            let raw_encrypted_str: String = stmt
+                .query_row(rusqlite::params![cred_id], |row| row.get(0))
+                .unwrap();
+
+            assert!(
+                raw_encrypted_str.starts_with("enc:v1:"),
+                "Credential data in SQLite must be encrypted at-rest and start with 'enc:v1:'. Found: {}",
+                raw_encrypted_str
+            );
+            assert!(
+                !raw_encrypted_str.contains(secret_token),
+                "Encrypted credential data must NEVER leak plaintext secret tokens in storage! Found: {}",
+                raw_encrypted_str
+            );
+        }
+
+        // 3. Verify Transparent Decryption via REST API
+        let res_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/credentials/{cred_id}"))
+                    .method("GET")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_get.status(), StatusCode::OK);
+        let bytes_get = res_get.into_body().collect().await.unwrap().to_bytes();
+        let get_json: serde_json::Value = serde_json::from_slice(&bytes_get).unwrap();
+        assert_eq!(get_json["data"]["data"]["token"], secret_token);
+        assert_eq!(get_json["data"]["data"]["custom_field"], "confidential_value");
+
+        // 4. Setup mock HTTP server to verify automatic Bearer token injection
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let auth_mock_app = Router::new().route(
+                "/auth-test",
+                get(|headers: axum::http::HeaderMap| async move {
+                    if let Some(auth_val) = headers.get(axum::http::header::AUTHORIZATION) {
+                        if auth_val == "Bearer super-secret-vault-token-xyz-12345" {
+                            (StatusCode::OK, axum::Json(json!({ "authenticated": true })))
+                        } else {
+                            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "invalid_token" })))
+                        }
+                    } else {
+                        (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "missing_header" })))
+                    }
+                }),
+            );
+            rt.block_on(async move {
+                let _ = axum::serve(listener, auth_mock_app).await;
+            });
+        });
+
+        let local_addr = rx.recv().unwrap();
+
+        // 5. Run workflow using HttpRequest node with credentialId
+        let http_cred_wf = json!({
+            "nodes": [
+                {
+                    "id": "http-vault-node",
+                    "name": "Vault HTTP Node",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": format!("http://{local_addr}/auth-test"),
+                        "method": "GET",
+                        "credentialId": cred_id
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(http_cred_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run.status(), StatusCode::OK);
+        let bytes_run = res_run.into_body().collect().await.unwrap().to_bytes();
+        let run_json: serde_json::Value = serde_json::from_slice(&bytes_run).unwrap();
+        assert_eq!(run_json["data"]["status"], "success");
+        let node_out = &run_json["data"]["resultData"]["runData"]["Vault HTTP Node"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(node_out["statusCode"], 200);
+        assert_eq!(node_out["data"]["authenticated"], true, "Expected node to be authenticated via injected Bearer header");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 21 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 22. RespondToWebhook & Collection Transform Nodes (SplitOut, Aggregate, RemoveDuplicates) Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_respond_to_webhook_and_collection_transform_nodes() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // Create workflow DAG: Webhook -> SplitOut -> RemoveDuplicates -> Aggregate -> RespondToWebhook
+        let full_transform_wf = json!({
+            "name": "Collection Transform & Webhook Respond Workflow",
+            "nodes": [
+                {
+                    "id": "wh-trigger",
+                    "name": "Webhook Trigger",
+                    "type": "n8n-nodes-base.webhook",
+                    "parameters": {
+                        "path": "collection-pipeline"
+                    }
+                },
+                {
+                    "id": "split-node",
+                    "name": "Split Out Records",
+                    "type": "n8n-nodes-base.splitOut",
+                    "parameters": {
+                        "fieldToSplitOut": "records"
+                    }
+                },
+                {
+                    "id": "dedup-node",
+                    "name": "Remove Duplicates",
+                    "type": "n8n-nodes-base.removeDuplicates",
+                    "parameters": {
+                        "compareField": "id"
+                    }
+                },
+                {
+                    "id": "agg-node",
+                    "name": "Aggregate Items",
+                    "type": "n8n-nodes-base.aggregate",
+                    "parameters": {
+                        "destinationFieldName": "deduplicatedRecords"
+                    }
+                },
+                {
+                    "id": "resp-node",
+                    "name": "Respond to Webhook",
+                    "type": "n8n-nodes-base.respondToWebhook",
+                    "parameters": {
+                        "responseCode": 201,
+                        "responseHeaders": {
+                            "X-Engine": "n8n-rust-v5.7",
+                            "X-Transform-Status": "deduplicated-ok"
+                        },
+                        "responseBody": {
+                            "success": true,
+                            "processedCount": 3,
+                            "summary": "Records processed and deduplicated"
+                        }
+                    }
+                }
+            ],
+            "connections": {
+                "Webhook Trigger": {
+                    "main": [
+                        [
+                            { "node": "Split Out Records", "type": "main", "index": 0 }
+                        ]
+                    ]
+                },
+                "Split Out Records": {
+                    "main": [
+                        [
+                            { "node": "Remove Duplicates", "type": "main", "index": 0 }
+                        ]
+                    ]
+                },
+                "Remove Duplicates": {
+                    "main": [
+                        [
+                            { "node": "Aggregate Items", "type": "main", "index": 0 }
+                        ]
+                    ]
+                },
+                "Aggregate Items": {
+                    "main": [
+                        [
+                            { "node": "Respond to Webhook", "type": "main", "index": 0 }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        // Save workflow to DB so Webhook handler can find it by path
+        let wf_record = n8n_rust_v5::db::WorkflowRecord {
+            id: "wf-collection-pipeline".to_string(),
+            name: "Collection Transform & Webhook Respond Workflow".to_string(),
+            active: true,
+            is_archived: false,
+            nodes: full_transform_wf["nodes"].clone(),
+            connections: full_transform_wf["connections"].clone(),
+            settings: json!({}),
+            static_data: json!({}),
+            pin_data: json!({}),
+            meta: json!({}),
+            version_id: "v1".to_string(),
+            trigger_count: 1,
+            tags: json!([]),
+            parent_folder_id: None,
+            created_at: "2026-10-15T00:00:00Z".to_string(),
+            updated_at: "2026-10-15T00:00:00Z".to_string(),
+        };
+        db.insert_or_update_workflow(&wf_record).unwrap();
+
+        // 1. Test SplitOut -> RemoveDuplicates -> Aggregate pipeline via REST API
+        let transform_direct_wf = json!({
+            "nodes": [
+                {
+                    "id": "t-manual",
+                    "name": "Manual Input",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "batchId": "b-1",
+                        "records": [
+                            { "id": 1, "val": "A" },
+                            { "id": 2, "val": "B" },
+                            { "id": 1, "val": "A-duplicate" }
+                        ]
+                    }
+                },
+                {
+                    "id": "t-split",
+                    "name": "Split Direct",
+                    "type": "n8n-nodes-base.splitOut",
+                    "parameters": {
+                        "fieldToSplitOut": "records"
+                    }
+                },
+                {
+                    "id": "t-dedup",
+                    "name": "Dedup Direct",
+                    "type": "n8n-nodes-base.removeDuplicates",
+                    "parameters": {
+                        "compareField": "id"
+                    }
+                },
+                {
+                    "id": "t-agg",
+                    "name": "Agg Direct",
+                    "type": "n8n-nodes-base.aggregate",
+                    "parameters": {
+                        "destinationFieldName": "grouped"
+                    }
+                }
+            ],
+            "connections": {
+                "Manual Input": {
+                    "main": [[{ "node": "Split Direct", "type": "main", "index": 0 }]]
+                },
+                "Split Direct": {
+                    "main": [[{ "node": "Dedup Direct", "type": "main", "index": 0 }]]
+                },
+                "Dedup Direct": {
+                    "main": [[{ "node": "Agg Direct", "type": "main", "index": 0 }]]
+                }
+            }
+        });
+
+        let res_pipe = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(transform_direct_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_pipe.status(), StatusCode::OK);
+        let bytes_pipe = res_pipe.into_body().collect().await.unwrap().to_bytes();
+        let pipe_json: serde_json::Value = serde_json::from_slice(&bytes_pipe).unwrap();
+        assert_eq!(pipe_json["data"]["status"], "success");
+        let agg_output = &pipe_json["data"]["resultData"]["runData"]["Agg Direct"][0]["data"]["main"][0][0]["json"];
+        let grouped_arr = agg_output["grouped"].as_array().expect("Agg Direct must produce grouped array");
+        assert_eq!(grouped_arr.len(), 2, "Duplicate item with id 1 must be removed while preserving order");
+        assert_eq!(grouped_arr[0]["id"], 1);
+        assert_eq!(grouped_arr[1]["id"], 2);
+
+        // 2. Trigger Webhook with request payload and verify RespondToWebhook overrides HTTP response
+        let webhook_input_payload = json!({
+            "records": [
+                { "id": "u-10", "name": "User 10" },
+                { "id": "u-20", "name": "User 20" },
+                { "id": "u-10", "name": "User 10 Dup" },
+                { "id": "u-30", "name": "User 30" }
+            ]
+        });
+
+        let res_wh = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/webhook/collection-pipeline")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(webhook_input_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Verify status code 201 Created from RespondToWebhook
+        assert_eq!(res_wh.status(), StatusCode::CREATED, "RespondToWebhook must set status 201 Created");
+
+        // Verify custom response headers
+        let headers = res_wh.headers();
+        assert_eq!(
+            headers.get("X-Engine").and_then(|v| v.to_str().ok()),
+            Some("n8n-rust-v5.7"),
+            "Custom X-Engine header must match RespondToWebhook config"
+        );
+        assert_eq!(
+            headers.get("X-Transform-Status").and_then(|v| v.to_str().ok()),
+            Some("deduplicated-ok")
+        );
+
+        // Verify custom response body
+        let bytes_wh = res_wh.into_body().collect().await.unwrap().to_bytes();
+        let wh_json: serde_json::Value = serde_json::from_slice(&bytes_wh).unwrap();
+        assert_eq!(wh_json["success"], true);
+        assert_eq!(wh_json["processedCount"], 3);
+        assert_eq!(wh_json["summary"], "Records processed and deduplicated");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 22 timed out!");
+}
+
+

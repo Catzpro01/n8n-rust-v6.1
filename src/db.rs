@@ -584,12 +584,13 @@ impl StorageEngine {
 
         let rows = stmt.query_map([], |row| {
             let data_str: String = row.get(3)?;
+            let decrypted_data = decrypt_credential_data(&data_str)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
             Ok(CredentialRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 cred_type: row.get(2)?,
-                data: serde_json::from_str(&data_str)
-                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                data: decrypted_data,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
             })
@@ -613,12 +614,13 @@ impl StorageEngine {
         let mut rows = stmt.query(params![id])?;
         if let Some(row) = rows.next()? {
             let data_str: String = row.get(3)?;
+            let decrypted_data = decrypt_credential_data(&data_str)
+                .unwrap_or_else(|_| Value::Object(serde_json::Map::new()));
             Ok(Some(CredentialRecord {
                 id: row.get(0)?,
                 name: row.get(1)?,
                 cred_type: row.get(2)?,
-                data: serde_json::from_str(&data_str)
-                    .unwrap_or(Value::Object(serde_json::Map::new())),
+                data: decrypted_data,
                 created_at: row.get(4)?,
                 updated_at: row.get(5)?,
             }))
@@ -632,6 +634,7 @@ impl StorageEngine {
             .conn
             .lock()
             .map_err(|e| anyhow::anyhow!("Poisoned db lock: {}", e))?;
+        let encrypted_data = encrypt_credential_data(&cred.data)?;
         conn.execute(
             r#"
             INSERT OR REPLACE INTO credentials (id, name, cred_type, data, created_at, updated_at)
@@ -641,7 +644,7 @@ impl StorageEngine {
                 cred.id,
                 cred.name,
                 cred.cred_type,
-                serde_json::to_string(&cred.data)?,
+                encrypted_data,
                 cred.created_at,
                 cred.updated_at,
             ],
@@ -657,6 +660,9 @@ impl StorageEngine {
         let affected = conn.execute("DELETE FROM credentials WHERE id = ?1", params![id])?;
         Ok(affected > 0)
     }
+
+
+
 
     // --- TAGS CRUD ---
 
@@ -1052,3 +1058,72 @@ impl StorageEngine {
 pub fn new_id() -> String {
     Uuid::new_v4().to_string()
 }
+
+// ---------------------------------------------------------------------------
+// Credential Vault Encryption & Decryption (Deterministic At-Rest Protection)
+// ---------------------------------------------------------------------------
+
+pub fn get_encryption_key() -> Vec<u8> {
+    std::env::var("N8N_ENCRYPTION_KEY")
+        .unwrap_or_else(|_| "n8n-rust-v5-master-encryption-key-32b".to_string())
+        .into_bytes()
+}
+
+fn xor_stream_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
+    if key.is_empty() {
+        return data.to_vec();
+    }
+    data.iter()
+        .enumerate()
+        .map(|(i, &b)| {
+            let k = key[i % key.len()];
+            let salt = ((i * 37 + 19) & 0xFF) as u8;
+            b ^ k ^ salt
+        })
+        .collect()
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+fn hex_decode(s: &str) -> Result<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        anyhow::bail!("Invalid hex string length: {}", s.len());
+    }
+    let mut bytes = Vec::with_capacity(s.len() / 2);
+    for i in (0..s.len()).step_by(2) {
+        let byte_str = &s[i..i + 2];
+        let byte = u8::from_str_radix(byte_str, 16)
+            .map_err(|e| anyhow::anyhow!("Invalid hex byte '{}': {}", byte_str, e))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+pub fn encrypt_credential_data(data: &Value) -> Result<String> {
+    let json_bytes = serde_json::to_vec(data)?;
+    let key = get_encryption_key();
+    let enc_bytes = xor_stream_cipher(&json_bytes, &key);
+    let hex_str = hex_encode(&enc_bytes);
+    Ok(format!("enc:v1:{}", hex_str))
+}
+
+pub fn decrypt_credential_data(raw: &str) -> Result<Value> {
+    if let Some(stripped) = raw.strip_prefix("enc:v1:") {
+        let key = get_encryption_key();
+        let enc_bytes = hex_decode(stripped)?;
+        let json_bytes = xor_stream_cipher(&enc_bytes, &key);
+        let val: Value = serde_json::from_slice(&json_bytes)?;
+        Ok(val)
+    } else {
+        // Fallback for unencrypted legacy credentials
+        let val: Value = serde_json::from_str(raw)?;
+        Ok(val)
+    }
+}
+
