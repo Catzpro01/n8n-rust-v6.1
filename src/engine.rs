@@ -30,6 +30,7 @@ pub enum NodeKind {
     Code = 9,
     Merge = 10,
     HttpRequest = 11,
+    ExecuteWorkflow = 12,
     Unknown = 255,
 }
 
@@ -48,9 +49,22 @@ impl NodeKind {
             "n8n-nodes-base.code" | "code" => NodeKind::Code,
             "n8n-nodes-base.merge" | "merge" => NodeKind::Merge,
             "n8n-nodes-base.httpRequest" | "httpRequest" => NodeKind::HttpRequest,
+            "n8n-nodes-base.executeWorkflow" | "executeWorkflow" => NodeKind::ExecuteWorkflow,
             _ => NodeKind::Unknown,
         }
     }
+}
+
+static SUBWORKFLOW_REGISTRY: OnceLock<DashMap<String, Value>> = OnceLock::new();
+
+pub fn register_subworkflow(workflow_id: &str, workflow_data: Value) {
+    let registry = SUBWORKFLOW_REGISTRY.get_or_init(DashMap::new);
+    registry.insert(workflow_id.to_string(), workflow_data);
+}
+
+pub fn get_subworkflow(workflow_id: &str) -> Option<Value> {
+    let registry = SUBWORKFLOW_REGISTRY.get_or_init(DashMap::new);
+    registry.get(workflow_id).map(|v| v.clone())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -369,6 +383,7 @@ impl HyperScaleEngine {
             is_hyperscale,
             is_compact_logging,
             total_nodes,
+            subworkflow_depth: 0,
         };
 
         // Execute DAG using Rayon Work-Stealing Scope
@@ -523,6 +538,7 @@ struct TraversalContext<'a> {
     is_hyperscale: bool,
     is_compact_logging: bool,
     total_nodes: usize,
+    subworkflow_depth: u32,
 }
 
 fn prepare_target_input(
@@ -599,7 +615,7 @@ fn traverse_node_inner<'scope>(
 
         // Execute node transformation with zero-copy Arc<Value> & conditional port routing
         let (result_payload, active_port) =
-            execute_node_logic(node, current_input, &expr_ctx, ctx.is_hyperscale);
+            execute_node_logic(node, current_input, &expr_ctx, ctx.is_hyperscale, ctx.subworkflow_depth);
 
         // Store output for UI runData ONLY when not compact logging (saves massive allocations in hyperscale)
         if !ctx.is_compact_logging {
@@ -962,6 +978,7 @@ fn execute_node_logic(
     input: Arc<Value>,
     expr_ctx: &ExprContext,
     is_hyperscale: bool,
+    subworkflow_depth: u32,
 ) -> (Arc<Value>, Option<u16>) {
     let resolved_holder;
     let params_ref = if !is_hyperscale && node.has_expressions {
@@ -1152,7 +1169,54 @@ fn execute_node_logic(
                 .unwrap_or("GET");
             let headers = params_ref.get("headers");
             let body = params_ref.get("body").or_else(|| params_ref.get("data"));
-            let mut res = execute_real_http_request(url, method, headers, body);
+
+            let max_tries = params_ref
+                .get("maxTries")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    params_ref
+                        .get("options")
+                        .and_then(|o| o.get("maxTries"))
+                        .and_then(|v| v.as_u64())
+                })
+                .unwrap_or(1)
+                .clamp(1, 5) as u32;
+
+            let wait_between_tries = params_ref
+                .get("waitBetweenTries")
+                .and_then(|v| v.as_u64())
+                .or_else(|| {
+                    params_ref
+                        .get("options")
+                        .and_then(|o| o.get("waitBetweenTries"))
+                        .and_then(|v| v.as_u64())
+                })
+                .unwrap_or(0)
+                .clamp(0, 5000);
+
+            let mut attempts = 0u32;
+            let mut res;
+
+            loop {
+                attempts += 1;
+                res = execute_real_http_request(url, method, headers, body);
+                let status = res
+                    .get("statusCode")
+                    .and_then(|s| s.as_u64())
+                    .unwrap_or(200);
+
+                if (status < 500 && status != 0) || attempts >= max_tries {
+                    break;
+                }
+
+                if wait_between_tries > 0 {
+                    std::thread::sleep(std::time::Duration::from_millis(wait_between_tries));
+                }
+            }
+
+            if let Some(res_obj) = res.as_object_mut() {
+                res_obj.insert("attempts".to_string(), json!(attempts));
+            }
 
             let continue_on_fail = params_ref
                 .get("continueOnFail")
@@ -1188,7 +1252,144 @@ fn execute_node_logic(
 
             (Arc::new(res), None)
         }
+        NodeKind::ExecuteWorkflow => {
+            if subworkflow_depth >= 10 {
+                return (
+                    Arc::new(json!({
+                        "__node_error": true,
+                        "error": {
+                            "message": "Exceeded maximum sub-workflow recursion depth (10)"
+                        }
+                    })),
+                    None,
+                );
+            }
+
+            let workflow_val = if let Some(wf) = params_ref.get("workflow") {
+                Some(wf.clone())
+            } else if let Some(wf_id) = params_ref.get("workflowId").and_then(|v| v.as_str()) {
+                get_subworkflow(wf_id)
+            } else {
+                None
+            };
+
+            let Some(wf_val) = workflow_val else {
+                return (
+                    Arc::new(json!({
+                        "__node_error": true,
+                        "error": {
+                            "message": "Sub-workflow not found or missing workflowId/workflow parameter"
+                        }
+                    })),
+                    None,
+                );
+            };
+
+            let empty_arr = Value::Array(vec![]);
+            let empty_obj = Value::Object(serde_json::Map::new());
+            let nodes_val = wf_val.get("nodes").unwrap_or(&empty_arr);
+            let conns_val = wf_val.get("connections").unwrap_or(&empty_obj);
+
+            let compiled = match CompiledGraph::compile(nodes_val, conns_val) {
+                Ok(c) => c,
+                Err(e) => {
+                    return (
+                        Arc::new(json!({
+                            "__node_error": true,
+                            "error": {
+                                "message": format!("Failed to compile sub-workflow: {}", e)
+                            }
+                        })),
+                        None,
+                    );
+                }
+            };
+
+            execute_subworkflow(&compiled, Arc::clone(&input), subworkflow_depth + 1)
+        }
         _ => (input, None),
+    }
+}
+
+pub fn execute_subworkflow(
+    graph: &CompiledGraph,
+    initial_input: Arc<Value>,
+    depth: u32,
+) -> (Arc<Value>, Option<u16>) {
+    let start_time = Instant::now();
+    let total_nodes = graph.nodes.len();
+
+    if total_nodes == 0 {
+        return (initial_input, None);
+    }
+
+    let remaining_in_degree: Vec<AtomicU32> =
+        graph.in_degree.iter().map(|&d| AtomicU32::new(d)).collect();
+    let executed_count = AtomicU32::new(0);
+    let outputs = DashMap::<u32, Arc<Value>>::new();
+    let cancel_flag = AtomicBool::new(false);
+    let timed_out = AtomicBool::new(false);
+    let has_error = AtomicBool::new(false);
+    let timeout_duration = std::time::Duration::from_secs(30);
+    let last_output_holder = std::sync::Mutex::new(Arc::clone(&initial_input));
+
+    let multi_inputs = DashMap::<u32, std::sync::Mutex<Vec<Arc<Value>>>>::new();
+    for (idx, &degree) in graph.in_degree.iter().enumerate() {
+        if degree > 1 {
+            multi_inputs.insert(
+                idx as u32,
+                std::sync::Mutex::new(Vec::with_capacity(degree as usize)),
+            );
+        }
+    }
+
+    let ctx = TraversalContext {
+        graph,
+        remaining_in_degree: &remaining_in_degree,
+        outputs: &outputs,
+        multi_inputs: &multi_inputs,
+        executed_count: &executed_count,
+        cancel_flag: &cancel_flag,
+        timed_out: &timed_out,
+        has_error: &has_error,
+        start_time,
+        timeout_duration,
+        notifier: None,
+        execution_id: "subworkflow",
+        last_output_holder: &last_output_holder,
+        is_hyperscale: false,
+        is_compact_logging: false,
+        total_nodes,
+        subworkflow_depth: depth,
+    };
+
+    rayon::scope(|s| {
+        for &root_idx in &graph.roots {
+            let root_input = Arc::clone(&initial_input);
+            let ctx_ref = &ctx;
+            s.spawn(move |s| {
+                traverse_node(s, ctx_ref, root_idx, root_input);
+            });
+        }
+    });
+
+    let final_output = last_output_holder
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+
+    if has_error.load(Ordering::Relaxed) {
+        let mut err_obj = (*final_output).clone();
+        if !err_obj
+            .as_object()
+            .is_some_and(|o| o.contains_key("__node_error"))
+        {
+            if let Some(obj) = err_obj.as_object_mut() {
+                obj.insert("__node_error".to_string(), json!(true));
+            }
+        }
+        (Arc::new(err_obj), None)
+    } else {
+        (final_output, None)
     }
 }
 

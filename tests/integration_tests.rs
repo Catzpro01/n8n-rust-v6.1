@@ -12,7 +12,7 @@ use n8n_rust_v5::{
 };
 use serde_json::json;
 use std::path::Path;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tower::ServiceExt;
@@ -2231,7 +2231,27 @@ async fn test_real_http_client_and_schedule_daemon() {
         let (db, db_path) = setup_test_engine();
         let app = build_app(Path::new("ui-dist"), db.clone());
 
-        // 1. Direct execution of HttpRequest node (testing graceful networking and expression resolution)
+        // Spawn genuinely active local mock HTTP server
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let mock_app = Router::new()
+                .route("/healthz", get(|| async { axum::Json(json!({ "status": "ok" })) }))
+                .route("/plain-text", get(|| async { "pong-plain-text-response" }));
+            rt.block_on(async move {
+                let _ = axum::serve(listener, mock_app).await;
+            });
+        });
+
+        let local_addr = rx.recv().unwrap();
+
+        // 1. Direct execution of HttpRequest node (genuine 200 OK without continueOnFail)
         let http_wf_payload = json!({
             "nodes": [
                 {
@@ -2239,9 +2259,8 @@ async fn test_real_http_client_and_schedule_daemon() {
                     "name": "HTTP Request Node",
                     "type": "n8n-nodes-base.httpRequest",
                     "parameters": {
-                        "url": "http://127.0.0.1:5678/healthz",
-                        "method": "GET",
-                        "continueOnFail": true
+                        "url": format!("http://{local_addr}/healthz"),
+                        "method": "GET"
                     }
                 }
             ],
@@ -2265,6 +2284,9 @@ async fn test_real_http_client_and_schedule_daemon() {
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(run_res["data"]["status"], "success");
+        let http1_out = &run_res["data"]["resultData"]["runData"]["HTTP Request Node"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(http1_out["statusCode"], 200);
+        assert_eq!(http1_out["data"]["status"], "ok");
 
         // 2. Test active workflow with scheduleTrigger (intervalSecs: 1)
         let schedule_wf = json!({
@@ -2329,22 +2351,6 @@ async fn test_real_http_client_and_schedule_daemon() {
         );
 
         // 3. Anti-regression check: Plain-text endpoint response & Connection Pool reuse
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
-            let addr = listener.local_addr().unwrap();
-            tx.send(addr).unwrap();
-            let text_app = Router::new().route("/plain-text", get(|| async { "pong-plain-text-response" }));
-            rt.block_on(async move {
-                let _ = axum::serve(listener, text_app).await;
-            });
-        });
-
-        let local_addr = rx.recv().unwrap();
         let target_url = format!("http://{local_addr}/plain-text");
         for _ in 0..3 {
             let resp_val = n8n_rust_v5::engine::execute_real_http_request(&target_url, "GET", None, None);
@@ -2440,5 +2446,294 @@ async fn test_real_http_client_and_schedule_daemon() {
     })
     .await
     .expect("Test 18 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 19. Sub-Workflow Execution Engine & Recursion Depth Guard Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_sub_workflow_execution_and_recursion_guard() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // A. Successful Parent -> Sub-Workflow Execution (with inline workflow definition & parameter mapping)
+        let sub_wf_definition = json!({
+            "nodes": [
+                {
+                    "id": "sub-set-1",
+                    "name": "Sub Set Node",
+                    "type": "n8n-nodes-base.set",
+                    "parameters": {
+                        "sub_executed": true,
+                        "multiplier": 42
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let parent_wf_payload = json!({
+            "nodes": [
+                {
+                    "id": "parent-manual",
+                    "name": "Parent Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "sub-exec-1",
+                    "name": "Execute SubWorkflow",
+                    "type": "n8n-nodes-base.executeWorkflow",
+                    "parameters": {
+                        "workflow": sub_wf_definition
+                    }
+                }
+            ],
+            "connections": {
+                "Parent Trigger": {
+                    "main": [
+                        [
+                            {
+                                "node": "Execute SubWorkflow",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(parent_wf_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run_res["data"]["status"], "success");
+        let sub_run_data = &run_res["data"]["resultData"]["runData"]["Execute SubWorkflow"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(sub_run_data["sub_executed"], true);
+        assert_eq!(sub_run_data["multiplier"], 42);
+
+        // B. Recursion Depth Guard: Circular Sub-Workflow Calling Itself (> 10 levels)
+        let circular_sub_id = "circular-loop-subwf";
+        let circular_wf = json!({
+            "nodes": [
+                {
+                    "id": "recurse-node",
+                    "name": "Recurse Node",
+                    "type": "n8n-nodes-base.executeWorkflow",
+                    "parameters": {
+                        "workflowId": circular_sub_id
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        n8n_rust_v5::engine::register_subworkflow(circular_sub_id, circular_wf);
+
+        let parent_loop_payload = json!({
+            "nodes": [
+                {
+                    "id": "trigger",
+                    "name": "Loop Trigger",
+                    "type": "n8n-nodes-base.manualTrigger",
+                    "parameters": {}
+                },
+                {
+                    "id": "loop-exec",
+                    "name": "Loop SubWorkflow",
+                    "type": "n8n-nodes-base.executeWorkflow",
+                    "parameters": {
+                        "workflowId": circular_sub_id
+                    }
+                }
+            ],
+            "connections": {
+                "Loop Trigger": {
+                    "main": [
+                        [
+                            {
+                                "node": "Loop SubWorkflow",
+                                "type": "main",
+                                "index": 0
+                            }
+                        ]
+                    ]
+                }
+            }
+        });
+
+        let res_loop = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(parent_loop_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_loop.status(), StatusCode::OK);
+        let bytes_loop = res_loop.into_body().collect().await.unwrap().to_bytes();
+        let loop_res: serde_json::Value = serde_json::from_slice(&bytes_loop).unwrap();
+        assert_eq!(loop_res["data"]["status"], "error");
+        let loop_node_entry = &loop_res["data"]["resultData"]["runData"]["Loop SubWorkflow"][0];
+        assert_eq!(loop_node_entry["executionStatus"], "error");
+        let error_msg = loop_node_entry["error"]["message"].as_str().unwrap_or("");
+        assert!(
+            error_msg.contains("Exceeded maximum sub-workflow recursion depth (10)"),
+            "Expected recursion guard error message, got: {}",
+            error_msg
+        );
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 19 timed out!");
+}
+
+// ---------------------------------------------------------------------------
+// 20. HTTP Request Retry Policy (maxTries & waitBetweenTries) Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_http_request_retry_policy() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // Setup mock server with atomic hit counter
+        let hit_counter = Arc::new(AtomicU32::new(0));
+        let counter_clone = Arc::clone(&hit_counter);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let retry_app = Router::new().route(
+                "/retry-endpoint",
+                get(move || {
+                    let c = Arc::clone(&counter_clone);
+                    async move {
+                        let current_hits = c.fetch_add(1, Ordering::SeqCst) + 1;
+                        if current_hits < 3 {
+                            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({ "error": "Temporary Failure" })))
+                        } else {
+                            (StatusCode::OK, axum::Json(json!({ "recovered": true, "hits": current_hits })))
+                        }
+                    }
+                }),
+            );
+            rt.block_on(async move {
+                let _ = axum::serve(listener, retry_app).await;
+            });
+        });
+
+        let local_addr = rx.recv().unwrap();
+
+        // A. Successful recovery after 3 attempts
+        let retry_wf = json!({
+            "nodes": [
+                {
+                    "id": "http-retry",
+                    "name": "Retry HTTP Request",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": format!("http://{local_addr}/retry-endpoint"),
+                        "method": "GET",
+                        "maxTries": 3,
+                        "waitBetweenTries": 10
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(retry_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let run_res: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(run_res["data"]["status"], "success");
+        let node_data = &run_res["data"]["resultData"]["runData"]["Retry HTTP Request"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(node_data["statusCode"], 200);
+        assert_eq!(node_data["attempts"], 3, "Expected exactly 3 retry attempts");
+        assert_eq!(node_data["data"]["recovered"], true);
+
+        // B. Permanent failure on dead port verifying attempts count
+        let dead_retry_wf = json!({
+            "nodes": [
+                {
+                    "id": "dead-retry",
+                    "name": "Dead Retry Node",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": "http://127.0.0.1:1",
+                        "method": "GET",
+                        "maxTries": 3,
+                        "waitBetweenTries": 10,
+                        "continueOnFail": true
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_dead = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(dead_retry_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_dead.status(), StatusCode::OK);
+        let bytes_dead = res_dead.into_body().collect().await.unwrap().to_bytes();
+        let dead_res: serde_json::Value = serde_json::from_slice(&bytes_dead).unwrap();
+        assert_eq!(dead_res["data"]["status"], "success");
+        let dead_node_data = &dead_res["data"]["resultData"]["runData"]["Dead Retry Node"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(dead_node_data["statusCode"], 502);
+        assert_eq!(dead_node_data["attempts"], 3, "Expected 3 attempts on failing endpoint");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 20 timed out!");
 }
 
