@@ -2899,7 +2899,7 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
             }
         });
 
-        // 1. Create credential via REST API
+        // 1. Create first credential via REST API
         let res_create = app
             .clone()
             .oneshot(
@@ -2919,25 +2919,88 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
         let cred_id = created_json["data"]["id"].as_str().unwrap().to_string();
         assert!(!cred_id.is_empty());
 
-        // 2. Direct SQLite Inspection: Verify at-rest encryption format ("enc:v1:") and zero plaintext leak
+        // Create second credential with 100% identical data to verify per-record random nonce
+        let cred_payload_2 = json!({
+            "name": "Production Vault Secret Identical Copy",
+            "type": "customAuth",
+            "data": {
+                "token": secret_token,
+                "custom_field": "confidential_value"
+            }
+        });
+
+        let res_create_2 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/credentials")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(cred_payload_2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_2.status(), StatusCode::OK);
+        let bytes_create_2 = res_create_2.into_body().collect().await.unwrap().to_bytes();
+        let created_json_2: serde_json::Value = serde_json::from_slice(&bytes_create_2).unwrap();
+        let cred_id_2 = created_json_2["data"]["id"].as_str().unwrap().to_string();
+        assert!(!cred_id_2.is_empty());
+
+        // 2. Direct SQLite Inspection: Verify at-rest encryption format, random nonce, and zero plaintext leak
         {
             let raw_conn = rusqlite::Connection::open(&db_path).unwrap();
             let mut stmt = raw_conn
                 .prepare("SELECT data FROM credentials WHERE id = ?1")
                 .unwrap();
-            let raw_encrypted_str: String = stmt
+            let raw_encrypted_1: String = stmt
                 .query_row(rusqlite::params![cred_id], |row| row.get(0))
                 .unwrap();
+            let raw_encrypted_2: String = stmt
+                .query_row(rusqlite::params![cred_id_2], |row| row.get(0))
+                .unwrap();
 
+            // Verifikasi keduanya berawalan "enc:v1:"
             assert!(
-                raw_encrypted_str.starts_with("enc:v1:"),
-                "Credential data in SQLite must be encrypted at-rest and start with 'enc:v1:'. Found: {}",
-                raw_encrypted_str
+                raw_encrypted_1.starts_with("enc:v1:"),
+                "Credential 1 in SQLite must be encrypted at-rest and start with 'enc:v1:'. Found: {}",
+                raw_encrypted_1
             );
             assert!(
-                !raw_encrypted_str.contains(secret_token),
-                "Encrypted credential data must NEVER leak plaintext secret tokens in storage! Found: {}",
-                raw_encrypted_str
+                raw_encrypted_2.starts_with("enc:v1:"),
+                "Credential 2 in SQLite must be encrypted at-rest and start with 'enc:v1:'. Found: {}",
+                raw_encrypted_2
+            );
+
+            // Verifikasi format memiliki 2 titik dua (misal enc:v1:{nonce}:{ciphertext})
+            assert!(
+                raw_encrypted_1.matches(':').count() >= 2,
+                "Format of credential 1 must contain colons separating prefix, nonce, and ciphertext: {}",
+                raw_encrypted_1
+            );
+            assert!(
+                raw_encrypted_2.matches(':').count() >= 2,
+                "Format of credential 2 must contain colons separating prefix, nonce, and ciphertext: {}",
+                raw_encrypted_2
+            );
+
+            // Verifikasi raw_encrypted_1 != raw_encrypted_2 (karena per-record nonce acak, ciphertext dua record identik WAJIB berbeda!)
+            assert_ne!(
+                raw_encrypted_1, raw_encrypted_2,
+                "Per-record random nonce must ensure identical plaintext data produces completely distinct ciphertexts!"
+            );
+
+            // Verifikasi keduanya TIDAK mengandung secret_token dalam bentuk plaintext
+            assert!(
+                !raw_encrypted_1.contains(secret_token),
+                "Encrypted credential 1 must NEVER leak plaintext secret tokens in storage! Found: {}",
+                raw_encrypted_1
+            );
+            assert!(
+                !raw_encrypted_2.contains(secret_token),
+                "Encrypted credential 2 must NEVER leak plaintext secret tokens in storage! Found: {}",
+                raw_encrypted_2
             );
         }
 
@@ -2960,7 +3023,36 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
         assert_eq!(get_json["data"]["data"]["token"], secret_token);
         assert_eq!(get_json["data"]["data"]["custom_field"], "confidential_value");
 
-        // 4. Setup mock HTTP server to verify automatic Bearer token injection
+        // 4. Create third credential with "type": "httpBasicAuth"
+        let cred_payload_3 = json!({
+            "name": "Production Basic Auth Credential",
+            "type": "httpBasicAuth",
+            "data": {
+                "user": "n8n_admin",
+                "password": "super_secret_password_777"
+            }
+        });
+
+        let res_create_3 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/credentials")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(cred_payload_3.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_create_3.status(), StatusCode::OK);
+        let bytes_create_3 = res_create_3.into_body().collect().await.unwrap().to_bytes();
+        let created_json_3: serde_json::Value = serde_json::from_slice(&bytes_create_3).unwrap();
+        let cred_id_3 = created_json_3["data"]["id"].as_str().unwrap().to_string();
+        assert!(!cred_id_3.is_empty());
+
+        // 5. Setup mock HTTP server to verify automatic Bearer token and Basic Auth injection
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -2970,20 +3062,35 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
             let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
             let addr = listener.local_addr().unwrap();
             tx.send(addr).unwrap();
-            let auth_mock_app = Router::new().route(
-                "/auth-test",
-                get(|headers: axum::http::HeaderMap| async move {
-                    if let Some(auth_val) = headers.get(axum::http::header::AUTHORIZATION) {
-                        if auth_val == "Bearer super-secret-vault-token-xyz-12345" {
-                            (StatusCode::OK, axum::Json(json!({ "authenticated": true })))
+            let auth_mock_app = Router::new()
+                .route(
+                    "/auth-test",
+                    get(|headers: axum::http::HeaderMap| async move {
+                        if let Some(auth_val) = headers.get(axum::http::header::AUTHORIZATION) {
+                            if auth_val == "Bearer super-secret-vault-token-xyz-12345" {
+                                (StatusCode::OK, axum::Json(json!({ "authenticated": true })))
+                            } else {
+                                (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "invalid_token" })))
+                            }
                         } else {
-                            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "invalid_token" })))
+                            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "missing_header" })))
                         }
-                    } else {
-                        (StatusCode::UNAUTHORIZED, axum::Json(json!({ "authenticated": false, "reason": "missing_header" })))
-                    }
-                }),
-            );
+                    }),
+                )
+                .route(
+                    "/auth-basic-test",
+                    get(|headers: axum::http::HeaderMap| async move {
+                        if let Some(auth_val) = headers.get(axum::http::header::AUTHORIZATION) {
+                            if auth_val == "Basic bjhuX2FkbWluOnN1cGVyX3NlY3JldF9wYXNzd29yZF83Nzc=" {
+                                (StatusCode::OK, axum::Json(json!({ "basic_authenticated": true })))
+                            } else {
+                                (StatusCode::UNAUTHORIZED, axum::Json(json!({ "basic_authenticated": false, "reason": "invalid_auth" })))
+                            }
+                        } else {
+                            (StatusCode::UNAUTHORIZED, axum::Json(json!({ "basic_authenticated": false, "reason": "missing_header" })))
+                        }
+                    }),
+                );
             rt.block_on(async move {
                 let _ = axum::serve(listener, auth_mock_app).await;
             });
@@ -2991,7 +3098,7 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
 
         let local_addr = rx.recv().unwrap();
 
-        // 5. Run workflow using HttpRequest node with credentialId
+        // 6. Run workflow using HttpRequest node with Bearer token credentialId
         let http_cred_wf = json!({
             "nodes": [
                 {
@@ -3028,6 +3135,44 @@ async fn test_credential_vault_encryption_and_http_auth_injection() {
         let node_out = &run_json["data"]["resultData"]["runData"]["Vault HTTP Node"][0]["data"]["main"][0][0]["json"];
         assert_eq!(node_out["statusCode"], 200);
         assert_eq!(node_out["data"]["authenticated"], true, "Expected node to be authenticated via injected Bearer header");
+
+        // 7. Run workflow using HttpRequest node with Basic Auth credentialId (cred_id_3)
+        let http_basic_wf = json!({
+            "nodes": [
+                {
+                    "id": "http-basic-node",
+                    "name": "Basic Auth HTTP Node",
+                    "type": "n8n-nodes-base.httpRequest",
+                    "parameters": {
+                        "url": format!("http://{local_addr}/auth-basic-test"),
+                        "method": "GET",
+                        "credentialId": cred_id_3
+                    }
+                }
+            ],
+            "connections": {}
+        });
+
+        let res_run_basic = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(http_basic_wf.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run_basic.status(), StatusCode::OK);
+        let bytes_run_basic = res_run_basic.into_body().collect().await.unwrap().to_bytes();
+        let run_json_basic: serde_json::Value = serde_json::from_slice(&bytes_run_basic).unwrap();
+        assert_eq!(run_json_basic["data"]["status"], "success");
+        let basic_out = &run_json_basic["data"]["resultData"]["runData"]["Basic Auth HTTP Node"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(basic_out["statusCode"], 200);
+        assert_eq!(basic_out["data"]["basic_authenticated"], true, "Expected node to be authenticated via injected Basic Auth header");
 
         let _ = std::fs::remove_file(db_path);
     })
@@ -3163,7 +3308,10 @@ async fn test_respond_to_webhook_and_collection_transform_nodes() {
                         "records": [
                             { "id": 1, "val": "A" },
                             { "id": 2, "val": "B" },
-                            { "id": 1, "val": "A-duplicate" }
+                            { "id": 1, "val": "A-duplicate" },
+                            { "id": "10", "label": "string_ten" },
+                            { "id": 10, "label": "number_ten" },
+                            { "label": "no_id_field" }
                         ]
                     }
                 },
@@ -3224,9 +3372,26 @@ async fn test_respond_to_webhook_and_collection_transform_nodes() {
         assert_eq!(pipe_json["data"]["status"], "success");
         let agg_output = &pipe_json["data"]["resultData"]["runData"]["Agg Direct"][0]["data"]["main"][0][0]["json"];
         let grouped_arr = agg_output["grouped"].as_array().expect("Agg Direct must produce grouped array");
-        assert_eq!(grouped_arr.len(), 2, "Duplicate item with id 1 must be removed while preserving order");
+
+        // Verifikasi:
+        // 1. Item duplikat nyata: {"id": 1, "val": "A"} dan {"id": 1, "val": "A-duplicate"} -> hanya 1 yang lolos.
+        // 2. Item dengan tipe berbeda pada field yang sama: {"id": "10", "label": "string_ten"} vs {"id": 10, "label": "number_ten"} -> KEDUANYA harus lolos deduplikasi (tidak saling menghapus!).
+        // 3. Item tanpa field id: {"label": "no_id_field"} -> TIDAK BOLEH dihapus!
+        assert_eq!(grouped_arr.len(), 5, "Expected 5 deduplicated records preserving distinct types and missing fields");
         assert_eq!(grouped_arr[0]["id"], 1);
+        assert_eq!(grouped_arr[0]["val"], "A");
         assert_eq!(grouped_arr[1]["id"], 2);
+        assert_eq!(grouped_arr[1]["val"], "B");
+        assert_eq!(grouped_arr[2]["id"], "10");
+        assert_eq!(grouped_arr[2]["label"], "string_ten");
+        assert_eq!(grouped_arr[3]["id"], 10);
+        assert_eq!(grouped_arr[3]["label"], "number_ten");
+        assert_eq!(grouped_arr[4]["label"], "no_id_field");
+        assert!(grouped_arr[4].get("id").is_none());
+        assert!(
+            !grouped_arr.iter().any(|item| item.get("val").and_then(|v| v.as_str()) == Some("A-duplicate")),
+            "Duplicate item with id 1 must be removed"
+        );
 
         // 2. Trigger Webhook with request payload and verify RespondToWebhook overrides HTTP response
         let webhook_input_payload = json!({
@@ -3266,12 +3431,26 @@ async fn test_respond_to_webhook_and_collection_transform_nodes() {
             Some("deduplicated-ok")
         );
 
+        // Verifikasi header content-type ada dan bernilai application/json
+        assert_eq!(
+            headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            Some("application/json"),
+            "Content-Type header must exist and equal application/json"
+        );
+
         // Verify custom response body
         let bytes_wh = res_wh.into_body().collect().await.unwrap().to_bytes();
         let wh_json: serde_json::Value = serde_json::from_slice(&bytes_wh).unwrap();
         assert_eq!(wh_json["success"], true);
         assert_eq!(wh_json["processedCount"], 3);
         assert_eq!(wh_json["summary"], "Records processed and deduplicated");
+
+        // Verifikasi bahwa JSON response body yang diterima client TIDAK mengandung key "__webhook_response"
+        assert!(
+            wh_json.get("__webhook_response").is_none(),
+            "Client response body must NOT contain internal '__webhook_response' key: {:?}",
+            wh_json
+        );
 
         let _ = std::fs::remove_file(db_path);
     })

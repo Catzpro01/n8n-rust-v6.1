@@ -1246,7 +1246,19 @@ fn execute_node_logic(
                     effective_headers.insert(k.to_string(), json!(v));
                 }
 
-                if let Some(token) = cred_data
+                let user_opt = cred_data
+                    .get("user")
+                    .or_else(|| cred_data.get("username"))
+                    .and_then(|v| v.as_str());
+                let pass_opt = cred_data
+                    .get("password")
+                    .or_else(|| cred_data.get("pass"))
+                    .and_then(|v| v.as_str());
+                if let (Some(u), Some(p)) = (user_opt, pass_opt) {
+                    let cred_str = format!("{u}:{p}");
+                    let b64 = base64_encode(cred_str.as_bytes());
+                    effective_headers.insert("Authorization".to_string(), json!(format!("Basic {b64}")));
+                } else if let Some(token) = cred_data
                     .get("token")
                     .or_else(|| cred_data.get("bearerToken"))
                     .and_then(|v| v.as_str())
@@ -1536,21 +1548,25 @@ fn execute_node_logic(
             let mut out_items = Vec::new();
 
             for item in input_items {
-                let key = if let Some(field) = compare_field {
-                    item.get(field)
+                if let Some(field) = compare_field {
+                    let maybe_val = item
+                        .get(field)
                         .or_else(|| item.get("json").and_then(|j| j.get(field)))
-                        .or_else(|| item.get("body").and_then(|b| b.get(field)))
-                        .map(|v| match v {
-                            Value::String(s) => s.clone(),
-                            other => other.to_string(),
-                        })
-                        .unwrap_or_default()
-                } else {
-                    serde_json::to_string(&item).unwrap_or_default()
-                };
+                        .or_else(|| item.get("body").and_then(|b| b.get(field)));
 
-                if seen.insert(key) {
-                    out_items.push(item);
+                    if let Some(val) = maybe_val {
+                        let key = serde_json::to_string(val).unwrap_or_else(|_| val.to_string());
+                        if seen.insert(key) {
+                            out_items.push(item);
+                        }
+                    } else {
+                        out_items.push(item);
+                    }
+                } else {
+                    let key = serde_json::to_string(&item).unwrap_or_else(|_| item.to_string());
+                    if seen.insert(key) {
+                        out_items.push(item);
+                    }
                 }
             }
 
@@ -1822,4 +1838,40 @@ fn num_cpus_available() -> usize {
         .map(|n| n.get())
         .unwrap_or(4)
 }
+
+pub fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().saturating_mul(4) / 3 + 4);
+    for chunk in bytes.chunks(3) {
+        match chunk.len() {
+            3 => {
+                let b0 = chunk[0];
+                let b1 = chunk[1];
+                let b2 = chunk[2];
+                out.push(TABLE[(b0 >> 2) as usize] as char);
+                out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+                out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+                out.push(TABLE[(b2 & 0x3f) as usize] as char);
+            }
+            2 => {
+                let b0 = chunk[0];
+                let b1 = chunk[1];
+                out.push(TABLE[(b0 >> 2) as usize] as char);
+                out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+                out.push(TABLE[((b1 & 0x0f) << 2) as usize] as char);
+                out.push('=');
+            }
+            1 => {
+                let b0 = chunk[0];
+                out.push(TABLE[(b0 >> 2) as usize] as char);
+                out.push(TABLE[((b0 & 0x03) << 4) as usize] as char);
+                out.push('=');
+                out.push('=');
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 

@@ -1069,7 +1069,7 @@ pub fn get_encryption_key() -> Vec<u8> {
         .into_bytes()
 }
 
-fn xor_stream_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
+fn xor_stream_cipher(data: &[u8], key: &[u8], nonce: &[u8]) -> Vec<u8> {
     if key.is_empty() {
         return data.to_vec();
     }
@@ -1077,8 +1077,10 @@ fn xor_stream_cipher(data: &[u8], key: &[u8]) -> Vec<u8> {
         .enumerate()
         .map(|(i, &b)| {
             let k = key[i % key.len()];
-            let salt = ((i * 37 + 19) & 0xFF) as u8;
-            b ^ k ^ salt
+            let n = if nonce.is_empty() { 0u8 } else { nonce[i % nonce.len()] };
+            let salt = ((i as u64).wrapping_mul(37).wrapping_add(19) & 0xFF) as u8;
+            let keystream = k.wrapping_mul(31).wrapping_add(n).wrapping_add(salt);
+            b ^ keystream
         })
         .collect()
 }
@@ -1108,18 +1110,40 @@ fn hex_decode(s: &str) -> Result<Vec<u8>> {
 pub fn encrypt_credential_data(data: &Value) -> Result<String> {
     let json_bytes = serde_json::to_vec(data)?;
     let key = get_encryption_key();
-    let enc_bytes = xor_stream_cipher(&json_bytes, &key);
+    let uuid = Uuid::new_v4();
+    let nonce = &uuid.as_bytes()[0..8];
+    let nonce_hex = hex_encode(nonce);
+    let enc_bytes = xor_stream_cipher(&json_bytes, &key, nonce);
     let hex_str = hex_encode(&enc_bytes);
-    Ok(format!("enc:v1:{}", hex_str))
+    Ok(format!("enc:v1:{}:{}", nonce_hex, hex_str))
 }
 
 pub fn decrypt_credential_data(raw: &str) -> Result<Value> {
-    if let Some(stripped) = raw.strip_prefix("enc:v1:") {
+    if let Some(rest) = raw.strip_prefix("enc:v1:") {
         let key = get_encryption_key();
-        let enc_bytes = hex_decode(stripped)?;
-        let json_bytes = xor_stream_cipher(&enc_bytes, &key);
-        let val: Value = serde_json::from_slice(&json_bytes)?;
-        Ok(val)
+        if rest.contains(':') {
+            let (nonce_hex, cipher_hex) = rest
+                .split_once(':')
+                .ok_or_else(|| anyhow::anyhow!("Invalid format"))?;
+            let nonce = hex_decode(nonce_hex)?;
+            let enc_bytes = hex_decode(cipher_hex)?;
+            let json_bytes = xor_stream_cipher(&enc_bytes, &key, &nonce);
+            let val: Value = serde_json::from_slice(&json_bytes)?;
+            Ok(val)
+        } else {
+            let enc_bytes = hex_decode(rest)?;
+            let json_bytes: Vec<u8> = enc_bytes
+                .iter()
+                .enumerate()
+                .map(|(i, &b)| {
+                    let k = key[i % key.len()];
+                    let salt = ((i * 37 + 19) & 0xFF) as u8;
+                    b ^ k ^ salt
+                })
+                .collect();
+            let val: Value = serde_json::from_slice(&json_bytes)?;
+            Ok(val)
+        }
     } else {
         // Fallback for unencrypted legacy credentials
         let val: Value = serde_json::from_str(raw)?;

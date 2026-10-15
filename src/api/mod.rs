@@ -2184,8 +2184,27 @@ pub async fn handle_webhook(
             }
         }
 
-        let body_val = resp_val.get("body").unwrap_or(&Value::Null);
-        let body_bytes = match body_val {
+        let mut body_val = resp_val.get("body").cloned().unwrap_or(Value::Null);
+        if let Value::Object(ref mut map) = body_val {
+            map.remove("__webhook_response");
+        }
+
+        if !res_headers.contains_key(axum::http::header::CONTENT_TYPE) {
+            match &body_val {
+                Value::String(_) => {
+                    if let Ok(ct) = axum::http::HeaderValue::from_str("text/plain; charset=utf-8") {
+                        res_headers.insert(axum::http::header::CONTENT_TYPE, ct);
+                    }
+                }
+                _ => {
+                    if let Ok(ct) = axum::http::HeaderValue::from_str("application/json") {
+                        res_headers.insert(axum::http::header::CONTENT_TYPE, ct);
+                    }
+                }
+            }
+        }
+
+        let body_bytes = match &body_val {
             Value::String(s) => s.as_bytes().to_vec(),
             Value::Null => Vec::new(),
             other => serde_json::to_vec(other).unwrap_or_default(),
