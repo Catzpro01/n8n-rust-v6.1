@@ -17,7 +17,7 @@ use axum::{
     Json, Router,
 };
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -601,12 +601,27 @@ pub struct CommunityPackageInputDto {
 
 pub async fn node_types_catalog(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let mut catalog = get_core_node_types_array();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    if let Some(cat_arr) = catalog.as_array() {
+        for node in cat_arr {
+            if let Some(name) = node.get("name").and_then(|n| n.as_str()) {
+                seen_names.insert(name.to_string());
+            }
+        }
+    }
+
     if let Ok(packages) = state.db.list_community_packages() {
         if let Some(cat_arr) = catalog.as_array_mut() {
             for pkg in packages {
                 if let Some(nodes) = pkg.manifest.get("nodeTypes").and_then(|n| n.as_array()) {
                     for node in nodes {
-                        cat_arr.push(node.clone());
+                        if let Some(name) = node.get("name").and_then(|n| n.as_str()) {
+                            if !seen_names.contains(name) {
+                                seen_names.insert(name.to_string());
+                                cat_arr.push(node.clone());
+                            }
+                        }
                     }
                 }
             }
@@ -630,9 +645,16 @@ pub async fn install_community_package(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CommunityPackageInputDto>,
 ) -> impl IntoResponse {
+    if payload.name.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "Package name cannot be empty" })),
+        )
+            .into_response();
+    }
     let now = Utc::now().to_rfc3339();
     let pkg = CommunityPackageRecord {
-        name: payload.name,
+        name: payload.name.trim().to_string(),
         version: payload.version.unwrap_or_else(|| "1.0.0".to_string()),
         author: payload.author.unwrap_or_default(),
         description: payload.description.unwrap_or_default(),
@@ -760,11 +782,27 @@ pub fn slice_workflow_spatial(
     };
 
     let total_nodes = nodes_arr.len();
-    let min_x = q.min_x.unwrap_or(-1000.0);
-    let max_x = q.max_x.unwrap_or(2000.0);
-    let min_y = q.min_y.unwrap_or(-1000.0);
-    let max_y = q.max_y.unwrap_or(2000.0);
-    let grid_size = q.grid_size.unwrap_or(500.0).max(50.0);
+    let mut min_x = q.min_x.unwrap_or(-1000.0);
+    let mut max_x = q.max_x.unwrap_or(2000.0);
+    let mut min_y = q.min_y.unwrap_or(-1000.0);
+    let mut max_y = q.max_y.unwrap_or(2000.0);
+
+    if !min_x.is_finite() { min_x = -1000.0; }
+    if !max_x.is_finite() { max_x = 2000.0; }
+    if !min_y.is_finite() { min_y = -1000.0; }
+    if !max_y.is_finite() { max_y = 2000.0; }
+
+    if min_x > max_x {
+        std::mem::swap(&mut min_x, &mut max_x);
+    }
+    if min_y > max_y {
+        std::mem::swap(&mut min_y, &mut max_y);
+    }
+
+    let grid_size = match q.grid_size {
+        Some(g) if g.is_finite() && g >= 10.0 => g,
+        _ => 500.0,
+    };
 
     let mut inside_nodes = Vec::new();
     let mut clusters: HashMap<(i64, i64), Vec<Value>> = HashMap::new();
@@ -773,7 +811,10 @@ pub fn slice_workflow_spatial(
         let (x, y) = if let Some(pos) = node.get("position").and_then(|p| p.as_array()) {
             let px = pos.first().and_then(|v| v.as_f64()).unwrap_or(0.0);
             let py = pos.get(1).and_then(|v| v.as_f64()).unwrap_or(0.0);
-            (px, py)
+            (
+                if px.is_finite() { px } else { 0.0 },
+                if py.is_finite() { py } else { 0.0 },
+            )
         } else {
             (0.0, 0.0)
         };
@@ -2050,6 +2091,7 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
         let last_runs: Arc<DashMap<String, std::time::Instant>> = Arc::new(DashMap::new());
+        let in_flight: Arc<DashSet<String>> = Arc::new(DashSet::new());
 
         loop {
             interval.tick().await;
@@ -2063,6 +2105,10 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
             };
 
             for wf in active_wfs {
+                if in_flight.contains(&wf.id) {
+                    continue;
+                }
+
                 let has_schedule = wf.nodes.as_array().is_some_and(|nodes| {
                     nodes.iter().any(|n| {
                         n.get("type").and_then(|t| t.as_str()).is_some_and(|t| {
@@ -2106,14 +2152,17 @@ pub fn spawn_cron_scheduler_daemon(state: Arc<AppState>) -> tokio::task::JoinHan
 
                 if should_run {
                     last_runs.insert(wf.id.clone(), std::time::Instant::now());
+                    in_flight.insert(wf.id.clone());
                     let state_clone = Arc::clone(&state);
+                    let in_flight_clone = Arc::clone(&in_flight);
                     let wf_id = wf.id.clone();
                     let nodes = wf.nodes.clone();
                     let connections = wf.connections.clone();
 
                     tokio::spawn(async move {
-                        let _ = execute_workflow_helper(state_clone, Some(wf_id), nodes, connections)
+                        let _ = execute_workflow_helper(state_clone, Some(wf_id.clone()), nodes, connections)
                             .await;
+                        in_flight_clone.remove(&wf_id);
                     });
                 }
             }

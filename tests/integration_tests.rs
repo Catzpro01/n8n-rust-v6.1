@@ -1,4 +1,8 @@
-use axum::http::{header, Request, StatusCode};
+use axum::{
+    http::{header, Request, StatusCode},
+    routing::get,
+    Router,
+};
 use chrono::Utc;
 use http_body_util::BodyExt;
 use n8n_rust_v5::{
@@ -1981,6 +1985,24 @@ async fn test_spatial_lod_viewport_clustering() {
         assert_eq!(wf_resp["data"]["meta"]["lodClustered"], true);
         assert_eq!(wf_resp["data"]["meta"]["totalOriginalNodes"], 10);
 
+        // 4. Anti-regression check: Query with gridSize=0 and inverted coordinates must NOT panic or produce NaN
+        let res_zero = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/workflows/{wf_id}/spatial-map?gridSize=0&minX=500&maxX=0&minY=500&maxY=0"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_zero.status(), StatusCode::OK);
+        let bytes_zero = res_zero.into_body().collect().await.unwrap().to_bytes();
+        let map_zero: serde_json::Value = serde_json::from_slice(&bytes_zero).unwrap();
+        assert_eq!(map_zero["data"]["totalOriginalNodes"], 10);
+        assert_eq!(map_zero["data"]["isClustered"], true);
+
         let _ = std::fs::remove_file(db_path);
     })
     .await
@@ -2086,6 +2108,26 @@ async fn test_community_packages_registry_and_node_types_merge() {
             .unwrap();
 
         assert_eq!(res.status(), StatusCode::OK);
+
+        // 5. Anti-regression check: Install package with empty/whitespace name must return 400 Bad Request
+        let bad_pkg = json!({
+            "name": "   ",
+            "version": "1.0.0"
+        });
+        let res_bad = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/community-packages")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(bad_pkg.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
 
         let _ = std::fs::remove_file(db_path);
     })
@@ -2197,6 +2239,33 @@ async fn test_real_http_client_and_schedule_daemon() {
             !execs.is_empty(),
             "ScheduleTrigger daemon must have triggered at least one execution"
         );
+
+        // 3. Anti-regression check: Plain-text endpoint response & Connection Pool reuse
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            let listener = rt.block_on(tokio::net::TcpListener::bind("127.0.0.1:0")).unwrap();
+            let addr = listener.local_addr().unwrap();
+            tx.send(addr).unwrap();
+            let text_app = Router::new().route("/plain-text", get(|| async { "pong-plain-text-response" }));
+            rt.block_on(async move {
+                let _ = axum::serve(listener, text_app).await;
+            });
+        });
+
+        let local_addr = rx.recv().unwrap();
+        let target_url = format!("http://{local_addr}/plain-text");
+        for _ in 0..3 {
+            let resp_val = n8n_rust_v5::engine::execute_real_http_request(&target_url, "GET", None, None);
+            assert_eq!(resp_val["statusCode"], 200, "resp_val was: {}", resp_val);
+            assert_eq!(
+                resp_val["data"], "pong-plain-text-response",
+                "Plain-text response must be preserved as Value::String and not dropped to Null"
+            );
+        }
 
         let _ = std::fs::remove_file(db_path);
     })

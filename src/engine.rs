@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, info, warn};
 
@@ -1095,14 +1095,71 @@ fn execute_node_logic(
                 .unwrap_or("GET");
             let headers = params_ref.get("headers");
             let body = params_ref.get("body").or_else(|| params_ref.get("data"));
-            let res = execute_real_http_request(url, method, headers, body);
+            let mut res = execute_real_http_request(url, method, headers, body);
+
+            let continue_on_fail = params_ref
+                .get("continueOnFail")
+                .and_then(|v| v.as_bool())
+                .or_else(|| {
+                    params_ref
+                        .get("options")
+                        .and_then(|o| o.get("continueOnFail"))
+                        .and_then(|v| v.as_bool())
+                })
+                .unwrap_or(false);
+
+            if continue_on_fail {
+                if let Some(res_obj) = res.as_object_mut() {
+                    let status = res_obj
+                        .get("statusCode")
+                        .and_then(|s| s.as_u64())
+                        .unwrap_or(200);
+                    if status >= 400 {
+                        res_obj.insert("continueOnFail".to_string(), json!(true));
+                    }
+                }
+            }
+
             (Arc::new(res), None)
         }
         _ => (input, None),
     }
 }
 
-fn execute_real_http_request(
+static SHARED_HTTP_RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+static SHARED_HTTP_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn get_shared_http_runtime() -> Option<&'static tokio::runtime::Runtime> {
+    if let Some(rt) = SHARED_HTTP_RUNTIME.get() {
+        return Some(rt);
+    }
+    if let Ok(rt) = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .thread_name("shared-http-rt")
+        .build()
+    {
+        let _ = SHARED_HTTP_RUNTIME.set(rt);
+    }
+    SHARED_HTTP_RUNTIME.get()
+}
+
+fn get_shared_http_client() -> Option<&'static reqwest::Client> {
+    if let Some(c) = SHARED_HTTP_CLIENT.get() {
+        return Some(c);
+    }
+    if let Ok(c) = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .pool_max_idle_per_host(32)
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .build()
+    {
+        let _ = SHARED_HTTP_CLIENT.set(c);
+    }
+    SHARED_HTTP_CLIENT.get()
+}
+
+pub fn execute_real_http_request(
     url: &str,
     method: &str,
     headers_val: Option<&Value>,
@@ -1118,114 +1175,114 @@ fn execute_real_http_request(
         });
     }
 
+    let rt = match get_shared_http_runtime() {
+        Some(r) => r,
+        None => {
+            return json!({
+                "statusCode": 500,
+                "url": url,
+                "method": method,
+                "error": "Failed to initialize shared HTTP runtime",
+                "data": Value::Null
+            });
+        }
+    };
+
+    let client = match get_shared_http_client() {
+        Some(c) => c,
+        None => {
+            return json!({
+                "statusCode": 500,
+                "url": url,
+                "method": method,
+                "error": "Failed to initialize shared HTTP client",
+                "data": Value::Null
+            });
+        }
+    };
+
     let url_owned = url.to_string();
     let method_owned = method.to_string();
     let headers_owned = headers_val.cloned();
     let body_owned = body_val.cloned();
 
-    let runner = move || {
-        let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
-            Ok(r) => r,
-            Err(e) => {
-                return json!({
-                    "statusCode": 500,
-                    "url": url_owned,
-                    "method": method_owned,
-                    "error": format!("Runtime init error: {e}"),
-                    "data": Value::Null
-                });
-            }
+    let async_work = async move {
+        let req_method = match method_owned.to_ascii_uppercase().as_str() {
+            "POST" => reqwest::Method::POST,
+            "PUT" => reqwest::Method::PUT,
+            "DELETE" => reqwest::Method::DELETE,
+            "PATCH" => reqwest::Method::PATCH,
+            "HEAD" => reqwest::Method::HEAD,
+            "OPTIONS" => reqwest::Method::OPTIONS,
+            _ => reqwest::Method::GET,
         };
 
-        rt.block_on(async move {
-            let client = match reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .build()
-            {
-                Ok(c) => c,
-                Err(e) => {
-                    return json!({
-                        "statusCode": 500,
-                        "url": url_owned,
-                        "method": method_owned,
-                        "error": format!("HTTP client initialization failed: {e}"),
-                        "data": Value::Null
-                    });
+        let mut req = client.request(req_method, &url_owned);
+
+        if let Some(h_obj) = headers_owned.as_ref().and_then(|h| h.as_object()) {
+            for (k, v) in h_obj {
+                if let Some(v_str) = v.as_str() {
+                    req = req.header(k.as_str(), v_str);
                 }
-            };
+            }
+        }
 
-            let req_method = match method_owned.to_ascii_uppercase().as_str() {
-                "POST" => reqwest::Method::POST,
-                "PUT" => reqwest::Method::PUT,
-                "DELETE" => reqwest::Method::DELETE,
-                "PATCH" => reqwest::Method::PATCH,
-                "HEAD" => reqwest::Method::HEAD,
-                "OPTIONS" => reqwest::Method::OPTIONS,
-                _ => reqwest::Method::GET,
-            };
+        if let Some(ref b) = body_owned {
+            if !b.is_null() && b != &json!({}) {
+                req = req.json(b);
+            }
+        }
 
-            let mut req = client.request(req_method, &url_owned);
-
-            if let Some(h_obj) = headers_owned.as_ref().and_then(|h| h.as_object()) {
-                for (k, v) in h_obj {
-                    if let Some(v_str) = v.as_str() {
-                        req = req.header(k.as_str(), v_str);
+        match req.send().await {
+            Ok(resp) => {
+                let status = resp.status().as_u16();
+                let mut resp_headers = serde_json::Map::new();
+                for (k, v) in resp.headers() {
+                    if let Ok(v_str) = v.to_str() {
+                        resp_headers.insert(k.as_str().to_string(), Value::String(v_str.to_string()));
                     }
                 }
+                let raw_text = resp.text().await.unwrap_or_default();
+                let body_val = match serde_json::from_str::<Value>(&raw_text) {
+                    Ok(json_val) => json_val,
+                    Err(_) => Value::String(raw_text),
+                };
+                json!({
+                    "statusCode": status,
+                    "url": url_owned,
+                    "method": method_owned,
+                    "headers": Value::Object(resp_headers),
+                    "data": body_val
+                })
             }
-
-            if let Some(ref b) = body_owned {
-                if !b.is_null() && b != &json!({}) {
-                    req = req.json(b);
-                }
+            Err(e) => {
+                json!({
+                    "statusCode": 502,
+                    "url": url_owned,
+                    "method": method_owned,
+                    "error": e.to_string(),
+                    "data": Value::Null
+                })
             }
-
-            match req.send().await {
-                Ok(resp) => {
-                    let status = resp.status().as_u16();
-                    let mut resp_headers = serde_json::Map::new();
-                    for (k, v) in resp.headers() {
-                        if let Ok(v_str) = v.to_str() {
-                            resp_headers.insert(k.as_str().to_string(), Value::String(v_str.to_string()));
-                        }
-                    }
-                    let body_json = match resp.json::<Value>().await {
-                        Ok(j) => j,
-                        Err(_) => Value::Null,
-                    };
-                    json!({
-                        "statusCode": status,
-                        "url": url_owned,
-                        "method": method_owned,
-                        "headers": Value::Object(resp_headers),
-                        "data": body_json
-                    })
-                }
-                Err(e) => {
-                    json!({
-                        "statusCode": 502,
-                        "url": url_owned,
-                        "method": method_owned,
-                        "error": e.to_string(),
-                        "data": Value::Null
-                    })
-                }
-            }
-        })
+        }
     };
 
     if tokio::runtime::Handle::try_current().is_ok() {
-        std::thread::spawn(runner).join().unwrap_or_else(|_| {
-            json!({
-                "statusCode": 500,
-                "url": url,
-                "method": method,
-                "error": "Thread execution panicked",
-                "data": Value::Null
-            })
+        std::thread::scope(|s| {
+            s.spawn(|| rt.block_on(async_work))
+                .join()
+                .unwrap_or_else(|_| {
+                    json!({
+                        "statusCode": 500,
+                        "url": url,
+                        "method": method,
+                        "error": "Thread execution panicked",
+                        "data": Value::Null
+                    })
+                })
         })
     } else {
-        runner()
+        rt.block_on(async_work)
     }
 }
 
