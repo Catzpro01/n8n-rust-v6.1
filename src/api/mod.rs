@@ -566,10 +566,10 @@ pub fn get_core_node_types_array() -> Value {
         {
             "name": "n8n-nodes-base.switch",
             "displayName": "Switch",
-            "icon": "fa:directions",
+            "icon": "fa:random",
             "group": ["transform"],
-            "version": 3.2,
-            "description": "Routes items across multiple rules",
+            "version": 1,
+            "description": "Route items to different output branches based on conditions",
             "defaults": { "name": "Switch" },
             "inputs": ["main"],
             "outputs": ["main", "main", "main", "main"],
@@ -692,6 +692,42 @@ pub fn get_core_node_types_array() -> Value {
             "description": "Triggers workflow when another workflow encounters an error",
             "defaults": { "name": "Error Trigger" },
             "inputs": [],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.sort",
+            "displayName": "Sort",
+            "icon": "fa:sort-amount-down",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Sort items by fields",
+            "defaults": { "name": "Sort" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.limit",
+            "displayName": "Limit",
+            "icon": "fa:compress-arrows-alt",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Limit the number of items passed through",
+            "defaults": { "name": "Limit" },
+            "inputs": ["main"],
+            "outputs": ["main"],
+            "properties": []
+        },
+        {
+            "name": "n8n-nodes-base.filter",
+            "displayName": "Filter",
+            "icon": "fa:filter",
+            "group": ["transform"],
+            "version": 1,
+            "description": "Filter items based on conditions",
+            "defaults": { "name": "Filter" },
+            "inputs": ["main"],
             "outputs": ["main"],
             "properties": []
         }
@@ -1902,7 +1938,14 @@ pub async fn run_workflow_direct(
     Json(payload): Json<Option<RunWorkflowPayload>>,
 ) -> impl IntoResponse {
     let payload = payload.unwrap_or_default();
-    let nodes = payload
+    let pin_data = payload.pin_data.clone().or_else(|| {
+        payload
+            .workflow_data
+            .as_ref()
+            .and_then(|w| w.get("pinData").cloned())
+    });
+
+    let mut nodes = payload
         .nodes
         .clone()
         .or_else(|| {
@@ -1912,6 +1955,30 @@ pub async fn run_workflow_direct(
                 .and_then(|w| w.get("nodes").cloned())
         })
         .unwrap_or_else(|| json!([]));
+
+    if let (Some(pin), Some(nodes_arr)) = (&pin_data, nodes.as_array_mut()) {
+        for n in nodes_arr {
+            let name = n.get("name").and_then(|v| v.as_str()).unwrap_or("");
+            if let Some(pin_val) = pin.get(name) {
+                let items: Vec<Value> = if let Some(arr) = pin_val.as_array() {
+                    arr.iter().map(|item| {
+                        if let Some(j) = item.get("json") {
+                            j.clone()
+                        } else {
+                            item.clone()
+                        }
+                    }).collect()
+                } else if let Some(j) = pin_val.get("json") {
+                    vec![j.clone()]
+                } else {
+                    vec![pin_val.clone()]
+                };
+                if let Some(params) = n.get_mut("parameters").and_then(|p| p.as_object_mut()) {
+                    params.entry("data".to_string()).or_insert_with(|| json!(items));
+                }
+            }
+        }
+    }
 
     let connections = payload
         .connections
@@ -1958,6 +2025,10 @@ pub async fn trigger_error_workflow_if_needed(
             })
         })?;
 
+    if failed_workflow_id == Some(error_workflow_id.as_str()) {
+        return None;
+    }
+
     let err_wf_data = crate::engine::get_subworkflow(&error_workflow_id)
         .map(|val| {
             let err_nodes = val.get("nodes").cloned().unwrap_or_else(|| json!([]));
@@ -1988,7 +2059,7 @@ pub async fn trigger_error_workflow_if_needed(
         "error": failed_final_output.get("error").cloned().unwrap_or_else(|| failed_final_output.clone())
     });
 
-    let err_exec_res = state
+    let exec_outcome = state
         .engine
         .execute(
             &err_execution_id,
@@ -1998,10 +2069,10 @@ pub async fn trigger_error_workflow_if_needed(
             Some(Arc::clone(notifier)),
             Some(err_cancel_token),
         )
-        .await
-        .ok()?;
+        .await;
 
     state.active_executions.remove(&err_execution_id);
+    let err_exec_res = exec_outcome.ok()?;
     let err_stopped_at = Utc::now().to_rfc3339();
 
     let write_msg = ExecutionWriteMessage {

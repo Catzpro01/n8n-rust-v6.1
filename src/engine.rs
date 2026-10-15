@@ -23,10 +23,6 @@ pub enum NodeKind {
     Webhook = 2,
     Set = 3,
     If = 4,
-    Switch = 5,
-    Filter = 6,
-    Limit = 7,
-    Sort = 8,
     Code = 9,
     Merge = 10,
     HttpRequest = 11,
@@ -39,6 +35,10 @@ pub enum NodeKind {
     Wait = 18,
     StopAndError = 19,
     ErrorTrigger = 20,
+    Switch = 21,
+    Sort = 22,
+    Limit = 23,
+    Filter = 24,
     Unknown = 255,
 }
 
@@ -51,9 +51,9 @@ impl NodeKind {
             "n8n-nodes-base.set" | "set" => NodeKind::Set,
             "n8n-nodes-base.if" | "if" => NodeKind::If,
             "n8n-nodes-base.switch" | "switch" => NodeKind::Switch,
-            "n8n-nodes-base.filter" | "filter" => NodeKind::Filter,
-            "n8n-nodes-base.limit" | "limit" => NodeKind::Limit,
             "n8n-nodes-base.sort" | "sort" => NodeKind::Sort,
+            "n8n-nodes-base.limit" | "limit" => NodeKind::Limit,
+            "n8n-nodes-base.filter" | "filter" => NodeKind::Filter,
             "n8n-nodes-base.code" | "code" => NodeKind::Code,
             "n8n-nodes-base.merge" | "merge" => NodeKind::Merge,
             "n8n-nodes-base.httpRequest" | "httpRequest" => NodeKind::HttpRequest,
@@ -972,6 +972,7 @@ fn check_op(left: &Value, right: &Value, op: &str) -> bool {
                 .unwrap_or_else(|| right.to_string());
             l_str.contains(&r_str)
         }
+        "exists" => !left.is_null(),
         "isEmpty" => match left {
             Value::Null => true,
             Value::String(s) => s.is_empty(),
@@ -1013,28 +1014,6 @@ fn is_set_idempotent(obj: &serde_json::Map<String, Value>, params: &Value) -> bo
     }
 }
 
-fn evaluate_switch_rule(
-    params: &Value,
-    item_json: &Value,
-    ctx: &ExprContext,
-    has_expressions: bool,
-) -> u16 {
-    if let Some(rules) = params
-        .get("rules")
-        .and_then(|r| r.get("rules"))
-        .and_then(|r| r.as_array())
-    {
-        for (idx, rule) in rules.iter().enumerate() {
-            if let Some(conditions) = rule.get("conditions") {
-                if evaluate_if_condition(conditions, item_json, ctx, has_expressions) {
-                    return idx as u16;
-                }
-            }
-        }
-    }
-    0
-}
-
 /// Node execution logic: executes transformations with zero-copy input & expression evaluation
 fn execute_node_logic(
     node: &ArenaNode,
@@ -1053,7 +1032,13 @@ fn execute_node_logic(
 
     match node.kind {
         NodeKind::ManualTrigger => {
-            let payload = if input.is_null() || input.as_object().is_some_and(|o| o.is_empty()) {
+            let payload = if let Some(d) = params_ref
+                .get("data")
+                .or_else(|| params_ref.get("input"))
+                .or_else(|| params_ref.get("values"))
+            {
+                Arc::new(d.clone())
+            } else if input.is_null() || input.as_object().is_some_and(|o| o.is_empty()) {
                 Arc::new(json!({
                     "timestamp": Utc::now().to_rfc3339(),
                     "triggeredBy": "manualTest"
@@ -1125,89 +1110,175 @@ fn execute_node_logic(
             (input, Some(port))
         }
         NodeKind::Switch => {
-            let port = evaluate_switch_rule(params_ref, &input, expr_ctx, node.has_expressions);
-            (input, Some(port))
-        }
-        NodeKind::Filter => {
-            let payload = if let Some(arr) = input.as_array() {
-                let mut filtered = Vec::new();
-                for item in arr {
-                    if evaluate_if_condition(params_ref, item, expr_ctx, node.has_expressions) {
-                        filtered.push(item.clone());
+            let rules_arr = params_ref
+                .get("rules")
+                .and_then(|r| {
+                    if r.is_array() {
+                        r.as_array()
+                    } else {
+                        r.get("rules").and_then(|sub| sub.as_array())
                     }
+                });
+            if let Some(rules) = rules_arr {
+                if !rules.is_empty() {
+                    let test_item = input.as_array().and_then(|a| a.first()).unwrap_or(&*input);
+                    for (i, rule) in rules.iter().enumerate() {
+                        let field = rule.get("field").and_then(|f| f.as_str()).unwrap_or("");
+                        let actual = if !field.is_empty() {
+                            test_item.get(field).unwrap_or(&Value::Null)
+                        } else {
+                            rule.get("value1").unwrap_or(&Value::Null)
+                        };
+                        let op = rule
+                            .get("operator")
+                            .or_else(|| rule.get("operation"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("equals");
+                        let expected = rule
+                            .get("value")
+                            .or_else(|| rule.get("value2"))
+                            .unwrap_or(&Value::Null);
+                        if check_op(actual, expected, op) {
+                            let target_port = rule
+                                .get("outputPort")
+                                .or_else(|| rule.get("output"))
+                                .and_then(|v| v.as_u64())
+                                .map(|p| p as u16)
+                                .unwrap_or(i as u16);
+                            return (input, Some(target_port));
+                        }
+                    }
+                    let fallback = params_ref
+                        .get("fallbackOutput")
+                        .and_then(|v| v.as_u64())
+                        .map(|p| p as u16);
+                    return (input, fallback);
                 }
-                Arc::new(Value::Array(filtered))
-            } else if evaluate_if_condition(params_ref, &input, expr_ctx, node.has_expressions) {
-                input
+            }
+            (input, None)
+        }
+        NodeKind::Sort => {
+            let sort_field = params_ref
+                .get("sortField")
+                .or_else(|| params_ref.get("fieldName"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("id");
+            let is_desc = params_ref
+                .get("order")
+                .and_then(|v| v.as_str())
+                .map(|s| s.eq_ignore_ascii_case("desc") || s.eq_ignore_ascii_case("descending"))
+                .unwrap_or_else(|| {
+                    params_ref
+                        .get("descending")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                });
+
+            if let Some(arr) = input.as_array() {
+                let mut sorted = arr.clone();
+                sorted.sort_by(|a, b| {
+                    let v_a = a.get(sort_field).unwrap_or(&Value::Null);
+                    let v_b = b.get(sort_field).unwrap_or(&Value::Null);
+                    let ord = match (v_a, v_b) {
+                        (Value::Number(n1), Value::Number(n2)) => {
+                            let f1 = n1.as_f64().unwrap_or(0.0);
+                            let f2 = n2.as_f64().unwrap_or(0.0);
+                            f1.total_cmp(&f2)
+                        }
+                        (Value::String(s1), Value::String(s2)) => {
+                            if let (Ok(f1), Ok(f2)) =
+                                (s1.trim().parse::<f64>(), s2.trim().parse::<f64>())
+                            {
+                                f1.total_cmp(&f2)
+                            } else {
+                                s1.cmp(s2)
+                            }
+                        }
+                        _ => v_a.to_string().cmp(&v_b.to_string()),
+                    };
+                    if is_desc {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                });
+                (Arc::new(Value::Array(sorted)), None)
             } else {
-                Arc::new(Value::Array(vec![]))
-            };
-            (payload, None)
+                (input, None)
+            }
         }
         NodeKind::Limit => {
             let max_items = params_ref
                 .get("maxItems")
                 .and_then(|v| v.as_u64())
-                .unwrap_or(10) as usize;
-            let payload = if let Some(arr) = input.as_array() {
-                let limited: Vec<Value> = arr.iter().take(max_items).cloned().collect();
-                Arc::new(Value::Array(limited))
+                .unwrap_or(1)
+                .max(1) as usize;
+            let keep = params_ref
+                .get("keep")
+                .and_then(|v| v.as_str())
+                .unwrap_or("firstItems");
+
+            if let Some(arr) = input.as_array() {
+                if arr.len() > max_items {
+                    let slice = if keep == "lastItems" {
+                        let start = arr.len().saturating_sub(max_items);
+                        arr[start..].to_vec()
+                    } else {
+                        arr[..max_items].to_vec()
+                    };
+                    (Arc::new(Value::Array(slice)), None)
+                } else {
+                    (input, None)
+                }
             } else {
-                input
-            };
-            (payload, None)
+                (input, None)
+            }
         }
-        NodeKind::Sort => {
-            let field_name = params_ref
-                .get("fieldName")
+        NodeKind::Filter => {
+            let field = params_ref
+                .get("field")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let descending = params_ref
-                .get("descending")
-                .and_then(|v| v.as_bool())
-                .or_else(|| {
-                    params_ref
-                        .get("order")
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.eq_ignore_ascii_case("desc") || s.eq_ignore_ascii_case("descending"))
-                })
-                .unwrap_or(false);
+            let op = params_ref
+                .get("operator")
+                .or_else(|| params_ref.get("operation"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("equals");
+            let expected = params_ref
+                .get("value")
+                .or_else(|| params_ref.get("value2"))
+                .unwrap_or(&Value::Null);
 
-            let payload = if let Some(arr) = input.as_array() {
-                let mut sorted = arr.clone();
-                if !field_name.is_empty() {
-                    sorted.sort_by(|a, b| {
-                        let v_a = a.get(field_name).unwrap_or(&Value::Null);
-                        let v_b = b.get(field_name).unwrap_or(&Value::Null);
-                        let ord = match (v_a, v_b) {
-                            (Value::Number(n1), Value::Number(n2)) => {
-                                let f1 = n1.as_f64().unwrap_or(0.0);
-                                let f2 = n2.as_f64().unwrap_or(0.0);
-                                f1.total_cmp(&f2)
-                            }
-                            (Value::String(s1), Value::String(s2)) => {
-                                if let (Ok(f1), Ok(f2)) =
-                                    (s1.trim().parse::<f64>(), s2.trim().parse::<f64>())
-                                {
-                                    f1.total_cmp(&f2)
-                                } else {
-                                    s1.cmp(s2)
-                                }
-                            }
-                            _ => v_a.to_string().cmp(&v_b.to_string()),
-                        };
-                        if descending {
-                            ord.reverse()
+            if let Some(arr) = input.as_array() {
+                let filtered: Vec<Value> = arr
+                    .iter()
+                    .filter(|item| {
+                        if op == "exists" {
+                            item.get(field).is_some_and(|v| !v.is_null())
                         } else {
-                            ord
+                            let actual = if !field.is_empty() {
+                                item.get(field).unwrap_or(&Value::Null)
+                            } else {
+                                item
+                            };
+                            check_op(actual, expected, op)
                         }
-                    });
-                }
-                Arc::new(Value::Array(sorted))
+                    })
+                    .cloned()
+                    .collect();
+                (Arc::new(Value::Array(filtered)), None)
             } else {
-                input
-            };
-            (payload, None)
+                let actual = if !field.is_empty() {
+                    input.get(field).unwrap_or(&Value::Null)
+                } else {
+                    &*input
+                };
+                if check_op(actual, expected, op) {
+                    (input, None)
+                } else {
+                    (Arc::new(Value::Array(vec![])), None)
+                }
+            }
         }
         NodeKind::Code => {
             if let Some(obj) = input.as_object() {
