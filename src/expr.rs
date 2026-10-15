@@ -139,6 +139,24 @@ pub fn evaluate_raw_expression(expr: &str, item_json: &Value, ctx: &ExprContext)
         return Value::Null;
     }
 
+    // 0. Logical Boolean Operators (||, &&)
+    if let Some((left, right)) = split_by_operator(expr, "||") {
+        let l_bool = value_to_bool(&evaluate_raw_expression(left, item_json, ctx));
+        if l_bool {
+            return Value::Bool(true);
+        }
+        let r_bool = value_to_bool(&evaluate_raw_expression(right, item_json, ctx));
+        return Value::Bool(r_bool);
+    }
+    if let Some((left, right)) = split_by_operator(expr, "&&") {
+        let l_bool = value_to_bool(&evaluate_raw_expression(left, item_json, ctx));
+        if !l_bool {
+            return Value::Bool(false);
+        }
+        let r_bool = value_to_bool(&evaluate_raw_expression(right, item_json, ctx));
+        return Value::Bool(r_bool);
+    }
+
     // 1. Comparison Operators (==, !=, >=, <=, >, <)
     for op in ["==", "!=", ">=", "<=", ">", "<"] {
         if let Some((left, right)) = split_by_operator(expr, op) {
@@ -566,6 +584,15 @@ fn value_to_string(val: &Value) -> String {
     }
 }
 
+fn value_to_bool(val: &Value) -> bool {
+    match val {
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().unwrap_or(0.0) != 0.0,
+        Value::String(s) => !s.is_empty() && s != "false",
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,5 +637,24 @@ mod tests {
 
         let res_gt = resolve_expression_string("={{ $json.count > 5 }}", &item, &ctx);
         assert_eq!(res_gt, json!(true));
+
+        // Logical boolean operators tests
+        let res_and = resolve_expression_string(
+            "={{ $json.count > 5 && $json.status == \"active\" }}",
+            &item,
+            &ctx,
+        );
+        if res_and != json!(true) {
+            panic!("FAIL_AND: res_and was {:?}", res_and);
+        }
+
+        let res_or = resolve_expression_string(
+            "={{ $json.count < 5 || $json.status == \"active\" }}",
+            &item,
+            &ctx,
+        );
+        if res_or != json!(true) {
+            panic!("FAIL_OR: res_or was {:?}", res_or);
+        }
     }
 }
