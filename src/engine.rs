@@ -124,7 +124,19 @@ impl CompiledGraph {
                 .and_then(|v| v.as_str())
                 .unwrap_or("n8n-nodes-base.manualTrigger")
                 .to_string();
-            let parameters = n.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            let mut parameters = n.get("parameters").cloned().unwrap_or_else(|| json!({}));
+            if let Some(cof) = n.get("continueOnFail").and_then(|v| v.as_bool()) {
+                if let Some(obj) = parameters.as_object_mut() {
+                    obj.entry("continueOnFail".to_string()).or_insert(json!(cof));
+                }
+            }
+            if let Some(oe) = n.get("onError").and_then(|v| v.as_str()) {
+                if oe == "continueRegularOutput" || oe == "continueErrorOutput" {
+                    if let Some(obj) = parameters.as_object_mut() {
+                        obj.entry("continueOnFail".to_string()).or_insert(json!(true));
+                    }
+                }
+            }
             let has_expressions = crate::expr::has_potential_expression(&parameters);
 
             node_index.insert(name.clone(), idx as u32);
