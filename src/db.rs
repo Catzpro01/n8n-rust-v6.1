@@ -235,6 +235,8 @@ impl StorageEngine {
             "#,
         )?;
 
+        seed_default_workflows(&conn)?;
+
         let conn_arc = Arc::new(Mutex::new(conn));
         let (tx, mut rx) = mpsc::unbounded_channel::<DbWriteMessage>();
 
@@ -1149,5 +1151,296 @@ pub fn decrypt_credential_data(raw: &str) -> Result<Value> {
         let val: Value = serde_json::from_str(raw)?;
         Ok(val)
     }
+}
+
+pub fn get_hyperscale_1m_canvas_nodes() -> Value {
+    serde_json::json!([
+        {
+            "id": "node-1-manual-trigger",
+            "name": "When clicking ‘Execute workflow’",
+            "type": "n8n-nodes-base.manualTrigger",
+            "typeVersion": 1,
+            "position": [0, 300],
+            "parameters": {}
+        },
+        {
+            "id": "node-2-set",
+            "name": "HyperScale Set",
+            "type": "n8n-nodes-base.set",
+            "typeVersion": 2,
+            "position": [240, 300],
+            "parameters": {
+                "mode": "manual",
+                "duplicateItem": false,
+                "assignments": {
+                    "assignments": [
+                        { "id": "as-1", "name": "benchmark", "value": "1_000_000_nodes", "type": "string" },
+                        { "id": "as-2", "name": "verified", "value": true, "type": "boolean" },
+                        { "id": "as-3", "name": "status", "value": "HYPERSCALE_ARENA_ACTIVE", "type": "string" }
+                    ]
+                },
+                "options": {}
+            }
+        },
+        {
+            "id": "node-3-if",
+            "name": "HyperScale If",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.3,
+            "position": [480, 300],
+            "parameters": {
+                "conditions": {
+                    "combinator": "and",
+                    "conditions": [
+                        {
+                            "id": "c-1",
+                            "leftValue": "={{ $json.verified }}",
+                            "rightValue": true,
+                            "operator": { "name": "filter.operator.equals", "operation": "equals", "type": "boolean" }
+                        }
+                    ],
+                    "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 }
+                },
+                "options": {}
+            }
+        },
+        {
+            "id": "node-4-filter",
+            "name": "HyperScale Filter",
+            "type": "n8n-nodes-base.filter",
+            "typeVersion": 2.2,
+            "position": [720, 300],
+            "parameters": {
+                "conditions": {
+                    "combinator": "and",
+                    "conditions": [
+                        {
+                            "id": "f-1",
+                            "leftValue": "={{ $json.verified }}",
+                            "rightValue": true,
+                            "operator": { "name": "filter.operator.equals", "operation": "equals", "type": "boolean" }
+                        }
+                    ],
+                    "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 }
+                },
+                "options": {}
+            }
+        },
+        {
+            "id": "node-5-switch",
+            "name": "HyperScale Switch",
+            "type": "n8n-nodes-base.switch",
+            "typeVersion": 3.2,
+            "position": [960, 300],
+            "parameters": {
+                "rules": {
+                    "values": [
+                        {
+                            "output": 0,
+                            "rules": {
+                                "combinator": "and",
+                                "conditions": [
+                                    {
+                                        "leftValue": "={{ $json.verified }}",
+                                        "rightValue": true,
+                                        "operator": { "name": "filter.operator.equals", "operation": "equals", "type": "boolean" }
+                                    }
+                                ]
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        {
+            "id": "node-6-sort",
+            "name": "HyperScale Sort",
+            "type": "n8n-nodes-base.sort",
+            "typeVersion": 1,
+            "position": [1200, 300],
+            "parameters": {
+                "sortFieldsUi": {
+                    "sortField": [
+                        { "fieldName": "benchmark", "order": "ascending" }
+                    ]
+                }
+            }
+        },
+        {
+            "id": "node-7-limit",
+            "name": "HyperScale Limit",
+            "type": "n8n-nodes-base.limit",
+            "typeVersion": 1,
+            "position": [1440, 300],
+            "parameters": {
+                "maxItems": 10,
+                "keep": "firstItems"
+            }
+        },
+        {
+            "id": "node-8-code",
+            "name": "Polyglot Code",
+            "type": "n8n-nodes-base.code",
+            "typeVersion": 2,
+            "position": [1680, 300],
+            "parameters": {
+                "language": "javaScript",
+                "runtimeVersion": "auto",
+                "mode": "runOnceForAllItems",
+                "jsCode": "// Polyglot Engine 1M Arena Verifier\nfor (const item of $input.all()) {\n  item.json.polyglotCodeExecuted = true;\n  item.json.arenaTier = 'Tier-1 Native AST';\n}\nreturn $input.all();"
+            }
+        },
+        {
+            "id": "node-9-aggregate",
+            "name": "HyperScale Aggregate",
+            "type": "n8n-nodes-base.aggregate",
+            "typeVersion": 1,
+            "position": [1920, 300],
+            "parameters": {
+                "aggregate": "aggregateAllItemData",
+                "destinationFieldName": "aggregatedItems"
+            }
+        },
+        {
+            "id": "node-10-split-out",
+            "name": "HyperScale SplitOut",
+            "type": "n8n-nodes-base.splitOut",
+            "typeVersion": 1,
+            "position": [2160, 300],
+            "parameters": {
+                "fieldToSplitOut": "aggregatedItems"
+            }
+        },
+        {
+            "id": "node-11-dedup",
+            "name": "HyperScale Dedup",
+            "type": "n8n-nodes-base.removeDuplicates",
+            "typeVersion": 1.1,
+            "position": [2400, 300],
+            "parameters": {
+                "compare": "selectedFields",
+                "fieldsToCompare": {
+                    "fields": [{ "fieldName": "benchmark" }]
+                }
+            }
+        },
+        {
+            "id": "node-12-batch",
+            "name": "HyperScale BatchFinalizer",
+            "type": "n8n-nodes-base.splitInBatches",
+            "typeVersion": 3,
+            "position": [2640, 300],
+            "parameters": {
+                "batchSize": 10,
+                "options": {}
+            }
+        }
+    ])
+}
+
+pub fn get_hyperscale_1m_canvas_connections() -> Value {
+    serde_json::json!({
+        "When clicking ‘Execute workflow’": {
+            "main": [[{ "node": "HyperScale Set", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Set": {
+            "main": [[{ "node": "HyperScale If", "type": "main", "index": 0 }]]
+        },
+        "HyperScale If": {
+            "main": [
+                [{ "node": "HyperScale Filter", "type": "main", "index": 0 }],
+                []
+            ]
+        },
+        "HyperScale Filter": {
+            "main": [[{ "node": "HyperScale Switch", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Switch": {
+            "main": [[{ "node": "HyperScale Sort", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Sort": {
+            "main": [[{ "node": "HyperScale Limit", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Limit": {
+            "main": [[{ "node": "Polyglot Code", "type": "main", "index": 0 }]]
+        },
+        "Polyglot Code": {
+            "main": [[{ "node": "HyperScale Aggregate", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Aggregate": {
+            "main": [[{ "node": "HyperScale SplitOut", "type": "main", "index": 0 }]]
+        },
+        "HyperScale SplitOut": {
+            "main": [[{ "node": "HyperScale Dedup", "type": "main", "index": 0 }]]
+        },
+        "HyperScale Dedup": {
+            "main": [[{ "node": "HyperScale BatchFinalizer", "type": "main", "index": 0 }]]
+        }
+    })
+}
+
+fn seed_default_workflows(conn: &Connection) -> Result<()> {
+    let mut check_stmt = conn.prepare("SELECT COUNT(*) FROM workflows WHERE id = ?1")?;
+    let count: i64 = check_stmt.query_row(params!["wf-hyperscale-1m-benchmark"], |r| r.get(0))?;
+    let nodes = get_hyperscale_1m_canvas_nodes();
+    let connections = get_hyperscale_1m_canvas_connections();
+    let settings = serde_json::json!({
+        "executionOrder": "v1",
+        "binaryMode": "separate",
+        "hyperScaleArena": {
+            "enabled": true,
+            "totalNodes": 1000000,
+            "chains": 1000,
+            "nodesPerChain": 1000
+        }
+    });
+    let now = Utc::now().to_rfc3339();
+
+    if count == 0 {
+        conn.execute(
+            "INSERT INTO workflows (
+                id, name, active, is_archived, nodes, connections, settings,
+                static_data, pin_data, meta, version_id, trigger_count, tags,
+                parent_folder_id, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                "wf-hyperscale-1m-benchmark",
+                "⚡ HyperScale 1,000,000 Nodes Arena Benchmark",
+                0,
+                0,
+                serde_json::to_string(&nodes)?,
+                serde_json::to_string(&connections)?,
+                serde_json::to_string(&settings)?,
+                "{}",
+                "{}",
+                "{}",
+                "v6-hyperscale-arena-1m",
+                0,
+                "[]",
+                Option::<String>::None,
+                now,
+                now,
+            ],
+        )?;
+    } else {
+        // Keep definition up to date with 12 nodes and settings
+        conn.execute(
+            "UPDATE workflows SET
+                name = ?1,
+                nodes = ?2,
+                connections = ?3,
+                settings = ?4,
+                updated_at = ?5
+            WHERE id = 'wf-hyperscale-1m-benchmark'",
+            params![
+                "⚡ HyperScale 1,000,000 Nodes Arena Benchmark",
+                serde_json::to_string(&nodes)?,
+                serde_json::to_string(&connections)?,
+                serde_json::to_string(&settings)?,
+                now,
+            ],
+        )?;
+    }
+    Ok(())
 }
 

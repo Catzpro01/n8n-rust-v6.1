@@ -403,6 +403,69 @@ impl HyperScaleEngine {
         })
     }
 
+    /// Fast programmatic builder for testing hyper-scale topologies (e.g. 1,000,000 nodes across 1,000 chains)
+    pub fn build_million_node_arena_graph(total_nodes: usize, chains_count: usize) -> CompiledGraph {
+        let nodes_per_chain = total_nodes / chains_count;
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut edges = vec![Vec::new(); total_nodes];
+
+        let static_set_params = serde_json::json!({ "step": "processed", "verified": true });
+        let static_if_params = serde_json::json!({ "value1": 10, "value2": 5, "operation": "largerEqual" });
+        let static_filter_params = serde_json::json!({ "field": "verified", "operator": "equals", "value": true });
+        let static_switch_params = serde_json::json!({ "rules": [{ "field": "step", "operator": "equals", "value": "processed", "outputPort": 0 }] });
+        let static_sort_params = serde_json::json!({ "sortField": "step", "order": "asc" });
+        let static_limit_params = serde_json::json!({ "maxItems": 10, "keep": "firstItems" });
+        let static_aggregate_params = serde_json::json!({ "destinationFieldName": "items" });
+        let static_split_out_params = serde_json::json!({ "fieldToSplitOut": "items" });
+        let static_remove_dup_params = serde_json::json!({ "compareField": "step" });
+        let static_split_batch_params = serde_json::json!({ "batchSize": 10, "batchIndex": 0 });
+        let static_code_params = serde_json::json!({
+            "language": "javaScript",
+            "runtimeVersion": "auto",
+            "mode": "runOnceForAllItems"
+        });
+
+        for c in 0..chains_count {
+            let base = c * nodes_per_chain;
+            for s in 0..nodes_per_chain {
+                let idx = base + s;
+                let (node_type, params) = if s == 0 {
+                    ("n8n-nodes-base.manualTrigger", serde_json::json!({}))
+                } else {
+                    match (s - 1) % 11 {
+                        0 => ("n8n-nodes-base.set", static_set_params.clone()),
+                        1 => ("n8n-nodes-base.if", static_if_params.clone()),
+                        2 => ("n8n-nodes-base.filter", static_filter_params.clone()),
+                        3 => ("n8n-nodes-base.switch", static_switch_params.clone()),
+                        4 => ("n8n-nodes-base.sort", static_sort_params.clone()),
+                        5 => ("n8n-nodes-base.limit", static_limit_params.clone()),
+                        6 => ("n8n-nodes-base.code", static_code_params.clone()),
+                        7 => ("n8n-nodes-base.aggregate", static_aggregate_params.clone()),
+                        8 => ("n8n-nodes-base.splitOut", static_split_out_params.clone()),
+                        9 => ("n8n-nodes-base.removeDuplicates", static_remove_dup_params.clone()),
+                        10 => ("n8n-nodes-base.splitInBatches", static_split_batch_params.clone()),
+                        _ => ("n8n-nodes-base.set", static_set_params.clone()),
+                    }
+                };
+
+                nodes.push(ArenaNode {
+                    id: format!("n_{idx}"),
+                    name: format!("Node_{idx}"),
+                    node_type: node_type.to_string(),
+                    parameters: params,
+                    has_expressions: false,
+                    kind: NodeKind::from_type_str(node_type),
+                });
+
+                if s + 1 < nodes_per_chain {
+                    edges[idx].push((idx + 1) as u32);
+                }
+            }
+        }
+
+        CompiledGraph::programmatic(nodes, edges)
+    }
+
     /// Execute a compiled DAG with zero-copy Arc payload passing and Rayon work-stealing wave scheduling
     pub async fn execute(
         &self,
@@ -1495,18 +1558,14 @@ fn execute_node_logic(
                 .unwrap_or("javascript");
             let language = crate::runtime::normalize_language(raw_lang);
 
-            let default_version = match language {
-                "python" => "3.11-sandbox",
-                "wasm" => "wasm32-wasmer-4.0",
-                "rust" => "rust-script-nightly",
-                _ => "es2022-quickjs",
-            };
-
-            let version = params_ref
+            let raw_ver = params_ref
                 .get("runtimeVersion")
                 .or_else(|| params_ref.get("languageVersion"))
                 .and_then(|v| v.as_str())
-                .unwrap_or(default_version);
+                .unwrap_or("auto");
+
+            let (_eff_lang, eff_ver) = crate::runtime::resolve_runtime_version(language, raw_ver);
+            let version = eff_ver.as_str();
 
             let code_val = match language {
                 "python" => params_ref

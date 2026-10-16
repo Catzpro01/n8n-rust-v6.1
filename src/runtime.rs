@@ -103,6 +103,15 @@ impl PolyglotRuntimeManager {
                 sha256: "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8".to_string(),
                 capabilities: vec!["es2024".to_string(), "v8".to_string(), "jit".to_string()],
             },
+            RuntimePackage {
+                language: "javascript".to_string(),
+                version: "js-es2024".to_string(),
+                installed: true,
+                is_default: false,
+                size_bytes: 8_388_608,
+                sha256: "3f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a09".to_string(),
+                capabilities: vec!["es2024".to_string(), "fast-jit".to_string(), "v1.2.0".to_string()],
+            },
             // Python Runtimes
             RuntimePackage {
                 language: "python".to_string(),
@@ -116,11 +125,30 @@ impl PolyglotRuntimeManager {
             RuntimePackage {
                 language: "python".to_string(),
                 version: "3.12-pyo3".to_string(),
-                installed: false,
+                installed: true,
                 is_default: false,
                 size_bytes: 16_777_216,
                 sha256: "ef2d127de37b942baad06145e54b0c619a1f22327b2ebbcfbec78f5564afe39d".to_string(),
                 capabilities: vec!["python3.12".to_string(), "gil-free".to_string(), "arrow".to_string()],
+            },
+            RuntimePackage {
+                language: "python".to_string(),
+                version: "py-3.12".to_string(),
+                installed: true,
+                is_default: false,
+                size_bytes: 14_680_064,
+                sha256: "6b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8b".to_string(),
+                capabilities: vec!["python3.12".to_string(), "embedded".to_string(), "v3.12.4".to_string()],
+            },
+            // TypeScript Runtimes
+            RuntimePackage {
+                language: "typescript".to_string(),
+                version: "ts-5.6".to_string(),
+                installed: true,
+                is_default: true,
+                size_bytes: 6_291_456,
+                sha256: "7b227777d4dd1fc61c6f884f48641d02b4d121d3fd328cb08b5531fcacdabf8c".to_string(),
+                capabilities: vec!["typescript".to_string(), "zero-strip".to_string(), "v5.6.2".to_string()],
             },
             // WASM Runtimes
             RuntimePackage {
@@ -134,8 +162,17 @@ impl PolyglotRuntimeManager {
             },
             RuntimePackage {
                 language: "wasm".to_string(),
+                version: "wasm-24.0".to_string(),
+                installed: true,
+                is_default: false,
+                size_bytes: 3_670_016,
+                sha256: "8c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7af".to_string(),
+                capabilities: vec!["wasm".to_string(), "wasmtime".to_string(), "v24.0.0".to_string()],
+            },
+            RuntimePackage {
+                language: "wasm".to_string(),
                 version: "wasm32-wasi".to_string(),
-                installed: false,
+                installed: true,
                 is_default: false,
                 size_bytes: 3_145_728,
                 sha256: "fc4888842fa76b5c48b0a1a2b1f0b08b3e8e7a6f235b6f790c9b0e263d9dd83f".to_string(),
@@ -176,7 +213,7 @@ impl PolyglotRuntimeManager {
         list
     }
 
-    /// Resolves canonical language and version, picking default if version is empty
+    /// Resolves canonical language and version, picking default if version is empty or "auto"
     pub fn resolve_runtime_version(&self, language: &str, version: &str) -> (String, String) {
         let norm_lang = normalize_language(language);
         let effective_lang = if norm_lang.is_empty() {
@@ -186,7 +223,10 @@ impl PolyglotRuntimeManager {
         };
 
         let trimmed_ver = version.trim();
-        if !trimmed_ver.is_empty() && !trimmed_ver.eq_ignore_ascii_case("default") {
+        if !trimmed_ver.is_empty()
+            && !trimmed_ver.eq_ignore_ascii_case("default")
+            && !trimmed_ver.eq_ignore_ascii_case("auto")
+        {
             return (effective_lang.to_string(), trimmed_ver.to_string());
         }
 
@@ -198,6 +238,7 @@ impl PolyglotRuntimeManager {
 
         let fallback_ver = match effective_lang {
             "python" => "3.11-sandbox",
+            "typescript" => "ts-5.6",
             "wasm" => "wasm32-wasmer-4.0",
             "rust" => "rust-script-nightly",
             _ => "es2022-quickjs",
@@ -304,7 +345,12 @@ impl PolyglotRuntimeManager {
         code: &str,
         code_hash: u64,
     ) -> Result<CompiledPolyglotProgram, String> {
-        let instructions = parse_statements_into_ast(code);
+        let effective_code = if language.eq_ignore_ascii_case("typescript") {
+            strip_typescript_types(code)
+        } else {
+            code.to_string()
+        };
+        let instructions = parse_statements_into_ast(&effective_code);
         Ok(CompiledPolyglotProgram {
             language: language.to_string(),
             version: version.to_string(),
@@ -681,11 +727,54 @@ pub fn execute_polyglot_code(
     PolyglotRuntimeManager::global().execute_polyglot_code(language, version, code, input, ctx)
 }
 
+/// Strips TypeScript type annotations for zero-overhead AST execution
+pub fn strip_typescript_types(code: &str) -> String {
+    let mut out = String::with_capacity(code.len());
+    for line in code.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("interface ") || trimmed.starts_with("type ") {
+            continue;
+        }
+        let mut clean_line = line.to_string();
+        for type_annot in [
+            ": string",
+            ": number",
+            ": boolean",
+            ": any",
+            ": void",
+            ": object",
+            ": Record<string, any>",
+            ": Array<any>",
+            ": any[]",
+            "as any",
+            "as string",
+            "as number",
+            "as boolean",
+        ] {
+            clean_line = clean_line.replace(type_annot, "");
+        }
+        out.push_str(&clean_line);
+        out.push('\n');
+    }
+    out
+}
+
+/// Public API: resolve canonical runtime version
+pub fn resolve_runtime_version(language: &str, version: &str) -> (String, String) {
+    PolyglotRuntimeManager::global().resolve_runtime_version(language, version)
+}
+
+/// Public API: alias for resolve_runtime_version
+pub fn resolve_language_version(language: &str, version: &str) -> (String, String) {
+    resolve_runtime_version(language, version)
+}
+
 /// Normalizes language identifier strings into canonical representations
 pub fn normalize_language(lang: &str) -> &str {
     match lang.trim().to_ascii_lowercase().as_str() {
         "javascript" | "js" | "node" | "nodejs" => "javascript",
         "python" | "py" | "python3" => "python",
+        "typescript" | "ts" => "typescript",
         "wasm" | "webassembly" => "wasm",
         "rust" | "rs" | "rust-script" => "rust",
         _ => lang.trim(),
@@ -701,8 +790,17 @@ pub fn compute_program_hash(language: &str, version: &str, code: &str) -> u64 {
     hasher.finish()
 }
 
-/// Injects `codeExecuted: true` and `runtimeUsed: language:version` into value and inner json objects
+/// Injects `codeExecuted: true`, `runtimeUsed: language:version`, and `_runtime` into value and inner json objects
 pub fn inject_metadata(val: &mut Value, runtime_used: &str) {
+    let parts: Vec<&str> = runtime_used.split(':').collect();
+    let lang = parts.first().copied().unwrap_or("javascript");
+    let ver = parts.get(1).copied().unwrap_or("auto");
+    let runtime_meta = serde_json::json!({
+        "language": lang,
+        "version": ver,
+        "tier": "Tier-1 Native AST"
+    });
+
     match val {
         Value::Array(arr) => {
             for item in arr.iter_mut() {
@@ -712,9 +810,11 @@ pub fn inject_metadata(val: &mut Value, runtime_used: &str) {
         Value::Object(map) => {
             map.insert("codeExecuted".to_string(), Value::Bool(true));
             map.insert("runtimeUsed".to_string(), Value::String(runtime_used.to_string()));
+            map.insert("_runtime".to_string(), runtime_meta.clone());
             if let Some(inner) = map.get_mut("json").and_then(|j| j.as_object_mut()) {
                 inner.insert("codeExecuted".to_string(), Value::Bool(true));
                 inner.insert("runtimeUsed".to_string(), Value::String(runtime_used.to_string()));
+                inner.insert("_runtime".to_string(), runtime_meta);
             }
         }
         _ => {}

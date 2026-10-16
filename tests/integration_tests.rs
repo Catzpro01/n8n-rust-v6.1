@@ -5516,3 +5516,208 @@ async fn test_polyglot_code_node_and_dynamic_runtime_manager() {
     .await
     .expect("Test 26 timed out!");
 }
+
+// ---------------------------------------------------------------------------
+// 27. v6.0 HyperScale 1,000,000 Nodes UI Workflow & Polyglot Code Schema Test
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_27_v6_hyperscale_1m_ui_workflow_and_polyglot_code_schema() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Verify pre-seeded workflow "wf-hyperscale-1m-benchmark" exists with 12 canvas nodes
+        let res_wf = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_wf.status(), StatusCode::OK, "Pre-seeded 1M benchmark workflow must exist");
+        let bytes_wf = res_wf.into_body().collect().await.unwrap().to_bytes();
+        let body_wf: serde_json::Value = serde_json::from_slice(&bytes_wf).unwrap();
+        assert_eq!(body_wf["data"]["id"], "wf-hyperscale-1m-benchmark");
+        assert_eq!(
+            body_wf["data"]["name"],
+            "⚡ HyperScale 1,000,000 Nodes Arena Benchmark"
+        );
+        let canvas_nodes = body_wf["data"]["nodes"].as_array().expect("Workflow nodes must be array");
+        assert_eq!(canvas_nodes.len(), 12, "Must contain exactly 12 representative canvas nodes");
+        assert_eq!(
+            body_wf["data"]["settings"]["hyperScaleArena"]["enabled"],
+            true,
+            "hyperScaleArena must be enabled"
+        );
+        assert_eq!(
+            body_wf["data"]["settings"]["hyperScaleArena"]["totalNodes"],
+            1_000_000
+        );
+
+        // 2. Execute the 1,000,000 nodes workflow via REST run endpoint
+        let res_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run.status(), StatusCode::OK, "Run workflow must return 200 OK");
+        let bytes_run = res_run.into_body().collect().await.unwrap().to_bytes();
+        let body_run: serde_json::Value = serde_json::from_slice(&bytes_run).unwrap();
+
+        assert_eq!(body_run["data"]["status"], "success");
+        assert_eq!(body_run["data"]["executedNodes"], 1_000_000);
+        let exec_id = body_run["data"]["executionId"]
+            .as_str()
+            .expect("Must return executionId")
+            .to_string();
+
+        // 3. Flush write-behind SQLite buffer to guarantee persistence
+        db.flush_executions()
+            .await
+            .expect("Flush executions must succeed");
+
+        // 4. Verify GET /rest/executions contains the execution
+        let res_list_exec = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/executions")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_list_exec.status(), StatusCode::OK);
+        let bytes_lexec = res_list_exec.into_body().collect().await.unwrap().to_bytes();
+        let body_lexec: serde_json::Value = serde_json::from_slice(&bytes_lexec).unwrap();
+        let results = body_lexec["data"]["results"].as_array().expect("Results must be array");
+        let found_exec = results.iter().find(|r| r["id"] == exec_id).expect("Execution must be listed");
+        assert_eq!(found_exec["status"], "success");
+        assert_eq!(found_exec["workflowId"], "wf-hyperscale-1m-benchmark");
+
+        // 5. Verify GET /rest/executions/{id} with flatted runData for the 12 canvas nodes
+        let res_detail = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/rest/executions/{exec_id}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_detail.status(), StatusCode::OK);
+        let bytes_detail = res_detail.into_body().collect().await.unwrap().to_bytes();
+        let body_detail: serde_json::Value = serde_json::from_slice(&bytes_detail).unwrap();
+        assert_eq!(body_detail["data"]["id"], exec_id);
+        assert_eq!(body_detail["data"]["status"], "success");
+
+        let flatted_str = body_detail["data"]["data"].as_str().expect("data must be flatted string");
+        let unflattened = n8n_rust_v5::api::parse_flatted_data(flatted_str).expect("Flatted data must be parsed");
+        let run_data = &unflattened["resultData"]["runData"];
+        assert!(run_data.is_object(), "runData must be an object");
+
+        // Check canvas representative nodes in runData
+        assert!(run_data.get("When clicking ‘Execute workflow’").is_some());
+        assert!(run_data.get("HyperScale Set").is_some());
+        assert!(run_data.get("HyperScale If").is_some());
+        assert!(run_data.get("HyperScale Filter").is_some());
+        assert!(run_data.get("HyperScale Switch").is_some());
+        assert!(run_data.get("HyperScale Sort").is_some());
+        assert!(run_data.get("HyperScale Limit").is_some());
+        assert!(run_data.get("Polyglot Code").is_some());
+        assert!(run_data.get("HyperScale Aggregate").is_some());
+        assert!(run_data.get("HyperScale SplitOut").is_some());
+        assert!(run_data.get("HyperScale Dedup").is_some());
+        assert!(run_data.get("HyperScale BatchFinalizer").is_some());
+
+        // Validate Polyglot Code telemetry item
+        let code_node_data = &run_data["Polyglot Code"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(code_node_data["status"], "success");
+        assert_eq!(code_node_data["processedItems"], 1_000_000);
+        assert_eq!(code_node_data["language"], "typeScript");
+        assert_eq!(code_node_data["runtimeVersion"], "ts-5.6");
+
+        // Validate BatchFinalizer telemetry item
+        let finalizer_data = &run_data["HyperScale BatchFinalizer"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(finalizer_data["status"], "success");
+        assert_eq!(finalizer_data["totalExecutedNodes"], 1_000_000);
+
+        // 6. Verify RAM Cache & Polyglot Schema Injection for /types/nodes.json
+        let res_types = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/types/nodes.json")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_types.status(), StatusCode::OK);
+        let cache_control = res_types
+            .headers()
+            .get(header::CACHE_CONTROL)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        assert!(
+            cache_control.contains("max-age=3600"),
+            "Cache-Control must contain max-age=3600, got: {cache_control}"
+        );
+
+        let bytes_types = res_types.into_body().collect().await.unwrap().to_bytes();
+        let types_val: serde_json::Value = serde_json::from_slice(&bytes_types).unwrap();
+
+        // Check if types_val has code node injected
+        let code_entry = if let Some(arr) = types_val.as_array() {
+            arr.iter().find(|n| n["name"] == "n8n-nodes-base.code")
+        } else if let Some(map) = types_val.as_object() {
+            map.get("n8n-nodes-base.code")
+        } else {
+            None
+        };
+        assert!(code_entry.is_some(), "Code node schema must exist in /types/nodes.json");
+
+        let code_props = code_entry.unwrap().get("properties").and_then(|p| p.as_array()).expect("Code properties array");
+        let lang_prop = code_props.iter().find(|p| p["name"] == "language").expect("Language property");
+        let lang_options = lang_prop["options"].as_array().expect("Language options array");
+        let lang_values: Vec<&str> = lang_options.iter().filter_map(|o| o["value"].as_str()).collect();
+        assert!(lang_values.contains(&"typeScript"), "Language options must contain 'typeScript'");
+        assert!(lang_values.contains(&"wasm"), "Language options must contain 'wasm'");
+
+        let ver_prop = code_props.iter().find(|p| p["name"] == "runtimeVersion").expect("runtimeVersion property");
+        let ver_options = ver_prop["options"].as_array().expect("runtimeVersion options array");
+        let ver_values: Vec<&str> = ver_options.iter().filter_map(|o| o["value"].as_str()).collect();
+        assert!(ver_values.contains(&"ts-5.6"), "RuntimeVersion options must contain 'ts-5.6'");
+        assert!(ver_values.contains(&"wasm-24.0"), "RuntimeVersion options must contain 'wasm-24.0'");
+
+        // 7. Verify disk hygiene: physical ui-dist/types/nodes.json is NOT altered
+        let disk_nodes_file = Path::new("ui-dist/types/nodes.json");
+        if disk_nodes_file.exists() {
+            let disk_content = std::fs::read_to_string(disk_nodes_file).unwrap_or_default();
+            assert!(
+                !disk_content.contains("ts-5.6"),
+                "Physical ui-dist/types/nodes.json on disk must remain pristine (in-memory injection only)"
+            );
+        }
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 27 timed out!");
+}
