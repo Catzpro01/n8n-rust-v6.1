@@ -5721,3 +5721,160 @@ async fn test_27_v6_hyperscale_1m_ui_workflow_and_polyglot_code_schema() {
     .await
     .expect("Test 27 timed out!");
 }
+
+// ---------------------------------------------------------------------------
+// 28. v6.0 HyperScale Add Node 13 (If), Autosave PATCH & Dynamic 1M Run
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_28_v6_hyperscale_add_node_13_autosave_and_execute() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // 1. Fetch current pre-seeded workflow
+        let res_get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_get.status(), StatusCode::OK);
+        let bytes_get = res_get.into_body().collect().await.unwrap().to_bytes();
+        let body_get: serde_json::Value = serde_json::from_slice(&bytes_get).unwrap();
+
+        let initial_checksum = body_get["data"]["checksum"].as_str().expect("Checksum must be present");
+        assert!(!initial_checksum.is_empty(), "Initial checksum must not be empty");
+
+        let mut nodes = body_get["data"]["nodes"].as_array().unwrap().clone();
+        assert_eq!(nodes.len(), 12, "Pre-seeded workflow must start with 12 nodes");
+
+        // 2. Append 13th node ("HyperScale If 2")
+        let node_13 = serde_json::json!({
+            "id": "node-13-if-extended",
+            "name": "HyperScale If 2",
+            "type": "n8n-nodes-base.if",
+            "typeVersion": 2.3,
+            "position": [2880, 300],
+            "parameters": {
+                "conditions": {
+                    "combinator": "and",
+                    "conditions": [
+                        {
+                            "id": "c-ext",
+                            "leftValue": 10,
+                            "rightValue": 5,
+                            "operator": { "name": "filter.operator.largerEqual", "operation": "largerEqual", "type": "number" }
+                        }
+                    ],
+                    "options": { "caseSensitive": true, "typeValidation": "strict", "version": 3 }
+                },
+                "options": {}
+            }
+        });
+        nodes.push(node_13);
+
+        let mut connections = body_get["data"]["connections"].as_object().unwrap().clone();
+        connections.insert(
+            "HyperScale BatchFinalizer".to_string(),
+            serde_json::json!({
+                "main": [
+                    [
+                        {
+                            "node": "HyperScale If 2",
+                            "type": "main",
+                            "index": 0
+                        }
+                    ]
+                ]
+            }),
+        );
+
+        // 3. Simulate Autosave PATCH /rest/workflows/wf-hyperscale-1m-benchmark
+        // Note: Frontend Vue only sends settings with executionOrder: "v1", expecting backend to preserve hyperScaleArena!
+        let patch_payload = serde_json::json!({
+            "nodes": nodes,
+            "connections": connections,
+            "settings": {
+                "executionOrder": "v1"
+            },
+            "expectedChecksum": initial_checksum,
+            "autosaved": true
+        });
+
+        let res_patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark")
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&patch_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_patch.status(), StatusCode::OK, "Autosave PATCH must return 200 OK");
+        let bytes_patch = res_patch.into_body().collect().await.unwrap().to_bytes();
+        let body_patch: serde_json::Value = serde_json::from_slice(&bytes_patch).unwrap();
+
+        let updated_checksum = body_patch["data"]["checksum"].as_str().expect("Checksum must be present in response");
+        assert_ne!(updated_checksum, initial_checksum, "Checksum must be updated after adding 13th node");
+        assert_eq!(body_patch["data"]["nodes"].as_array().unwrap().len(), 13, "Must have 13 nodes after patch");
+
+        // Verify hyperScaleArena config is preserved in settings
+        assert_eq!(
+            body_patch["data"]["settings"]["hyperScaleArena"]["enabled"],
+            true,
+            "hyperScaleArena must remain preserved even if autosave payload omits it"
+        );
+        assert_eq!(
+            body_patch["data"]["settings"]["hyperScaleArena"]["totalNodes"],
+            1_000_000
+        );
+
+        // 4. Execute the updated 13-node workflow
+        let res_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(res_run.status(), StatusCode::OK);
+        let bytes_run = res_run.into_body().collect().await.unwrap().to_bytes();
+        let body_run: serde_json::Value = serde_json::from_slice(&bytes_run).unwrap();
+
+        assert_eq!(body_run["data"]["status"], "success");
+        assert_eq!(body_run["data"]["executedNodes"], 1_000_000);
+
+        let result_data = &body_run["data"]["resultData"];
+        assert_eq!(
+            result_data["lastNodeExecuted"], "HyperScale If 2",
+            "lastNodeExecuted must be dynamically set to 13th node"
+        );
+
+        let run_data = &result_data["runData"];
+        assert!(run_data.get("HyperScale BatchFinalizer").is_some(), "BatchFinalizer must be executed");
+        assert!(run_data.get("HyperScale If 2").is_some(), "13th node HyperScale If 2 must be executed dynamically");
+
+        let if2_data = &run_data["HyperScale If 2"][0]["data"]["main"][0][0]["json"];
+        assert_eq!(if2_data["totalExecutedNodes"], 1_000_000);
+        assert_eq!(if2_data["canvasNodesCount"], 13);
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 28 timed out!");
+}
+

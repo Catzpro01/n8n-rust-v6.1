@@ -1422,24 +1422,6 @@ fn seed_default_workflows(conn: &Connection) -> Result<()> {
                 now,
             ],
         )?;
-    } else {
-        // Keep definition up to date with 12 nodes and settings
-        conn.execute(
-            "UPDATE workflows SET
-                name = ?1,
-                nodes = ?2,
-                connections = ?3,
-                settings = ?4,
-                updated_at = ?5
-            WHERE id = 'wf-hyperscale-1m-benchmark'",
-            params![
-                "⚡ HyperScale 1,000,000 Nodes Arena Benchmark",
-                serde_json::to_string(&nodes)?,
-                serde_json::to_string(&connections)?,
-                serde_json::to_string(&settings)?,
-                now,
-            ],
-        )?;
     }
     Ok(())
 }

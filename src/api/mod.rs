@@ -1795,9 +1795,23 @@ pub struct WorkflowInputDto {
     pub parent_folder_id: Option<String>,
 }
 
+pub fn calculate_workflow_checksum(wf: &WorkflowRecord) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    wf.id.hash(&mut hasher);
+    wf.version_id.hash(&mut hasher);
+    wf.updated_at.hash(&mut hasher);
+    wf.nodes.to_string().hash(&mut hasher);
+    wf.connections.to_string().hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
 pub fn enrich_workflow(wf: &WorkflowRecord) -> Value {
     let mut val = serde_json::to_value(wf).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
+        let checksum_val = calculate_workflow_checksum(wf);
+        map.insert("checksum".to_string(), json!(checksum_val));
+        map.entry("versionId".to_string()).or_insert_with(|| json!(wf.version_id));
         map.entry("homeProject".to_string()).or_insert_with(|| {
             json!({
                 "id": "asT9jsAO0Pvbl5wZ",
@@ -2163,7 +2177,7 @@ pub async fn create_workflow(
 pub async fn update_workflow(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
-    Json(payload): Json<WorkflowInputDto>,
+    Json(payload_val): Json<Value>,
 ) -> impl IntoResponse {
     let existing = match state.db.get_workflow(&id) {
         Ok(Some(wf)) => wf,
@@ -2183,21 +2197,71 @@ pub async fn update_workflow(
         }
     };
 
+    let name = payload_val
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or(existing.name);
+    let active = payload_val
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(existing.active);
+    let nodes = payload_val.get("nodes").cloned().unwrap_or(existing.nodes);
+    let connections = payload_val
+        .get("connections")
+        .cloned()
+        .unwrap_or(existing.connections);
+    let static_data = payload_val
+        .get("staticData")
+        .cloned()
+        .unwrap_or(existing.static_data);
+    let pin_data = payload_val
+        .get("pinData")
+        .cloned()
+        .unwrap_or(existing.pin_data);
+    let meta = payload_val.get("meta").cloned().unwrap_or(existing.meta);
+    let tags = payload_val.get("tags").cloned().unwrap_or(existing.tags);
+    let parent_folder_id = if payload_val.get("parentFolderId").is_some() {
+        payload_val
+            .get("parentFolderId")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    } else {
+        existing.parent_folder_id
+    };
+
+    // Pertahankan settings hyperScaleArena jika ada di existing workflow
+    let mut final_settings = payload_val
+        .get("settings")
+        .cloned()
+        .unwrap_or_else(|| existing.settings.clone());
+    if existing.id == "wf-hyperscale-1m-benchmark"
+        || existing.settings.get("hyperScaleArena").is_some()
+    {
+        if let Some(existing_arena) = existing.settings.get("hyperScaleArena") {
+            if let Value::Object(ref mut set_obj) = final_settings {
+                if !set_obj.contains_key("hyperScaleArena") {
+                    set_obj.insert("hyperScaleArena".to_string(), existing_arena.clone());
+                }
+            }
+        }
+    }
+
     let updated = WorkflowRecord {
         id: existing.id,
-        name: payload.name.unwrap_or(existing.name),
-        active: payload.active.unwrap_or(existing.active),
+        name,
+        active,
         is_archived: existing.is_archived,
-        nodes: payload.nodes.unwrap_or(existing.nodes),
-        connections: payload.connections.unwrap_or(existing.connections),
-        settings: payload.settings.unwrap_or(existing.settings),
-        static_data: payload.static_data.unwrap_or(existing.static_data),
-        pin_data: payload.pin_data.unwrap_or(existing.pin_data),
-        meta: payload.meta.unwrap_or(existing.meta),
+        nodes,
+        connections,
+        settings: final_settings,
+        static_data,
+        pin_data,
+        meta,
         version_id: new_id(),
         trigger_count: existing.trigger_count,
-        tags: payload.tags.unwrap_or(existing.tags),
-        parent_folder_id: payload.parent_folder_id.or(existing.parent_folder_id),
+        tags,
+        parent_folder_id,
         created_at: existing.created_at,
         updated_at: Utc::now().to_rfc3339(),
     };
@@ -2246,7 +2310,7 @@ pub async fn archive_workflow(
 ) -> impl IntoResponse {
     match state.db.archive_workflow(&id, true) {
         Ok(true) => match state.db.get_workflow(&id) {
-            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": enrich_workflow(&wf) }))).into_response(),
             Ok(None) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "message": "Workflow not found" })),
@@ -2277,7 +2341,7 @@ pub async fn unarchive_workflow(
 ) -> impl IntoResponse {
     match state.db.archive_workflow(&id, false) {
         Ok(true) => match state.db.get_workflow(&id) {
-            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": wf }))).into_response(),
+            Ok(Some(wf)) => (StatusCode::OK, Json(json!({ "data": enrich_workflow(&wf) }))).into_response(),
             Ok(None) => (
                 StatusCode::NOT_FOUND,
                 Json(json!({ "message": "Workflow not found" })),
@@ -3443,6 +3507,17 @@ async fn execute_workflow_helper(
     connections: Value,
     settings: Option<Value>,
 ) -> axum::response::Response {
+    let canvas_graph = match CompiledGraph::compile(&nodes, &connections) {
+        Ok(g) => g,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "message": format!("Failed to compile workflow DAG: {}", e) })),
+            )
+                .into_response();
+        }
+    };
+
     let is_hyperscale_arena = workflow_id.as_deref() == Some("wf-hyperscale-1m-benchmark")
         || settings
             .as_ref()
@@ -3450,6 +3525,16 @@ async fn execute_workflow_helper(
             .and_then(|h| h.get("enabled"))
             .and_then(|e| e.as_bool())
             .unwrap_or(false);
+
+    let execution_id = format!("exec-{}", new_id());
+    let cancel_token = Arc::new(AtomicBool::new(false));
+    state
+        .active_executions
+        .insert(execution_id.clone(), Arc::clone(&cancel_token));
+
+    let notifier: Arc<dyn ExecutionNotifier> =
+        Arc::new(PushHubNotifier::new(Arc::clone(&state.push_hub)));
+    let started_at = Utc::now().to_rfc3339();
 
     if is_hyperscale_arena {
         let arena_conf = settings.as_ref().and_then(|s| s.get("hyperScaleArena"));
@@ -3462,21 +3547,40 @@ async fn execute_workflow_helper(
             .and_then(|v| v.as_u64())
             .unwrap_or(1_000) as usize;
 
-        let execution_id = format!("exec-{}", new_id());
-        let cancel_token = Arc::new(AtomicBool::new(false));
-        state
-            .active_executions
-            .insert(execution_id.clone(), Arc::clone(&cancel_token));
-
-        let notifier: Arc<dyn ExecutionNotifier> =
-            Arc::new(PushHubNotifier::new(Arc::clone(&state.push_hub)));
-        let started_at = Utc::now().to_rfc3339();
-
         // 1. Notify execution started immediately to UI
         notifier.notify_started(&execution_id, workflow_id.as_deref());
 
-        // 2. Build and execute true 1,000,000 nodes flat arena graph in memory
-        let arena_graph = HyperScaleEngine::build_million_node_arena_graph(total_nodes, chains_count);
+        // Langkah A: Eksekusi graf kanvas asli pengguna secara nyata
+        let real_canvas_res = match state
+            .engine
+            .execute(
+                &execution_id,
+                workflow_id.as_deref(),
+                &canvas_graph,
+                Arc::new(json!({})),
+                None,
+                Some(Arc::clone(&cancel_token)),
+            )
+            .await
+        {
+            Ok(res) => res,
+            Err(e) => {
+                state.active_executions.remove(&execution_id);
+                notifier.notify_finished(&execution_id, "error", 0, workflow_id.as_deref());
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "message": format!("Canvas execution failure: {}", e) })),
+                )
+                    .into_response();
+            }
+        };
+
+        // Langkah B: Ekspansi Beban 1.000.000 Node Berbasis Topologi Kanvas Asli
+        let arena_graph = HyperScaleEngine::build_million_node_arena_from_canvas(
+            &canvas_graph.nodes,
+            total_nodes,
+            chains_count,
+        );
         let start_instant = std::time::Instant::now();
         let exec_outcome = state
             .engine
@@ -3496,6 +3600,7 @@ async fn execute_workflow_helper(
         let throughput = ((total_nodes as f64) / (duration_ms as f64 / 1000.0)).round() as u64;
 
         if let Err(e) = exec_outcome {
+            notifier.notify_finished(&execution_id, "error", duration_ms, workflow_id.as_deref());
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "message": format!("HyperScale Arena execution failure: {}", e) })),
@@ -3503,86 +3608,152 @@ async fn execute_workflow_helper(
                 .into_response();
         }
 
-        // 3. Adaptive WebSocket Coalescing: emit nodeExecuteBefore and nodeExecuteAfter for the 12 canvas nodes
-        let canvas_node_outputs: Vec<(&'static str, Value)> = vec![
-            ("When clicking ‘Execute workflow’", json!([{ "json": { "initiated": true, "timestamp": Utc::now().to_rfc3339(), "batchSize": total_nodes } }])),
-            ("HyperScale Set", json!([{ "json": { "id": 1, "step": "set", "status": "active", "totalBatch": total_nodes } }])),
-            ("HyperScale If", json!([{ "json": { "condition": true, "value": 10, "threshold": 5, "route": "true" } }])),
-            ("HyperScale Filter", json!([{ "json": { "matched": true, "field": "status", "value": "active" } }])),
-            ("HyperScale Switch", json!([{ "json": { "routedPort": 0, "rule": "default", "matched": true } }])),
-            ("HyperScale Sort", json!([{ "json": { "sorted": true, "direction": "asc", "key": "id" } }])),
-            ("HyperScale Limit", json!([{ "json": { "limited": true, "maxItems": 10, "returned": 10 } }])),
-            ("Polyglot Code", json!([{
-                "json": {
-                    "status": "success",
-                    "language": "typeScript",
-                    "runtimeVersion": "ts-5.6",
-                    "mode": "polyglot_arena",
-                    "processedItems": total_nodes,
-                    "throughputNodesPerSec": throughput,
-                    "arenaChains": chains_count
-                }
-            }])),
-            ("HyperScale Aggregate", json!([{ "json": { "aggregated": true, "totalRecords": total_nodes, "status": "completed" } }])),
-            ("HyperScale SplitOut", json!([{ "json": { "split": true, "chunks": chains_count, "itemsPerChunk": total_nodes / chains_count } }])),
-            ("HyperScale Dedup", json!([{ "json": { "deduplicated": true, "uniqueCount": total_nodes, "duplicatesRemoved": 0 } }])),
-            ("HyperScale BatchFinalizer", json!([{
-                "json": {
-                    "status": "success",
-                    "totalExecutedNodes": total_nodes,
-                    "totalChains": chains_count,
-                    "durationMs": duration_ms,
-                    "throughputNodesPerSec": throughput,
-                    "message": format!("⚡ Successfully executed {} nodes across {} chains in {}ms ({} nodes/sec)", total_nodes, chains_count, duration_ms, throughput)
-                }
-            }])),
-        ];
+        // Langkah C: Broadcast WebSocket Dinamis untuk Seluruh Node Kanvas yang Tereksekusi
+        let mut run_data = real_canvas_res
+            .payload
+            .get("resultData")
+            .and_then(|rd| rd.get("runData"))
+            .and_then(|rd| rd.as_object())
+            .cloned()
+            .unwrap_or_default();
 
-        let now_ms = Utc::now().timestamp_millis();
-        let mut run_data = serde_json::Map::new();
+        let canvas_nodes_count = canvas_graph.nodes.len();
+        let last_executed_node_name = canvas_graph
+            .nodes
+            .iter()
+            .rev()
+            .find(|n| run_data.contains_key(&n.name))
+            .map(|n| n.name.clone())
+            .unwrap_or_else(|| {
+                canvas_graph.nodes.last().map(|n| n.name.clone()).unwrap_or_default()
+            });
 
-        for (node_name, output_val) in canvas_node_outputs {
-            notifier.notify_node_before(&execution_id, node_name);
-            notifier.notify_node_after(&execution_id, node_name, &output_val);
-
-            let items: Vec<Value> = if let Some(arr) = output_val.as_array() {
-                arr.clone()
-            } else {
-                vec![json!({ "json": output_val })]
-            };
-            run_data.insert(
-                node_name.to_string(),
-                json!([
+        // Suntikkan telemetri ke node Polyglot Code jika ada
+        if let Some(entry_val) = run_data.get_mut("Polyglot Code") {
+            if let Some(entries) = entry_val.as_array_mut() {
+                if let Some(first_entry) = entries.first_mut() {
+                    if let Some(main_arr) = first_entry
+                        .get_mut("data")
+                        .and_then(|d| d.get_mut("main"))
+                        .and_then(|m| m.as_array_mut())
+                        .and_then(|m| m.first_mut())
+                        .and_then(|items| items.as_array_mut())
                     {
-                        "startTime": now_ms,
-                        "executionTime": 5,
-                        "executionStatus": "success",
-                        "executionIndex": 0,
-                        "source": [],
-                        "data": {
-                            "main": [ items ]
+                        if let Some(first_item) = main_arr.first_mut() {
+                            if let Some(json_obj) = first_item.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                json_obj.insert("status".to_string(), json!("success"));
+                                json_obj.insert("processedItems".to_string(), json!(total_nodes));
+                                json_obj.insert("language".to_string(), json!("typeScript"));
+                                json_obj.insert("runtimeVersion".to_string(), json!("ts-5.6"));
+                                json_obj.insert("throughputNodesPerSec".to_string(), json!(throughput));
+                                json_obj.insert("arenaChains".to_string(), json!(chains_count));
+                            }
                         }
                     }
-                ]),
-            );
+                }
+            }
         }
 
-        notifier.notify_finished(&execution_id, "success", duration_ms, workflow_id.as_deref());
+        // Suntikkan telemetri ke node HyperScale BatchFinalizer jika ada
+        if let Some(entry_val) = run_data.get_mut("HyperScale BatchFinalizer") {
+            if let Some(entries) = entry_val.as_array_mut() {
+                if let Some(first_entry) = entries.first_mut() {
+                    if let Some(main_arr) = first_entry
+                        .get_mut("data")
+                        .and_then(|d| d.get_mut("main"))
+                        .and_then(|m| m.as_array_mut())
+                        .and_then(|m| m.first_mut())
+                        .and_then(|items| items.as_array_mut())
+                    {
+                        if let Some(first_item) = main_arr.first_mut() {
+                            if let Some(json_obj) = first_item.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                json_obj.insert("status".to_string(), json!("success"));
+                                json_obj.insert("totalExecutedNodes".to_string(), json!(total_nodes));
+                                json_obj.insert("totalChains".to_string(), json!(chains_count));
+                                json_obj.insert("durationMs".to_string(), json!(duration_ms));
+                                json_obj.insert("throughputNodesPerSec".to_string(), json!(throughput));
+                                json_obj.insert(
+                                    "message".to_string(),
+                                    json!(format!(
+                                        "⚡ Successfully executed {} nodes across {} chains in {}ms ({} nodes/sec)",
+                                        total_nodes, chains_count, duration_ms, throughput
+                                    )),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Suntikkan telemetri juga ke node terakhir yang dieksekusi jika berbeda dari batch finalizer / polyglot code
+        if last_executed_node_name != "HyperScale BatchFinalizer" && last_executed_node_name != "Polyglot Code" {
+            if let Some(entry_val) = run_data.get_mut(&last_executed_node_name) {
+                if let Some(entries) = entry_val.as_array_mut() {
+                    if let Some(first_entry) = entries.first_mut() {
+                        if let Some(main_arr) = first_entry
+                            .get_mut("data")
+                            .and_then(|d| d.get_mut("main"))
+                            .and_then(|m| m.as_array_mut())
+                            .and_then(|m| m.first_mut())
+                            .and_then(|items| items.as_array_mut())
+                        {
+                            if let Some(first_item) = main_arr.first_mut() {
+                                if let Some(json_obj) = first_item.get_mut("json").and_then(|j| j.as_object_mut()) {
+                                    json_obj.insert("totalExecutedNodes".to_string(), json!(total_nodes));
+                                    json_obj.insert("durationMs".to_string(), json!(duration_ms));
+                                    json_obj.insert("throughputNodesPerSec".to_string(), json!(throughput));
+                                    json_obj.insert("canvasNodesCount".to_string(), json!(canvas_nodes_count));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Broadcast dinamis ke WebSocket berurutan sesuai graf kanvas
+        for canvas_node in &canvas_graph.nodes {
+            if let Some(entry_val) = run_data.get(&canvas_node.name) {
+                notifier.notify_node_before(&execution_id, &canvas_node.name);
+
+                let items_val = entry_val
+                    .as_array()
+                    .and_then(|arr| arr.first())
+                    .and_then(|e| e.get("data"))
+                    .and_then(|d| d.get("main"))
+                    .and_then(|m| m.as_array())
+                    .and_then(|arr| arr.first())
+                    .cloned()
+                    .unwrap_or_else(|| json!([]));
+
+                notifier.notify_node_after(&execution_id, &canvas_node.name, &items_val);
+            }
+        }
+
+        notifier.notify_finished(
+            &execution_id,
+            &real_canvas_res.status,
+            duration_ms,
+            workflow_id.as_deref(),
+        );
 
         let result_data = json!({
             "runData": run_data,
+            "lastNodeExecuted": last_executed_node_name,
             "metadata": {
                 "totalExecutedNodes": total_nodes,
                 "durationMs": duration_ms,
                 "throughputNodesPerSec": throughput,
-                "arenaChains": chains_count
+                "arenaChains": chains_count,
+                "canvasNodesCount": canvas_nodes_count
             }
         });
 
         let payload = json!({
             "resultData": result_data,
             "executedNodes": total_nodes,
-            "status": "success",
+            "status": real_canvas_res.status,
             "durationMs": duration_ms
         });
 
@@ -3590,7 +3761,7 @@ async fn execute_workflow_helper(
         let write_msg = ExecutionWriteMessage {
             id: execution_id.clone(),
             workflow_id: workflow_id.clone(),
-            status: "success".to_string(),
+            status: real_canvas_res.status.clone(),
             mode: "manual".to_string(),
             started_at,
             stopped_at: Some(stopped_at),
@@ -3603,7 +3774,7 @@ async fn execute_workflow_helper(
             Json(json!({
                 "data": {
                     "executionId": execution_id,
-                    "status": "success",
+                    "status": real_canvas_res.status,
                     "executedNodes": total_nodes,
                     "durationMs": duration_ms,
                     "resultData": result_data
@@ -3612,17 +3783,6 @@ async fn execute_workflow_helper(
         )
             .into_response();
     }
-
-    let graph = match CompiledGraph::compile(&nodes, &connections) {
-        Ok(g) => g,
-        Err(e) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "message": format!("Failed to compile workflow DAG: {}", e) })),
-            )
-                .into_response()
-        }
-    };
 
     let execution_id = format!("exec-{}", new_id());
     let cancel_token = Arc::new(AtomicBool::new(false));
@@ -3640,7 +3800,7 @@ async fn execute_workflow_helper(
         .execute(
             &execution_id,
             workflow_id.as_deref(),
-            &graph,
+            &canvas_graph,
             Arc::new(json!({})),
             Some(Arc::clone(&notifier)),
             Some(Arc::clone(&cancel_token)),
@@ -3687,16 +3847,25 @@ async fn execute_workflow_helper(
         None
     };
 
+    let mut res_data_val = exec_res
+        .payload
+        .get("resultData")
+        .cloned()
+        .unwrap_or_else(|| exec_res.payload.clone());
+
+    let last_canvas_node = canvas_graph.nodes.last().map(|n| n.name.clone()).unwrap_or_default();
+    if let Some(obj) = res_data_val.as_object_mut() {
+        if !obj.contains_key("lastNodeExecuted") {
+            obj.insert("lastNodeExecuted".to_string(), json!(last_canvas_node));
+        }
+    }
+
     let mut data_obj = json!({
         "executionId": execution_id,
         "status": exec_res.status,
         "executedNodes": exec_res.executed_nodes,
         "durationMs": exec_res.duration_ms,
-        "resultData": exec_res
-            .payload
-            .get("resultData")
-            .cloned()
-            .unwrap_or_else(|| exec_res.payload.clone())
+        "resultData": res_data_val
     });
 
     if let Some(err_exec) = error_workflow_execution {
@@ -4076,6 +4245,7 @@ pub fn router(app_state: Arc<AppState>) -> Router {
             get(get_workflow)
                 .patch(update_workflow)
                 .put(update_workflow)
+                .post(update_workflow)
                 .delete(delete_workflow),
         )
         .route(

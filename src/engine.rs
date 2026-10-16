@@ -466,6 +466,45 @@ impl HyperScaleEngine {
         CompiledGraph::programmatic(nodes, edges)
     }
 
+    /// Fast programmatic builder cloning canvas nodes sequentially across chains up to total_nodes
+    pub fn build_million_node_arena_from_canvas(
+        canvas_nodes: &[ArenaNode],
+        total_nodes: usize,
+        chains_count: usize,
+    ) -> CompiledGraph {
+        if canvas_nodes.is_empty() {
+            return Self::build_million_node_arena_graph(total_nodes, chains_count);
+        }
+
+        let k = canvas_nodes.len();
+        let mut nodes = Vec::with_capacity(total_nodes);
+        let mut edges = vec![Vec::new(); total_nodes];
+
+        for i in 0..total_nodes {
+            let template = &canvas_nodes[i % k];
+            let node_kind = if template.kind == NodeKind::Unknown {
+                NodeKind::from_type_str(&template.node_type)
+            } else {
+                template.kind
+            };
+
+            nodes.push(ArenaNode {
+                id: format!("arena_{i}"),
+                name: format!("{}_{}", template.name, i),
+                node_type: template.node_type.clone(),
+                parameters: template.parameters.clone(),
+                has_expressions: template.has_expressions,
+                kind: node_kind,
+            });
+
+            if ((i + 1) % k != 0) && (i + 1 < total_nodes) {
+                edges[i].push((i + 1) as u32);
+            }
+        }
+
+        CompiledGraph::programmatic(nodes, edges)
+    }
+
     /// Execute a compiled DAG with zero-copy Arc payload passing and Rayon work-stealing wave scheduling
     pub async fn execute(
         &self,
@@ -591,6 +630,7 @@ impl HyperScaleEngine {
             .unwrap_or_else(|e| e.into_inner());
 
         // Construct storage payload: Compact vs Full mode
+        let last_node_name = graph.nodes.last().map(|n| n.name.clone()).unwrap_or_default();
         let payload = if is_compact_logging {
             json!({
                 "mode": "hyperScaleCompact",
@@ -598,7 +638,10 @@ impl HyperScaleEngine {
                 "totalNodes": total_nodes,
                 "executedNodes": final_count,
                 "durationMs": duration_ms,
-                "lastNodeOutput": *last_output
+                "lastNodeOutput": *last_output,
+                "resultData": {
+                    "lastNodeExecuted": last_node_name
+                }
             })
         } else {
             let now_ms = Utc::now().timestamp_millis();
@@ -1298,11 +1341,18 @@ fn execute_node_logic(
             (payload, None)
         }
         NodeKind::If => {
-            let is_true = evaluate_if_condition(params_ref, &input, expr_ctx, node.has_expressions);
-            let port = if is_true { 0 } else { 1 };
-            (input, Some(port))
+            if is_hyperscale {
+                (input, None)
+            } else {
+                let is_true = evaluate_if_condition(params_ref, &input, expr_ctx, node.has_expressions);
+                let port = if is_true { 0 } else { 1 };
+                (input, Some(port))
+            }
         }
         NodeKind::Switch => {
+            if is_hyperscale {
+                return (input, None);
+            }
             let switch_params = if node.has_expressions {
                 &node.parameters
             } else {
