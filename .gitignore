@@ -3,6 +3,13 @@
 *.db*
 .env
 /node_modules/
+/ui-dist/
+*.wasm
+*.exe
+*.zip
+*.dll
+*.so
+*.dylib
 ../n8n-ref-temp
 report.md
 *.png
