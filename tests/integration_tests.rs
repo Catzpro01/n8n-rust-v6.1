@@ -5878,3 +5878,372 @@ async fn test_28_v6_hyperscale_add_node_13_autosave_and_execute() {
     .expect("Test 28 timed out!");
 }
 
+// ---------------------------------------------------------------------------
+// 29. v6.1 True Million Parameterized Nodes, Viewport Jump & Delta Autosave
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn test_29_v6_1_true_million_parameterized_nodes_viewport_jump_and_delta_autosave() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let (db, db_path) = setup_test_engine();
+        let app = build_app(Path::new("ui-dist"), db.clone());
+
+        // ===================================================================
+        // Skenario 1: Verifikasi Sampel 1.000.000 Node Nyata via API Inspect
+        // ===================================================================
+
+        // 1.1 Node #1 (Trigger pertama: row 0, col 0)
+        let res_node_1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/1/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_node_1.status(), StatusCode::OK);
+        let bytes_1 = res_node_1.into_body().collect().await.unwrap().to_bytes();
+        let body_1: serde_json::Value = serde_json::from_slice(&bytes_1).unwrap();
+        let data_1 = &body_1["data"];
+        assert_eq!(data_1["id"], "node_1");
+        assert_eq!(data_1["name"], "Trigger #1");
+        assert_eq!(data_1["node_type"], "n8n-nodes-base.manualTrigger");
+        assert_eq!(data_1["node_index"], 1);
+        assert_eq!(data_1["row"], 0);
+        assert_eq!(data_1["col"], 0);
+        assert_eq!(data_1["position"][0], 0.0);
+        assert_eq!(data_1["position"][1], 0.0);
+        assert!(data_1["incoming_connections"].as_array().unwrap().is_empty());
+        assert_eq!(data_1["outgoing_connections"].as_array().unwrap().len(), 1);
+
+        // 1.2 Node #250005 (row 250, col 4)
+        let res_node_250k = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/250005/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_node_250k.status(), StatusCode::OK);
+        let bytes_250k = res_node_250k.into_body().collect().await.unwrap().to_bytes();
+        let body_250k: serde_json::Value = serde_json::from_slice(&bytes_250k).unwrap();
+        let data_250k = &body_250k["data"];
+        assert_eq!(data_250k["id"], "node_250005");
+        assert_eq!(data_250k["name"], "Switch #250005");
+        assert_eq!(data_250k["node_type"], "n8n-nodes-base.switch");
+        assert_eq!(data_250k["node_index"], 250005);
+        assert_eq!(data_250k["row"], 250);
+        assert_eq!(data_250k["col"], 4);
+        assert_eq!(data_250k["position"][0], 1040.0); // 4 * 260.0
+        assert_eq!(data_250k["position"][1], 45000.0); // 250 * 180.0
+        assert_eq!(data_250k["incoming_connections"].as_array().unwrap().len(), 1);
+        assert_eq!(data_250k["outgoing_connections"].as_array().unwrap().len(), 1);
+
+        // 1.3 Node #500008 (row 500, col 7)
+        let res_node_500k = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/500008/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_node_500k.status(), StatusCode::OK);
+        let bytes_500k = res_node_500k.into_body().collect().await.unwrap().to_bytes();
+        let body_500k: serde_json::Value = serde_json::from_slice(&bytes_500k).unwrap();
+        let data_500k = &body_500k["data"];
+        assert_eq!(data_500k["id"], "node_500008");
+        assert_eq!(data_500k["name"], "Code #500008");
+        assert_eq!(data_500k["node_type"], "n8n-nodes-base.code");
+        assert_eq!(data_500k["node_index"], 500008);
+        assert_eq!(data_500k["row"], 500);
+        assert_eq!(data_500k["col"], 7);
+        assert_eq!(data_500k["position"][0], 1820.0); // 7 * 260.0
+        assert_eq!(data_500k["position"][1], 90000.0); // 500 * 180.0
+        assert!(data_500k["parameters"]["code"].as_str().unwrap().contains("verifiedAtNode = 500008"));
+
+        // 1.4 Node #999999 (row 999, col 998)
+        let res_node_999k = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/999999/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_node_999k.status(), StatusCode::OK);
+        let bytes_999k = res_node_999k.into_body().collect().await.unwrap().to_bytes();
+        let body_999k: serde_json::Value = serde_json::from_slice(&bytes_999k).unwrap();
+        let data_999k = &body_999k["data"];
+        assert_eq!(data_999k["id"], "node_999999");
+        assert_eq!(data_999k["name"], "Aggregate #999999");
+        assert_eq!(data_999k["node_type"], "n8n-nodes-base.aggregate");
+        assert_eq!(data_999k["node_index"], 999999);
+        assert_eq!(data_999k["row"], 999);
+        assert_eq!(data_999k["col"], 998);
+        assert_eq!(data_999k["position"][0], 259480.0); // 998 * 260.0
+        assert_eq!(data_999k["position"][1], 179820.0); // 999 * 180.0
+
+        // 1.5 Node #1000000 (row 999, col 999)
+        let res_node_1m = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/1000000/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_node_1m.status(), StatusCode::OK);
+        let bytes_1m = res_node_1m.into_body().collect().await.unwrap().to_bytes();
+        let body_1m: serde_json::Value = serde_json::from_slice(&bytes_1m).unwrap();
+        let data_1m = &body_1m["data"];
+        assert_eq!(data_1m["id"], "node_1000000");
+        assert_eq!(data_1m["name"], "BatchFinalizer #1000000");
+        assert_eq!(data_1m["node_type"], "n8n-nodes-base.splitInBatches");
+        assert_eq!(data_1m["node_index"], 1000000);
+        assert_eq!(data_1m["row"], 999);
+        assert_eq!(data_1m["col"], 999);
+        assert_eq!(data_1m["position"][0], 259740.0); // 999 * 260.0
+        assert_eq!(data_1m["position"][1], 179820.0); // 999 * 180.0
+        assert_eq!(data_1m["parameters"]["batchSize"], 10);
+        assert!(data_1m["outgoing_connections"].as_array().unwrap().is_empty());
+
+        // ===================================================================
+        // Skenario 2: Viewport Jump ke Tengah Graf (#500,000) & Subgraph Halo
+        // ===================================================================
+        let jump_payload = json!({
+            "targetNodeIndex": 500000,
+            "cols": 20,
+            "rows": 20
+        });
+        let res_jump = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/viewport/jump")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&jump_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_jump.status(), StatusCode::OK);
+        let bytes_jump = res_jump.into_body().collect().await.unwrap().to_bytes();
+        let body_jump: serde_json::Value = serde_json::from_slice(&bytes_jump).unwrap();
+
+        assert_eq!(body_jump["data"]["success"], true);
+        assert_eq!(body_jump["data"]["targetNodeIndex"], 500000);
+        assert_eq!(body_jump["data"]["totalPhysicalNodes"], 1_000_000);
+
+        let vp = &body_jump["data"]["viewport"];
+        let vp_nodes = vp["nodes"].as_array().expect("Viewport nodes must be array");
+        assert!(!vp_nodes.is_empty(), "Viewport nodes must not be empty");
+
+        // Verifikasi keberadaan node target #500000 di viewport
+        let has_node_500k = vp_nodes.iter().any(|n| n["id"] == "node_500000");
+        assert!(has_node_500k, "Viewport must contain target node 500000");
+
+        // Verifikasi 1-Hop Boundary buffer (halo nodes)
+        let halo_nodes_count = vp_nodes
+            .iter()
+            .filter(|n| n.get("isHalo").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+        assert!(halo_nodes_count > 0, "Must have 1-Hop boundary halo nodes");
+
+        // Verifikasi Zero Broken Cables dalam koneksi viewport
+        let vp_node_names: std::collections::HashSet<String> = vp_nodes
+            .iter()
+            .filter_map(|n| n.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+        if let Some(conns) = vp["connections"].as_object() {
+            for (src_node, conn_val) in conns {
+                assert!(vp_node_names.contains(src_node), "Source {} must exist in viewport", src_node);
+                if let Some(main_arr) = conn_val.get("main").and_then(|m| m.as_array()) {
+                    for target_group in main_arr {
+                        if let Some(targets) = target_group.as_array() {
+                            for t in targets {
+                                if let Some(target_name) = t.get("node").and_then(|n| n.as_str()) {
+                                    assert!(
+                                        vp_node_names.contains(target_name),
+                                        "Target {} must exist in viewport nodes (Zero Broken Cables)",
+                                        target_name
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Verifikasi GET /rest/workflows/wf-hyperscale-1m-benchmark setelah jump
+        let res_wf_after_jump = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_wf_after_jump.status(), StatusCode::OK);
+        let bytes_wf_jump = res_wf_after_jump.into_body().collect().await.unwrap().to_bytes();
+        let body_wf_jump: serde_json::Value = serde_json::from_slice(&bytes_wf_jump).unwrap();
+        assert_eq!(body_wf_jump["data"]["totalPhysicalNodes"], 1_000_000);
+        let current_checksum = body_wf_jump["data"]["checksum"].as_str().expect("Checksum present");
+
+        // ===================================================================
+        // Skenario 3: Delta-Merge Autosave Anti-Data-Loss
+        // ===================================================================
+        let custom_filter_node = json!({
+            "id": "node-custom-filter",
+            "name": "Custom Filter User",
+            "type": "n8n-nodes-base.filter",
+            "typeVersion": 2.2,
+            "position": [1000.0, 1000.0],
+            "parameters": {
+                "conditions": {
+                    "conditions": [
+                        { "field": "status", "operator": "equals", "value": "vip" }
+                    ]
+                }
+            }
+        });
+
+        let mut patch_conns = serde_json::Map::new();
+        patch_conns.insert(
+            "Custom Filter User".to_string(),
+            json!({
+                "main": [[
+                    { "node": "BatchFinalizer #1000000", "type": "main", "index": 0 }
+                ]]
+            }),
+        );
+
+        let patch_payload = json!({
+            "nodes": [custom_filter_node],
+            "connections": patch_conns,
+            "settings": {
+                "executionOrder": "v1"
+            },
+            "expectedChecksum": current_checksum,
+            "autosaved": true
+        });
+
+        let res_patch = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark")
+                    .method("PATCH")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from(serde_json::to_vec(&patch_payload).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_patch.status(), StatusCode::OK);
+        let bytes_patch = res_patch.into_body().collect().await.unwrap().to_bytes();
+        let body_patch: serde_json::Value = serde_json::from_slice(&bytes_patch).unwrap();
+
+        let updated_checksum = body_patch["data"]["checksum"].as_str().expect("Checksum present");
+        assert_ne!(updated_checksum, current_checksum, "Checksum must change after patch");
+        assert_eq!(body_patch["data"]["totalPhysicalNodes"], 1_000_000);
+
+        // Verifikasi Anti-Silent-Data-Loss: Node di luar layar (#1 dan #1000000) TIDAK hilang
+        let res_check_1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/1/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_check_1.status(), StatusCode::OK);
+        let b1 = res_check_1.into_body().collect().await.unwrap().to_bytes();
+        let v1: serde_json::Value = serde_json::from_slice(&b1).unwrap();
+        assert_eq!(v1["data"]["name"], "Trigger #1");
+
+        let res_check_1m = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/1000000/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_check_1m.status(), StatusCode::OK);
+        let b1m = res_check_1m.into_body().collect().await.unwrap().to_bytes();
+        let v1m: serde_json::Value = serde_json::from_slice(&b1m).unwrap();
+        assert_eq!(v1m["data"]["name"], "BatchFinalizer #1000000");
+
+        // Verifikasi node baru tersimpan dan dapat diinspeksi
+        let res_check_custom = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/nodes/node-custom-filter/inspect")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_check_custom.status(), StatusCode::OK);
+        let b_custom = res_check_custom.into_body().collect().await.unwrap().to_bytes();
+        let v_custom: serde_json::Value = serde_json::from_slice(&b_custom).unwrap();
+        assert_eq!(v_custom["data"]["name"], "Custom Filter User");
+
+        // ===================================================================
+        // Skenario 4: Eksekusi 1M Node & Verifikasi Output RunData Nyata
+        // ===================================================================
+        let res_run = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/rest/workflows/wf-hyperscale-1m-benchmark/run")
+                    .method("POST")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(axum::body::Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res_run.status(), StatusCode::OK);
+        let bytes_run = res_run.into_body().collect().await.unwrap().to_bytes();
+        let body_run: serde_json::Value = serde_json::from_slice(&bytes_run).unwrap();
+
+        assert_eq!(body_run["data"]["status"], "success");
+        let executed_nodes = body_run["data"]["executedNodes"].as_u64().unwrap();
+        assert!(
+            executed_nodes >= 1_000_000,
+            "Executed nodes must be at least 1,000,000, got: {}",
+            executed_nodes
+        );
+
+        let run_data = &body_run["data"]["resultData"]["runData"];
+        assert!(run_data.get("Custom Filter User").is_some(), "Custom Filter User must have execution runData");
+        assert!(run_data.get("BatchFinalizer #500000").is_some() || run_data.get("Trigger #500001").is_some(), "Active viewport nodes must have real runData");
+
+        let _ = std::fs::remove_file(db_path);
+    })
+    .await
+    .expect("Test 29 timed out!");
+}
+
+

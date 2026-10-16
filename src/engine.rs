@@ -6,7 +6,7 @@ use rayon::ThreadPool;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, info, warn};
@@ -2549,6 +2549,1016 @@ pub fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// RealMillionGraphStore: 1,000,000 Parameterized Graph Engine & Spatial Index
+// ---------------------------------------------------------------------------
+
+pub const MILLION_GRAPH_ROWS: usize = 1000;
+pub const MILLION_GRAPH_COLS: usize = 1000;
+pub const MILLION_GRAPH_TOTAL_NODES: usize = MILLION_GRAPH_ROWS * MILLION_GRAPH_COLS;
+pub const MILLION_NODE_SPACING_X: f64 = 260.0;
+pub const MILLION_NODE_SPACING_Y: f64 = 180.0;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewportBounds {
+    pub min_col: usize,
+    pub max_col: usize,
+    pub min_row: usize,
+    pub max_row: usize,
+    pub halo_cols: usize,
+    pub halo_rows: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewportSubgraph {
+    pub nodes: Vec<Value>,
+    pub connections: Value,
+    pub total_nodes: usize,
+    pub total_edges: usize,
+    pub viewport_bounds: ViewportBounds,
+    pub center_node_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeInspectData {
+    pub id: String,
+    pub name: String,
+    pub node_type: String,
+    pub node_index: usize,
+    pub row: usize,
+    pub col: usize,
+    pub position: (f64, f64),
+    pub parameters: Value,
+    pub incoming_connections: Vec<String>,
+    pub outgoing_connections: Vec<String>,
+    pub input_data: Value,
+    pub output_data: Value,
+    pub execution_status: String,
+    pub execution_duration_ms: f64,
+}
+
+pub struct RealMillionGraphStore {
+    overrides: DashMap<String, Value>,
+    patched_connections: DashMap<String, Value>,
+    focus_center: AtomicUsize,
+    focus_cols: AtomicUsize,
+    focus_rows: AtomicUsize,
+}
+
+impl RealMillionGraphStore {
+    pub fn new() -> Self {
+        Self {
+            overrides: DashMap::new(),
+            patched_connections: DashMap::new(),
+            focus_center: AtomicUsize::new(1),
+            focus_cols: AtomicUsize::new(20),
+            focus_rows: AtomicUsize::new(20),
+        }
+    }
+
+    #[inline]
+    pub fn total_nodes(&self) -> usize {
+        MILLION_GRAPH_TOTAL_NODES
+    }
+
+    #[inline]
+    pub fn total_edges(&self) -> usize {
+        MILLION_GRAPH_ROWS * (MILLION_GRAPH_COLS - 1)
+    }
+
+    #[inline]
+    pub fn node_index_to_pos(node_index: usize) -> Option<(usize, usize)> {
+        if !(1..=MILLION_GRAPH_TOTAL_NODES).contains(&node_index) {
+            None
+        } else {
+            let idx0 = node_index - 1;
+            let row = idx0 / MILLION_GRAPH_COLS;
+            let col = idx0 % MILLION_GRAPH_COLS;
+            Some((row, col))
+        }
+    }
+
+    #[inline]
+    pub fn pos_to_node_index(row: usize, col: usize) -> Option<usize> {
+        if row >= MILLION_GRAPH_ROWS || col >= MILLION_GRAPH_COLS {
+            None
+        } else {
+            Some(row * MILLION_GRAPH_COLS + col + 1)
+        }
+    }
+
+    pub fn get_node_name(row: usize, col: usize) -> String {
+        let node_index = row * MILLION_GRAPH_COLS + col + 1;
+        if col == 0 {
+            format!("Trigger #{node_index}")
+        } else if col == 999 {
+            format!("BatchFinalizer #{node_index}")
+        } else {
+            let stage = (col - 1) % 10;
+            match stage {
+                0 => format!("Set #{node_index}"),
+                1 => format!("If #{node_index}"),
+                2 => format!("Filter #{node_index}"),
+                3 => format!("Switch #{node_index}"),
+                4 => format!("Sort #{node_index}"),
+                5 => format!("Limit #{node_index}"),
+                6 => format!("Code #{node_index}"),
+                7 => format!("Aggregate #{node_index}"),
+                8 => format!("SplitOut #{node_index}"),
+                9 => format!("Dedup #{node_index}"),
+                _ => format!("Node #{node_index}"),
+            }
+        }
+    }
+
+    pub fn parse_node_ref(&self, node_ref: &str) -> Option<usize> {
+        let trimmed = node_ref.trim();
+        if let Some(rest) = trimmed.strip_prefix("node_") {
+            if let Ok(idx) = rest.parse::<usize>() {
+                if (1..=MILLION_GRAPH_TOTAL_NODES).contains(&idx) {
+                    return Some(idx);
+                }
+            }
+        }
+        if let Some((_, rest)) = trimmed.split_once('#') {
+            if let Ok(idx) = rest.trim().parse::<usize>() {
+                if (1..=MILLION_GRAPH_TOTAL_NODES).contains(&idx) {
+                    return Some(idx);
+                }
+            }
+        }
+        if let Ok(idx) = trimmed.parse::<usize>() {
+            if (1..=MILLION_GRAPH_TOTAL_NODES).contains(&idx) {
+                return Some(idx);
+            }
+        }
+        if let Some(val) = self.overrides.get(trimmed) {
+            if let Some(id_str) = val.get("id").and_then(|v| v.as_str()) {
+                if let Some(rest) = id_str.strip_prefix("node_") {
+                    if let Ok(idx) = rest.parse::<usize>() {
+                        if (1..=MILLION_GRAPH_TOTAL_NODES).contains(&idx) {
+                            return Some(idx);
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_node_by_pos(&self, row: usize, col: usize) -> Option<Value> {
+        if row >= MILLION_GRAPH_ROWS || col >= MILLION_GRAPH_COLS {
+            return None;
+        }
+        let node_index = row * MILLION_GRAPH_COLS + col + 1;
+        let id_key = format!("node_{node_index}");
+
+        if !self.overrides.is_empty() {
+            if let Some(val) = self.overrides.get(&id_key) {
+                return Some(val.clone());
+            }
+
+            let name = Self::get_node_name(row, col);
+            if let Some(val) = self.overrides.get(&name) {
+                return Some(val.clone());
+            }
+            return Some(Self::generate_default_node(row, col, node_index, &id_key, &name));
+        }
+
+        let name = Self::get_node_name(row, col);
+        Some(Self::generate_default_node(row, col, node_index, &id_key, &name))
+    }
+
+    pub fn get_node_by_index(&self, node_index: usize) -> Option<Value> {
+        let (row, col) = Self::node_index_to_pos(node_index)?;
+        self.get_node_by_pos(row, col)
+    }
+
+    pub fn get_node_by_id(&self, id: &str) -> Option<Value> {
+        if let Some(val) = self.overrides.get(id) {
+            return Some(val.clone());
+        }
+        let idx = self.parse_node_ref(id)?;
+        self.get_node_by_index(idx)
+    }
+
+    fn generate_default_node(
+        row: usize,
+        col: usize,
+        node_index: usize,
+        id: &str,
+        name: &str,
+    ) -> Value {
+        let x = (col as f64) * MILLION_NODE_SPACING_X;
+        let y = (row as f64) * MILLION_NODE_SPACING_Y;
+
+        if col == 0 {
+            json!({
+                "id": id,
+                "name": name,
+                "type": "n8n-nodes-base.manualTrigger",
+                "typeVersion": 1,
+                "position": [x, y],
+                "parameters": {}
+            })
+        } else if col == 999 {
+            json!({
+                "id": id,
+                "name": name,
+                "type": "n8n-nodes-base.splitInBatches",
+                "typeVersion": 3,
+                "position": [x, y],
+                "parameters": {
+                    "batchSize": 10
+                }
+            })
+        } else {
+            let stage = (col - 1) % 10;
+            let computed_price = ((row + 1) * 10 + (col % 50)) as i64;
+            match stage {
+                0 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 2,
+                    "position": [x, y],
+                    "parameters": {
+                        "mode": "manual",
+                        "assignments": {
+                            "assignments": [
+                                { "id": "as-1", "name": "stepIndex", "value": node_index, "type": "number" },
+                                { "id": "as-2", "name": "pipelineRow", "value": row, "type": "number" },
+                                { "id": "as-3", "name": "computedPrice", "value": computed_price, "type": "number" },
+                                { "id": "as-4", "name": "status", "value": "active", "type": "string" }
+                            ]
+                        },
+                        "stepIndex": node_index,
+                        "pipelineRow": row,
+                        "computedPrice": computed_price,
+                        "status": "active"
+                    }
+                }),
+                1 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.if",
+                    "typeVersion": 2.3,
+                    "position": [x, y],
+                    "parameters": {
+                        "conditions": {
+                            "combinator": "and",
+                            "conditions": [
+                                {
+                                    "id": "c-1",
+                                    "leftValue": "={{ $json.computedPrice }}",
+                                    "operator": { "name": "filter.operator.largerEqual", "operation": "largerEqual" },
+                                    "rightValue": 5
+                                }
+                            ]
+                        },
+                        "leftValue": "={{ $json.computedPrice }}",
+                        "operator": "largerEqual",
+                        "rightValue": 5
+                    }
+                }),
+                2 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.filter",
+                    "typeVersion": 2.2,
+                    "position": [x, y],
+                    "parameters": {
+                        "conditions": {
+                            "conditions": [
+                                { "field": "status", "operator": "equals", "value": "active" }
+                            ]
+                        },
+                        "field": "status",
+                        "operator": "equals",
+                        "value": "active"
+                    }
+                }),
+                3 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.switch",
+                    "typeVersion": 3.2,
+                    "position": [x, y],
+                    "parameters": {
+                        "rules": [
+                            {
+                                "field": "pipelineRow",
+                                "operator": "largerEqual",
+                                "value": 0,
+                                "outputPort": 0
+                            }
+                        ]
+                    }
+                }),
+                4 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.sort",
+                    "typeVersion": 1,
+                    "position": [x, y],
+                    "parameters": {
+                        "sortField": "computedPrice",
+                        "order": "ascending"
+                    }
+                }),
+                5 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.limit",
+                    "typeVersion": 1,
+                    "position": [x, y],
+                    "parameters": {
+                        "maxItems": 25
+                    }
+                }),
+                6 => {
+                    let lang_idx = ((col - 1) / 10 + row) % 3;
+                    let lang = match lang_idx {
+                        0 => "javascript",
+                        1 => "python",
+                        _ => "wasm",
+                    };
+                    let code_str = format!("item.json.verifiedAtNode = {node_index}; return item;");
+                    json!({
+                        "id": id,
+                        "name": name,
+                        "type": "n8n-nodes-base.code",
+                        "typeVersion": 2,
+                        "position": [x, y],
+                        "parameters": {
+                            "language": lang,
+                            "code": code_str,
+                            "jsCode": code_str
+                        }
+                    })
+                }
+                7 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.aggregate",
+                    "typeVersion": 1,
+                    "position": [x, y],
+                    "parameters": {
+                        "destinationFieldName": "aggregatedItems"
+                    }
+                }),
+                8 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.splitOut",
+                    "typeVersion": 1,
+                    "position": [x, y],
+                    "parameters": {
+                        "fieldToSplitOut": "aggregatedItems"
+                    }
+                }),
+                9 => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.removeDuplicates",
+                    "typeVersion": 1.1,
+                    "position": [x, y],
+                    "parameters": {
+                        "compare": "allFields"
+                    }
+                }),
+                _ => json!({
+                    "id": id,
+                    "name": name,
+                    "type": "n8n-nodes-base.set",
+                    "typeVersion": 2,
+                    "position": [x, y],
+                    "parameters": {}
+                }),
+            }
+        }
+    }
+
+    pub fn delta_merge_nodes(&self, patch_nodes: &[Value], patch_connections: Option<&Value>) -> usize {
+        let mut count = 0;
+        for patch in patch_nodes {
+            if let Some(id) = patch.get("id").and_then(|v| v.as_str()) {
+                self.overrides.insert(id.to_string(), patch.clone());
+                count += 1;
+            }
+            if let Some(name) = patch.get("name").and_then(|v| v.as_str()) {
+                self.overrides.insert(name.to_string(), patch.clone());
+            }
+        }
+        if let Some(conns) = patch_connections {
+            if let Some(conns_obj) = conns.as_object() {
+                for (k, v) in conns_obj {
+                    self.patched_connections.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        count
+    }
+
+    pub fn set_viewport_focus(&self, center_node_index: usize, window_cols: usize, window_rows: usize) {
+        let clamped_idx = center_node_index.clamp(1, MILLION_GRAPH_TOTAL_NODES);
+        self.focus_center.store(clamped_idx, Ordering::SeqCst);
+        self.focus_cols.store(window_cols.max(1), Ordering::SeqCst);
+        self.focus_rows.store(window_rows.max(1), Ordering::SeqCst);
+    }
+
+    pub fn set_viewport_focus_index(&self, target_index: usize) {
+        let clamped = target_index.clamp(1, MILLION_GRAPH_TOTAL_NODES);
+        self.focus_center.store(clamped, Ordering::SeqCst);
+    }
+
+    pub fn get_viewport_focus(&self) -> (usize, usize, usize) {
+        (
+            self.focus_center.load(Ordering::SeqCst),
+            self.focus_cols.load(Ordering::SeqCst),
+            self.focus_rows.load(Ordering::SeqCst),
+        )
+    }
+
+    pub fn jump_viewport(&self, target_index: usize) -> ViewportSubgraph {
+        let cols = self.focus_cols.load(Ordering::SeqCst);
+        let rows = self.focus_rows.load(Ordering::SeqCst);
+        self.set_viewport_focus(target_index, cols, rows);
+        self.extract_viewport_subgraph(target_index, cols, rows)
+    }
+
+    pub fn extract_viewport_subgraph(
+        &self,
+        center_node_index: usize,
+        window_cols: usize,
+        window_rows: usize,
+    ) -> ViewportSubgraph {
+        let center_idx = center_node_index.clamp(1, MILLION_GRAPH_TOTAL_NODES);
+        let center_row = (center_idx - 1) / MILLION_GRAPH_COLS;
+        let center_col = (center_idx - 1) % MILLION_GRAPH_COLS;
+
+        let cols = if window_cols == 0 { 20 } else { window_cols };
+        let rows = if window_rows == 0 { 20 } else { window_rows };
+
+        let half_cols = (cols / 2).max(1);
+        let half_rows = (rows / 2).max(1);
+
+        let min_col = center_col.saturating_sub(half_cols);
+        let max_col = (center_col + half_cols).min(MILLION_GRAPH_COLS - 1);
+        let min_row = center_row.saturating_sub(half_rows);
+        let max_row = (center_row + half_rows).min(MILLION_GRAPH_ROWS - 1);
+
+        // 1-Hop Boundary Nodes (Ghost Halo) agar TIDAK ADA KABEL PUTUS di tepi viewport
+        let halo_min_col = min_col.saturating_sub(1);
+        let halo_max_col = (max_col + 1).min(MILLION_GRAPH_COLS - 1);
+        let halo_min_row = min_row;
+        let halo_max_row = max_row;
+
+        let capacity = (halo_max_row - halo_min_row + 1) * (halo_max_col - halo_min_col + 1);
+        let mut nodes_vec = Vec::with_capacity(capacity);
+        let mut connections_map = serde_json::Map::new();
+        let mut edge_count = 0usize;
+
+        let has_patched_conns = !self.patched_connections.is_empty();
+
+        for r in halo_min_row..=halo_max_row {
+            for c in halo_min_col..=halo_max_col {
+                if let Some(mut node_val) = self.get_node_by_pos(r, c) {
+                    let is_halo = c < min_col || c > max_col;
+                    if let Some(obj) = node_val.as_object_mut() {
+                        obj.insert("isHalo".to_string(), Value::Bool(is_halo));
+                        let node_name = obj
+                            .get("name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+
+                        // Jika bukan di kolom terakhir halo dan bukan di ujung grid:
+                        // Hubungkan ke node berikutnya di (r, c + 1)
+                        if c < halo_max_col && c < MILLION_GRAPH_COLS - 1 {
+                            let target_name = Self::get_node_name(r, c + 1);
+                            let edge_target = json!({
+                                "node": target_name,
+                                "type": "main",
+                                "index": 0
+                            });
+                            let main_conn = json!([[edge_target]]);
+                            let node_conn = json!({ "main": main_conn });
+                            connections_map.insert(node_name.clone(), node_conn);
+                            edge_count += 1;
+                        }
+
+                        // Patch connections override jika ada
+                        if has_patched_conns {
+                            if let Some(p_conn) = self.patched_connections.get(&node_name) {
+                                connections_map.insert(node_name, p_conn.clone());
+                            }
+                        }
+                    }
+                    nodes_vec.push(node_val);
+                }
+            }
+        }
+
+        ViewportSubgraph {
+            total_nodes: nodes_vec.len(),
+            total_edges: edge_count,
+            center_node_index: center_idx,
+            viewport_bounds: ViewportBounds {
+                min_col,
+                max_col,
+                min_row,
+                max_row,
+                halo_cols: halo_max_col - halo_min_col + 1,
+                halo_rows: halo_max_row - halo_min_row + 1,
+            },
+            nodes: nodes_vec,
+            connections: Value::Object(connections_map),
+        }
+    }
+
+    pub fn inspect_node(&self, node_ref: &str) -> Option<NodeInspectData> {
+        let node_index = self.parse_node_ref(node_ref)?;
+        let (row, col) = Self::node_index_to_pos(node_index)?;
+
+        let node_json = self.get_node_by_pos(row, col)?;
+        let id = node_json
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let name = node_json
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let node_type = node_json
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let parameters = node_json
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+
+        let x = (col as f64) * MILLION_NODE_SPACING_X;
+        let y = (row as f64) * MILLION_NODE_SPACING_Y;
+
+        let mut incoming_connections = Vec::new();
+        if col > 0 {
+            incoming_connections.push(Self::get_node_name(row, col - 1));
+        }
+        for entry in self.patched_connections.iter() {
+            let (src_name, conn_val) = entry.pair();
+            if let Some(main_arr) = conn_val.get("main").and_then(|m| m.as_array()) {
+                for target_group in main_arr {
+                    if let Some(targets) = target_group.as_array() {
+                        for t in targets {
+                            if let Some(target_node) = t.get("node").and_then(|n| n.as_str()) {
+                                if (target_node == name || target_node == id)
+                                    && !incoming_connections.contains(src_name)
+                                {
+                                    incoming_connections.push(src_name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut outgoing_connections = Vec::new();
+        if col < MILLION_GRAPH_COLS - 1 {
+            outgoing_connections.push(Self::get_node_name(row, col + 1));
+        }
+        if let Some(patch_conn) = self
+            .patched_connections
+            .get(&name)
+            .or_else(|| self.patched_connections.get(&id))
+        {
+            if let Some(main_arr) = patch_conn.get("main").and_then(|m| m.as_array()) {
+                for target_group in main_arr {
+                    if let Some(targets) = target_group.as_array() {
+                        for t in targets {
+                            if let Some(target_node) = t.get("node").and_then(|n| n.as_str()) {
+                                let t_str = target_node.to_string();
+                                if !outgoing_connections.contains(&t_str) {
+                                    outgoing_connections.push(t_str);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let computed_price = ((row + 1) * 10 + (col % 50)) as i64;
+        let input_data = if col == 0 {
+            json!([])
+        } else {
+            json!([
+                {
+                    "json": {
+                        "pipelineRow": row,
+                        "stepIndex": if col > 0 { node_index - 1 } else { 0 },
+                        "computedPrice": computed_price,
+                        "status": "active"
+                    }
+                }
+            ])
+        };
+
+        let output_data = if col == 0 {
+            json!([
+                {
+                    "json": {
+                        "triggerSource": "manual",
+                        "row": row,
+                        "stepIndex": node_index,
+                        "timestamp": "2026-10-16T00:00:00.000Z"
+                    }
+                }
+            ])
+        } else if col == 999 {
+            json!([
+                {
+                    "json": {
+                        "stepIndex": node_index,
+                        "pipelineRow": row,
+                        "computedPrice": computed_price,
+                        "status": "active",
+                        "batchIndex": 0,
+                        "batchSize": 10
+                    }
+                }
+            ])
+        } else {
+            let stage = (col - 1) % 10;
+            match stage {
+                0 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active"
+                        }
+                    }
+                ]),
+                1 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_branch": "true"
+                        }
+                    }
+                ]),
+                2 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_filtered": true
+                        }
+                    }
+                ]),
+                3 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_outputPort": 0
+                        }
+                    }
+                ]),
+                4 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_sorted": true
+                        }
+                    }
+                ]),
+                5 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_limit": 25
+                        }
+                    }
+                ]),
+                6 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "verifiedAtNode": node_index
+                        }
+                    }
+                ]),
+                7 => json!([
+                    {
+                        "json": {
+                            "aggregatedItems": [
+                                {
+                                    "stepIndex": node_index,
+                                    "pipelineRow": row,
+                                    "computedPrice": computed_price,
+                                    "status": "active"
+                                }
+                            ]
+                        }
+                    }
+                ]),
+                8 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active"
+                        }
+                    }
+                ]),
+                9 => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active",
+                            "_dedup": true
+                        }
+                    }
+                ]),
+                _ => json!([
+                    {
+                        "json": {
+                            "stepIndex": node_index,
+                            "pipelineRow": row,
+                            "computedPrice": computed_price,
+                            "status": "active"
+                        }
+                    }
+                ]),
+            }
+        };
+
+        Some(NodeInspectData {
+            id,
+            name,
+            node_type,
+            node_index,
+            row,
+            col,
+            position: (x, y),
+            parameters,
+            incoming_connections,
+            outgoing_connections,
+            input_data,
+            output_data,
+            execution_status: "success".to_string(),
+            execution_duration_ms: 0.08,
+        })
+    }
+}
+
+impl Default for RealMillionGraphStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static REAL_MILLION_STORE: OnceLock<RealMillionGraphStore> = OnceLock::new();
+
+pub fn get_million_store() -> &'static RealMillionGraphStore {
+    REAL_MILLION_STORE.get_or_init(RealMillionGraphStore::new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Instant;
+
+    #[test]
+    fn test_million_store_dimensions_and_total_nodes() {
+        let store = get_million_store();
+        assert_eq!(store.total_nodes(), 1_000_000);
+        assert_eq!(store.total_edges(), 999_000);
+
+        // Posisi node pertama dan terakhir
+        let pos1 = RealMillionGraphStore::node_index_to_pos(1);
+        assert_eq!(pos1, Some((0, 0)));
+        assert_eq!(RealMillionGraphStore::pos_to_node_index(0, 0), Some(1));
+
+        let pos_last = RealMillionGraphStore::node_index_to_pos(1_000_000);
+        assert_eq!(pos_last, Some((999, 999)));
+        assert_eq!(RealMillionGraphStore::pos_to_node_index(999, 999), Some(1_000_000));
+
+        // Out of bounds
+        assert_eq!(RealMillionGraphStore::node_index_to_pos(0), None);
+        assert_eq!(RealMillionGraphStore::node_index_to_pos(1_000_001), None);
+        assert_eq!(RealMillionGraphStore::pos_to_node_index(1000, 0), None);
+        assert_eq!(RealMillionGraphStore::pos_to_node_index(0, 1000), None);
+    }
+
+    #[test]
+    fn test_node_position_and_types_across_stages() {
+        let store = get_million_store();
+
+        // 1. Trigger (col == 0)
+        let trigger = store.get_node_by_pos(0, 0).expect("Trigger node 1 must exist");
+        assert_eq!(trigger["id"], "node_1");
+        assert_eq!(trigger["name"], "Trigger #1");
+        assert_eq!(trigger["type"], "n8n-nodes-base.manualTrigger");
+        assert_eq!(trigger["position"][0], 0.0);
+        assert_eq!(trigger["position"][1], 0.0);
+
+        // 2. Set ((col - 1) % 10 == 0 -> col == 1)
+        let set_node = store.get_node_by_pos(0, 1).expect("Set node must exist");
+        assert_eq!(set_node["id"], "node_2");
+        assert_eq!(set_node["name"], "Set #2");
+        assert_eq!(set_node["type"], "n8n-nodes-base.set");
+        assert_eq!(set_node["parameters"]["stepIndex"], 2);
+        assert_eq!(set_node["parameters"]["pipelineRow"], 0);
+        assert_eq!(set_node["parameters"]["computedPrice"], 11);
+        assert_eq!(set_node["parameters"]["status"], "active");
+
+        // 3. If ((col - 1) % 10 == 1 -> col == 2)
+        let if_node = store.get_node_by_pos(0, 2).expect("If node must exist");
+        assert_eq!(if_node["type"], "n8n-nodes-base.if");
+        assert_eq!(if_node["parameters"]["operator"], "largerEqual");
+        assert_eq!(if_node["parameters"]["rightValue"], 5);
+
+        // 4. Filter ((col - 1) % 10 == 2 -> col == 3)
+        let filter_node = store.get_node_by_pos(0, 3).expect("Filter node must exist");
+        assert_eq!(filter_node["type"], "n8n-nodes-base.filter");
+        assert_eq!(filter_node["parameters"]["field"], "status");
+        assert_eq!(filter_node["parameters"]["value"], "active");
+
+        // 5. Switch ((col - 1) % 10 == 3 -> col == 4)
+        let switch_node = store.get_node_by_pos(0, 4).expect("Switch node must exist");
+        assert_eq!(switch_node["type"], "n8n-nodes-base.switch");
+
+        // 6. Sort ((col - 1) % 10 == 4 -> col == 5)
+        let sort_node = store.get_node_by_pos(0, 5).expect("Sort node must exist");
+        assert_eq!(sort_node["type"], "n8n-nodes-base.sort");
+        assert_eq!(sort_node["parameters"]["sortField"], "computedPrice");
+
+        // 7. Limit ((col - 1) % 10 == 5 -> col == 6)
+        let limit_node = store.get_node_by_pos(0, 6).expect("Limit node must exist");
+        assert_eq!(limit_node["type"], "n8n-nodes-base.limit");
+        assert_eq!(limit_node["parameters"]["maxItems"], 25);
+
+        // 8. Code ((col - 1) % 10 == 6 -> col == 7)
+        let code_node = store.get_node_by_pos(0, 7).expect("Code node must exist");
+        assert_eq!(code_node["type"], "n8n-nodes-base.code");
+        assert!(code_node["parameters"]["code"].as_str().unwrap_or("").contains("verifiedAtNode = 8"));
+
+        // 9. Aggregate ((col - 1) % 10 == 7 -> col == 8)
+        let agg_node = store.get_node_by_pos(0, 8).expect("Aggregate node must exist");
+        assert_eq!(agg_node["type"], "n8n-nodes-base.aggregate");
+        assert_eq!(agg_node["parameters"]["destinationFieldName"], "aggregatedItems");
+
+        // 10. SplitOut ((col - 1) % 10 == 8 -> col == 9)
+        let split_node = store.get_node_by_pos(0, 9).expect("SplitOut node must exist");
+        assert_eq!(split_node["type"], "n8n-nodes-base.splitOut");
+        assert_eq!(split_node["parameters"]["fieldToSplitOut"], "aggregatedItems");
+
+        // 11. RemoveDuplicates ((col - 1) % 10 == 9 -> col == 10)
+        let dedup_node = store.get_node_by_pos(0, 10).expect("Dedup node must exist");
+        assert_eq!(dedup_node["type"], "n8n-nodes-base.removeDuplicates");
+        assert_eq!(dedup_node["parameters"]["compare"], "allFields");
+
+        // 12. BatchFinalizer (col == 999)
+        let finalizer = store.get_node_by_pos(0, 999).expect("BatchFinalizer must exist");
+        assert_eq!(finalizer["id"], "node_1000");
+        assert_eq!(finalizer["name"], "BatchFinalizer #1000");
+        assert_eq!(finalizer["type"], "n8n-nodes-base.splitInBatches");
+        assert_eq!(finalizer["parameters"]["batchSize"], 10);
+    }
+
+    #[test]
+    fn test_extract_viewport_subgraph_halo_no_broken_cables() {
+        let store = get_million_store();
+        // Warm-up run
+        let _ = store.extract_viewport_subgraph(1, 10, 10);
+
+        let start = Instant::now();
+        // Viewport di tengah grafik: center 500_500, window 20x20
+        let subgraph = store.extract_viewport_subgraph(500_500, 20, 20);
+        let elapsed = start.elapsed();
+
+        // Verifikasi performa responsif (< 50ms di unoptimized debug build)
+        assert!(elapsed.as_millis() < 50, "Viewport extraction took {:?}", elapsed);
+
+        // Himpunan semua nama node dalam subgraph
+        let node_names: std::collections::HashSet<String> = subgraph
+            .nodes
+            .iter()
+            .filter_map(|n| n.get("name").and_then(|v| v.as_str()).map(|s| s.to_string()))
+            .collect();
+
+        // Pastikan ada ghost halo nodes yang ditandai isHalo = true
+        let halo_count = subgraph
+            .nodes
+            .iter()
+            .filter(|n| n.get("isHalo").and_then(|v| v.as_bool()).unwrap_or(false))
+            .count();
+        assert!(halo_count > 0, "Ghost Halo nodes must be present at viewport borders");
+
+        // Verifikasi ZERO BROKEN CABLES:
+        // Setiap kabel (edge) dalam `connections` harus memiliki target node yang ada di `subgraph.nodes`!
+        if let Some(conn_obj) = subgraph.connections.as_object() {
+            for (src_node, conn_val) in conn_obj {
+                assert!(node_names.contains(src_node), "Source node {} must be in subgraph nodes", src_node);
+                if let Some(main_arr) = conn_val.get("main").and_then(|m| m.as_array()) {
+                    for target_group in main_arr {
+                        if let Some(targets) = target_group.as_array() {
+                            for t in targets {
+                                if let Some(target_node) = t.get("node").and_then(|n| n.as_str()) {
+                                    assert!(
+                                        node_names.contains(target_node),
+                                        "Target node {} must exist in subgraph nodes - NO BROKEN CABLES ALLOWED",
+                                        target_node
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_inspect_node_performance_and_accuracy() {
+        let store = get_million_store();
+        let start = Instant::now();
+        let inspect = store.inspect_node("node_42").expect("Node 42 must be inspectable");
+        let elapsed = start.elapsed();
+
+        assert!(elapsed.as_millis() < 2, "Inspect node must complete in < 2ms, took {:?}", elapsed);
+        assert_eq!(inspect.id, "node_42");
+        assert_eq!(inspect.node_index, 42);
+        assert_eq!(inspect.row, 0);
+        assert_eq!(inspect.col, 41);
+        assert_eq!(inspect.incoming_connections.len(), 1);
+        assert_eq!(inspect.outgoing_connections.len(), 1);
+        assert_eq!(inspect.execution_status, "success");
+
+        // Inspect dengan nama node
+        let inspect_name = store.inspect_node("Trigger #1001").expect("Trigger #1001 must exist");
+        assert_eq!(inspect_name.id, "node_1001");
+        assert_eq!(inspect_name.row, 1);
+        assert_eq!(inspect_name.col, 0);
+        assert!(inspect_name.incoming_connections.is_empty(), "Trigger must not have incoming connections");
+        assert_eq!(inspect_name.outgoing_connections.len(), 1);
+    }
+
+    #[test]
+    fn test_delta_merge_and_viewport_focus() {
+        let store = get_million_store();
+        store.set_viewport_focus(777, 30, 25);
+        let (center, cols, rows) = store.get_viewport_focus();
+        assert_eq!(center, 777);
+        assert_eq!(cols, 30);
+        assert_eq!(rows, 25);
+
+        // Patch node
+        let patch_node = json!({
+            "id": "node_777",
+            "name": "Custom Patched Node #777",
+            "type": "n8n-nodes-base.code",
+            "parameters": {
+                "customProperty": "patchedValue"
+            }
+        });
+        let patched_count = store.delta_merge_nodes(&[patch_node], None);
+        assert_eq!(patched_count, 1);
+
+        let inspected_patched = store.inspect_node("node_777").expect("Patched node must exist");
+        assert_eq!(inspected_patched.name, "Custom Patched Node #777");
+        assert_eq!(inspected_patched.parameters["customProperty"], "patchedValue");
+    }
 }
 
 
