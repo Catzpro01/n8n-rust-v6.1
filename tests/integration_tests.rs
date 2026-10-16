@@ -926,7 +926,7 @@ async fn test_write_behind_batch_zstd_executions() {
         assert_eq!(res.status(), StatusCode::OK);
         let bytes = res.into_body().collect().await.unwrap().to_bytes();
         let exec_list: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
-        let records = exec_list["data"].as_array().unwrap();
+        let records = exec_list["data"]["results"].as_array().unwrap();
         assert_eq!(
             records.len(),
             total_items,
@@ -950,9 +950,11 @@ async fn test_write_behind_batch_zstd_executions() {
         let detail_42: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(detail_42["data"]["id"], "exec-batch-042");
         assert_eq!(detail_42["data"]["status"], "success");
-        assert_eq!(detail_42["data"]["data"]["batchIndex"], 42);
+        let data_str_42 = detail_42["data"]["data"].as_str().unwrap();
+        let flatted_42 = n8n_rust_v5::api::parse_flatted_data(data_str_42).unwrap();
+        assert_eq!(flatted_42["batchIndex"], 42);
         assert_eq!(
-            detail_42["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
+            flatted_42["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
                 [0]["json"]["item"],
             42
         );
@@ -974,9 +976,11 @@ async fn test_write_behind_batch_zstd_executions() {
         let detail_99: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(detail_99["data"]["id"], "exec-batch-099");
         assert_eq!(detail_99["data"]["status"], "error");
-        assert_eq!(detail_99["data"]["data"]["batchIndex"], 99);
+        let data_str_99 = detail_99["data"]["data"].as_str().unwrap();
+        let flatted_99 = n8n_rust_v5::api::parse_flatted_data(data_str_99).unwrap();
+        assert_eq!(flatted_99["batchIndex"], 99);
         assert_eq!(
-            detail_99["data"]["data"]["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
+            flatted_99["resultData"]["runData"]["Manual Trigger"][0]["data"]["main"][0]
                 [0]["json"]["checksum"],
             "crc32-1287"
         );
@@ -1146,7 +1150,9 @@ async fn test_engine_dag_execution_and_rest_run() {
         assert_eq!(db_exec["data"]["status"], "success");
 
         // Verify Vue Canvas full ITaskData contract across all 5 executed nodes
-        let run_data = &db_exec["data"]["data"]["resultData"]["runData"];
+        let flatted_data_str = db_exec["data"]["data"].as_str().unwrap();
+        let unflattened = n8n_rust_v5::api::parse_flatted_data(flatted_data_str).unwrap();
+        let run_data = &unflattened["resultData"]["runData"];
         for node_name in ["Trigger", "Branch1", "Branch2", "MergeNodes", "PostMergeSet"] {
             let task_entry = &run_data[node_name][0];
             assert_eq!(task_entry["executionStatus"], "success");

@@ -1740,6 +1740,22 @@ pub fn enrich_workflow(wf: &WorkflowRecord) -> Value {
         });
         map.entry("usedCredentials".to_string()).or_insert_with(|| json!([]));
         map.entry("projectId".to_string()).or_insert_with(|| json!("asT9jsAO0Pvbl5wZ"));
+        map.insert(
+            "activeVersionId".to_string(),
+            if wf.active {
+                json!(wf.version_id)
+            } else {
+                Value::Null
+            },
+        );
+        map.insert(
+            "publicationStatus".to_string(),
+            if wf.active {
+                json!("published")
+            } else {
+                Value::Null
+            },
+        );
     }
     val
 }
@@ -2701,8 +2717,39 @@ pub fn serde_to_flatted(v: &Value) -> flatted::Value {
     }
 }
 
+pub fn flatted_to_serde(v: &flatted::Value) -> Value {
+    match v {
+        flatted::Value::Null => Value::Null,
+        flatted::Value::Bool(b) => Value::Bool(*b),
+        flatted::Value::Number(n) => match n {
+            flatted::Number::Int(i) => json!(i),
+            flatted::Number::UInt(u) => json!(u),
+            flatted::Number::Float(f) => json!(f),
+        },
+        flatted::Value::Str(s) => Value::String(s.clone()),
+        flatted::Value::Array(arr) => {
+            let borrowed = arr.borrow();
+            let items: Vec<Value> = borrowed.iter().map(flatted_to_serde).collect();
+            Value::Array(items)
+        }
+        flatted::Value::Object(obj) => {
+            let borrowed = obj.borrow();
+            let mut map = serde_json::Map::new();
+            for (k, val) in borrowed.iter() {
+                map.insert(k.clone(), flatted_to_serde(val));
+            }
+            Value::Object(map)
+        }
+    }
+}
+
+pub fn parse_flatted_data(raw: &str) -> Result<Value, String> {
+    flatted::parse(raw, None)
+        .map(|v| flatted_to_serde(&v))
+        .map_err(|e| format!("Failed to parse flatted data: {:?}", e))
+}
+
 pub async fn list_executions(
-    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
@@ -2714,20 +2761,6 @@ pub async fn list_executions(
 
     match state.db.list_executions() {
         Ok(list) => {
-            let is_browser_or_client = headers.get(header::USER_AGENT).is_some()
-                || params.contains_key("filter")
-                || params.contains_key("cursor")
-                || params.contains_key("limit");
-
-            if !is_browser_or_client {
-                let count = list.len();
-                return (
-                    StatusCode::OK,
-                    Json(json!({ "data": list, "count": count })),
-                )
-                    .into_response();
-            }
-
             let filtered: Vec<_> = list
                 .into_iter()
                 .filter(|e| {
@@ -2822,17 +2855,11 @@ pub async fn list_executions(
 }
 
 pub async fn get_execution(
-    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.get_execution(&id) {
         Ok(Some(exec)) => {
-            let is_browser_or_client = headers.get(header::USER_AGENT).is_some();
-            if !is_browser_or_client {
-                return (StatusCode::OK, Json(json!({ "data": exec }))).into_response();
-            }
-
             let wf_data = if let Some(ref w_id) = exec.workflow_id {
                 state
                     .db
@@ -2873,26 +2900,34 @@ pub async fn get_execution(
                 })
             };
 
-            let result_data = if let Some(rd) = exec.data.get("resultData") {
-                rd.clone()
+            let mut full_execution_data = if let Value::Object(map) = exec.data.clone() {
+                map
             } else {
-                exec.data.clone()
+                serde_json::Map::new()
             };
+            full_execution_data
+                .entry("version".to_string())
+                .or_insert_with(|| json!(1));
+            full_execution_data
+                .entry("startData".to_string())
+                .or_insert_with(|| json!({}));
+            if !full_execution_data.contains_key("resultData") {
+                full_execution_data.insert("resultData".to_string(), json!({}));
+            }
+            full_execution_data
+                .entry("executionData".to_string())
+                .or_insert_with(|| {
+                    json!({
+                        "contextData": {},
+                        "nodeExecutionStack": [],
+                        "metadata": {},
+                        "waitingExecution": {},
+                        "waitingExecutionSource": {}
+                    })
+                });
 
-            let full_execution_data = json!({
-                "version": 1,
-                "startData": {},
-                "resultData": result_data,
-                "executionData": {
-                    "contextData": {},
-                    "nodeExecutionStack": [],
-                    "metadata": {},
-                    "waitingExecution": {},
-                    "waitingExecutionSource": {}
-                }
-            });
-
-            let flatted_val = serde_to_flatted(&full_execution_data);
+            let full_val = Value::Object(full_execution_data);
+            let flatted_val = serde_to_flatted(&full_val);
             let flatted_data_str = flatted::stringify(&flatted_val, None, None);
 
             (
