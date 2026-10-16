@@ -82,27 +82,73 @@ impl ExecutionNotifier for PushHubNotifier {
             "type": "nodeExecuteBefore",
             "data": {
                 "executionId": execution_id,
-                "nodeName": node_name
+                "nodeName": node_name,
+                "executionIndex": 0
             }
         }));
     }
 
     fn notify_node_after(&self, execution_id: &str, node_name: &str, output: &Value) {
+        let now_ms = Utc::now().timestamp_millis();
+        let main_items: Vec<Value> = if let Some(arr) = output.as_array() {
+            arr.iter().map(|item| json!({ "json": item })).collect()
+        } else {
+            vec![json!({ "json": output })]
+        };
+        let items_count = main_items.len().max(1);
+
         self.hub.broadcast(&json!({
             "type": "nodeExecuteAfter",
             "data": {
                 "executionId": execution_id,
                 "nodeName": node_name,
-                "data": output
+                "executionIndex": 0,
+                "itemCountByConnectionType": {
+                    "main": [[ items_count ]]
+                },
+                "data": {
+                    "startTime": now_ms,
+                    "executionTime": 5,
+                    "executionStatus": "success",
+                    "executionIndex": 0,
+                    "source": []
+                }
+            }
+        }));
+
+        self.hub.broadcast(&json!({
+            "type": "nodeExecuteAfterData",
+            "data": {
+                "executionId": execution_id,
+                "nodeName": node_name,
+                "executionIndex": 0,
+                "executionStatus": "success",
+                "data": {
+                    "startTime": now_ms,
+                    "executionTime": 5,
+                    "executionStatus": "success",
+                    "executionIndex": 0,
+                    "source": [],
+                    "data": {
+                        "main": [ main_items ]
+                    }
+                }
             }
         }));
     }
 
-    fn notify_finished(&self, execution_id: &str, status: &str, duration_ms: u64) {
+    fn notify_finished(
+        &self,
+        execution_id: &str,
+        status: &str,
+        duration_ms: u64,
+        workflow_id: Option<&str>,
+    ) {
         self.hub.broadcast(&json!({
             "type": "executionFinished",
             "data": {
                 "executionId": execution_id,
+                "workflowId": workflow_id,
                 "status": status,
                 "durationMs": duration_ms
             }
@@ -142,7 +188,7 @@ pub const SETTINGS_ENTERPRISE_PAYLOAD: &str = r#"{
     "endpointWebhook": "webhook",
     "endpointWebhookTest": "webhook-test",
     "endpointWebhookWaiting": "webhook-waiting",
-    "endpointHealth": "healthz",
+    "endpointHealth": "/healthz",
     "saveDataErrorExecution": "all",
     "saveDataSuccessExecution": "all",
     "saveManualExecutions": true,
@@ -259,7 +305,7 @@ pub const SETTINGS_ENTERPRISE_PAYLOAD: &str = r#"{
     "unverifiedCommunityNodesEnabled": false,
     "communityNodesManagedByEnv": false,
     "deployment": {
-      "type": "self-hosted"
+      "type": "default"
     },
     "allowedModules": {
       "builtIn": [],
@@ -351,11 +397,35 @@ pub const SETTINGS_ENTERPRISE_PAYLOAD: &str = r#"{
     },
     "evaluation": {
       "quota": -1,
-      "collectionsEnabled": true,
-      "configEvalsEnabled": true,
-      "agentEvalsEnabled": true
+      "collectionsEnabled": false,
+      "configEvalsEnabled": false,
+      "agentEvalsEnabled": false
     },
-    "activeModules": [],
+    "activeModules": [
+      "workflow-builder",
+      "policy-infrastructure",
+      "inbound-auth-core",
+      "insights",
+      "community-packages",
+      "data-table",
+      "oauth-server",
+      "mcp",
+      "breaking-changes",
+      "chat-hub",
+      "quick-connect",
+      "favorites",
+      "redaction",
+      "instance-registry",
+      "otel",
+      "instance-version-history",
+      "encryption-key-manager",
+      "oauth-jwe",
+      "n8n-packages",
+      "runtime-credentials",
+      "mcp-registry",
+      "instance-ai",
+      "agents"
+    ],
     "canvasOnly": false,
     "collaboration": {
       "crdt": false
@@ -377,6 +447,60 @@ pub async fn settings() -> impl IntoResponse {
 // Auto-Authenticated Owner & Session Endpoints
 // ---------------------------------------------------------------------------
 
+pub fn project_scopes_array() -> Vec<&'static str> {
+    vec![
+        "agent:create", "agent:read", "agent:update", "agent:delete", "agent:list", "agent:execute", "agent:unpublish",
+        "workflow:create", "workflow:read", "workflow:export", "workflow:import", "workflow:update", "workflow:delete", "workflow:list", "workflow:execute", "workflow:execute-chat", "workflow:move", "workflow:unpublish", "workflow:unshare", "workflow:enableRedaction", "workflow:disableRedaction",
+        "credential:create", "credential:read", "credential:update", "credential:delete", "credential:list", "credential:move", "credential:unshare", "credential:connect", "credential:createEndUser",
+        "execution:read", "execution:list", "execution:reveal", "execution:delete",
+        "project:list", "project:read", "project:export",
+        "folder:create", "folder:read", "folder:update", "folder:delete", "folder:list", "folder:move",
+        "dataTable:create", "dataTable:delete", "dataTable:read", "dataTable:update", "dataTable:listProject", "dataTable:readRow", "dataTable:writeRow", "dataTable:readColumn", "dataTable:writeColumn",
+        "projectAiPreference:list", "projectAiPreference:read", "projectAiPreference:create", "projectAiPreference:update", "projectAiPreference:delete",
+    ]
+}
+
+pub fn global_scopes_array() -> Vec<&'static str> {
+    vec![
+        "agent:create", "agent:read", "agent:update", "agent:delete", "agent:list", "agent:execute", "agent:publish", "agent:unpublish", "agent:manage",
+        "aiAssistant:manage", "annotationTag:create", "annotationTag:read", "annotationTag:update", "annotationTag:delete", "annotationTag:list", "auditLogs:manage", "banner:dismiss",
+        "credential:create", "credential:read", "credential:update", "credential:delete", "credential:list", "credential:share", "credential:unshare", "credential:shareGlobally", "credential:move", "credential:connect", "credential:createEndUser", "credential:manageInstance", "credential:use", "credentialTypePolicy:manage",
+        "community:register", "communityPackage:install", "communityPackage:uninstall", "communityPackage:update", "communityPackage:list",
+        "eventBusDestination:create", "eventBusDestination:read", "eventBusDestination:update", "eventBusDestination:delete", "eventBusDestination:list", "eventBusDestination:test",
+        "externalSecretsProvider:create", "externalSecretsProvider:read", "externalSecretsProvider:update", "externalSecretsProvider:delete", "externalSecretsProvider:list", "externalSecretsProvider:sync", "externalSecret:list",
+        "ldap:manage", "ldap:sync", "license:manage", "logStreaming:manage", "nodeTypePolicy:manage", "orchestration:read", "orchestration:manage", "saml:manage", "securityAudit:generate", "securitySettings:manage",
+        "sourceControl:pull", "sourceControl:push", "sourceControl:manage", "sourceControl:read",
+        "gitConnection:create", "gitConnection:read", "gitConnection:update", "gitConnection:delete", "gitConnection:list", "gitConnection:clone", "gitConnection:push", "gitConnection:manageProjects", "gitConnection:pull",
+        "tag:create", "tag:read", "tag:update", "tag:delete", "tag:list",
+        "user:create", "user:read", "user:update", "user:delete", "user:list", "user:resetPassword", "user:generateInviteLink", "user:changeRole", "user:enforceMfa",
+        "variable:create", "variable:read", "variable:update", "variable:delete", "variable:list", "projectVariable:create", "projectVariable:read", "projectVariable:update", "projectVariable:delete", "projectVariable:list",
+        "aiPreference:create", "aiPreference:read", "aiPreference:update", "aiPreference:delete", "aiPreference:list", "projectAiPreference:create", "projectAiPreference:read", "projectAiPreference:update", "projectAiPreference:delete", "projectAiPreference:list",
+        "workflow:create", "workflow:read", "workflow:export", "workflow:import", "workflow:update", "workflow:publish", "workflow:unpublish", "workflow:delete", "workflow:list", "workflow:share", "workflow:unshare", "workflow:execute", "workflow:execute-chat", "workflow:move", "workflow:enableRedaction", "workflow:disableRedaction",
+        "workersView:manage", "project:list", "project:create", "project:read", "project:update", "project:delete", "project:export", "project:manageMembers",
+        "insights:list", "insights:read", "folder:move", "folder:read", "folder:update", "folder:delete", "folder:create", "folder:list", "oidc:manage", "provisioning:manage",
+        "dataTable:create", "dataTable:delete", "dataTable:read", "dataTable:update", "dataTable:list", "dataTable:listProject", "dataTable:readRow", "dataTable:writeRow", "dataTable:readColumn", "dataTable:writeColumn",
+        "role:manage", "role:read", "role:list", "mcp:manage", "mcp:oauth", "mcpApiKey:create", "mcpApiKey:rotate",
+        "chatHub:manage", "chatHub:message", "chatHubAgent:create", "chatHubAgent:read", "chatHubAgent:update", "chatHubAgent:delete", "chatHubAgent:list",
+        "breakingChanges:list", "breakingChanges:migrate", "execution:read", "execution:list", "execution:reveal", "execution:delete",
+        "apiKey:manage", "apiKey:create", "apiKey:update", "encryptionKey:manage",
+        "credentialResolver:create", "credentialResolver:read", "credentialResolver:update", "credentialResolver:delete", "credentialResolver:list",
+        "instanceAi:message", "instanceAi:manage", "instanceAi:gateway", "instanceAi:eval", "roleMappingRule:create", "roleMappingRule:read", "roleMappingRule:update", "roleMappingRule:delete", "roleMappingRule:list", "otel:manage"
+    ]
+}
+
+pub fn personal_project_payload() -> Value {
+    json!({
+        "id": "asT9jsAO0Pvbl5wZ",
+        "name": "Personal",
+        "type": "personal",
+        "createdAt": "2026-10-14T00:00:00.000Z",
+        "updatedAt": "2026-10-14T00:00:00.000Z",
+        "role": "project:personalOwner",
+        "icon": null,
+        "scopes": project_scopes_array()
+    })
+}
+
 fn owner_user_payload() -> Value {
     json!({
         "data": {
@@ -387,20 +511,8 @@ fn owner_user_payload() -> Value {
             "isOwner": true,
             "isPending": false,
             "role": "global:owner",
-            "globalScopes": [
-                "workflow:create", "workflow:read", "workflow:update", "workflow:delete", "workflow:execute", "workflow:list", "workflow:publish",
-                "credential:create", "credential:read", "credential:update", "credential:delete", "credential:list",
-                "user:create", "user:read", "user:update", "user:delete", "user:list",
-                "rbac:read", "rbac:update", "communityPackage:manage",
-                "auditLog:read", "cloud:manage", "instanceSettings:manage", "orchestration:read"
-            ],
-            "personalProject": {
-                "id": "project-personal-owner",
-                "name": "Personal",
-                "type": "personal",
-                "createdAt": "2026-10-14T00:00:00.000Z",
-                "updatedAt": "2026-10-14T00:00:00.000Z"
-            },
+            "globalScopes": global_scopes_array(),
+            "personalProject": personal_project_payload(),
             "settings": {
                 "userActivated": true
             }
@@ -439,30 +551,128 @@ pub async fn license_status() -> impl IntoResponse {
 
 pub async fn list_projects() -> impl IntoResponse {
     Json(json!({
-        "data": [
-            {
-                "id": "project-personal-owner",
-                "name": "Personal",
-                "type": "personal",
-                "createdAt": "2026-10-14T00:00:00.000Z",
-                "updatedAt": "2026-10-14T00:00:00.000Z",
-                "role": "project:personalOwner",
-                "icon": null
-            }
-        ]
+        "data": [ personal_project_payload() ]
+    }))
+}
+
+pub async fn my_projects() -> impl IntoResponse {
+    Json(json!({
+        "data": [ personal_project_payload() ]
+    }))
+}
+
+pub async fn get_projects_count() -> impl IntoResponse {
+    Json(json!({
+        "data": 1
     }))
 }
 
 pub async fn get_personal_project() -> impl IntoResponse {
     Json(json!({
+        "data": personal_project_payload()
+    }))
+}
+
+pub async fn get_project_by_id(Path(_id): Path<String>) -> impl IntoResponse {
+    Json(json!({
+        "data": personal_project_payload()
+    }))
+}
+
+pub async fn get_sharing_candidates() -> impl IntoResponse {
+    Json(json!({
+        "data": []
+    }))
+}
+
+pub async fn list_users() -> impl IntoResponse {
+    Json(json!({
         "data": {
-            "id": "project-personal-owner",
-            "name": "Personal",
-            "type": "personal",
-            "createdAt": "2026-10-14T00:00:00.000Z",
-            "updatedAt": "2026-10-14T00:00:00.000Z",
-            "role": "project:personalOwner",
-            "icon": null
+            "items": [
+                {
+                    "id": "owner-admin-id",
+                    "email": "admin@n8n-rust.local",
+                    "firstName": "Admin",
+                    "lastName": "Owner",
+                    "isOwner": true,
+                    "isPending": false,
+                    "role": "global:owner"
+                }
+            ],
+            "count": 1
+        }
+    }))
+}
+
+pub async fn get_favorites() -> impl IntoResponse {
+    Json(json!({ "data": [] }))
+}
+
+pub async fn toggle_favorite() -> impl IntoResponse {
+    Json(json!({ "data": true }))
+}
+
+pub async fn insights_summary() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "total": { "value": 0, "deviation": 0 },
+            "failed": { "value": 0, "deviation": 0 },
+            "timeSaved": { "value": 0, "deviation": 0 },
+            "averageRunTime": { "value": 0, "deviation": 0 },
+            "failureRate": { "value": 0, "deviation": 0 }
+        }
+    }))
+}
+
+pub async fn data_tables_global_limits() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "dataTables": {},
+            "totalSize": 0,
+            "maxTableCount": -1,
+            "maxRowCount": -1
+        }
+    }))
+}
+
+pub async fn list_data_tables_global() -> impl IntoResponse {
+    Json(json!({
+        "data": [],
+        "count": 0
+    }))
+}
+
+pub async fn instance_ai_threads() -> impl IntoResponse {
+    Json(json!({ "data": [] }))
+}
+
+pub async fn mcp_settings_stub() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "mcpAccessEnabled": false,
+            "autoExposeNewWorkflows": false
+        }
+    }))
+}
+
+pub async fn mcp_api_key_stub() -> impl IntoResponse {
+    Json(json!({ "data": null }))
+}
+
+pub async fn saml_config_stub() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "loginEnabled": false,
+            "loginLabel": ""
+        }
+    }))
+}
+
+pub async fn ldap_config_stub() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "loginEnabled": false,
+            "loginLabel": ""
         }
     }))
 }
@@ -1343,7 +1553,143 @@ pub async fn credential_types_catalog() -> impl IntoResponse {
 }
 
 pub async fn module_settings() -> impl IntoResponse {
-    Json(json!({ "data": {} }))
+    Json(json!({
+        "data": {
+            "instance-ai": {
+                "enabled": true,
+                "setupCompleted": true
+            },
+            "agents": {
+                "enabled": true,
+                "modules": ["tools", "memory", "subagents"]
+            },
+            "chat-hub": {
+                "enabled": false
+            },
+            "data-table": {
+                "enabled": true
+            },
+            "insights": {
+                "enabled": true
+            },
+            "mcp": {
+                "enabled": true,
+                "mcpAccessEnabled": true
+            }
+        }
+    }))
+}
+
+pub async fn source_control_preferences() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "branchName": "main",
+            "branches": [],
+            "repositoryUrl": "",
+            "branchReadOnly": false,
+            "connected": false,
+            "publicKey": ""
+        }
+    }))
+}
+
+pub async fn source_control_status() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "ahead": 0,
+            "behind": 0,
+            "status": "clean",
+            "files": []
+        }
+    }))
+}
+
+pub async fn source_control_branches() -> impl IntoResponse {
+    Json(json!({ "data": [] }))
+}
+
+pub async fn workflow_dependencies_counts() -> impl IntoResponse {
+    Json(json!({
+        "data": {
+            "workflows": {},
+            "credentials": {}
+        }
+    }))
+}
+
+fn get_types_file_path(filename: &str) -> std::path::PathBuf {
+    if let Ok(env_path) = std::env::var("N8N_UI_DIST") {
+        let p = std::path::PathBuf::from(env_path).join("types").join(filename);
+        if p.is_file() {
+            return p;
+        }
+    }
+    let local = std::path::PathBuf::from("ui-dist").join("types").join(filename);
+    if local.is_file() {
+        return local;
+    }
+    local
+}
+
+pub async fn types_nodes_json(State(_state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cached_path = get_types_file_path("nodes.json");
+    if cached_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&cached_path) {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                content,
+            )
+                .into_response();
+        }
+    }
+    let catalog = get_core_node_types_array();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        serde_json::to_string(&catalog).unwrap_or_else(|_| "[]".to_string()),
+    )
+        .into_response()
+}
+
+pub async fn types_credentials_json() -> impl IntoResponse {
+    let cached_path = get_types_file_path("credentials.json");
+    if cached_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&cached_path) {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                content,
+            )
+                .into_response();
+        }
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        "[]".to_string(),
+    )
+        .into_response()
+}
+
+pub async fn types_node_versions_json() -> impl IntoResponse {
+    let cached_path = get_types_file_path("node-versions.json");
+    if cached_path.is_file() {
+        if let Ok(content) = std::fs::read_to_string(&cached_path) {
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                content,
+            )
+                .into_response();
+        }
+    }
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+        "[]".to_string(),
+    )
+        .into_response()
 }
 
 pub async fn active_workflows() -> impl IntoResponse {
@@ -1369,13 +1715,58 @@ pub struct WorkflowInputDto {
     pub parent_folder_id: Option<String>,
 }
 
+pub fn enrich_workflow(wf: &WorkflowRecord) -> Value {
+    let mut val = serde_json::to_value(wf).unwrap_or(Value::Null);
+    if let Value::Object(ref mut map) = val {
+        map.entry("homeProject".to_string()).or_insert_with(|| {
+            json!({
+                "id": "asT9jsAO0Pvbl5wZ",
+                "name": "Personal",
+                "type": "personal",
+                "icon": null
+            })
+        });
+        map.entry("sharedWithProjects".to_string()).or_insert_with(|| json!([]));
+        map.entry("scopes".to_string()).or_insert_with(|| {
+            json!([
+                "workflow:create",
+                "workflow:delete",
+                "workflow:execute",
+                "workflow:move",
+                "workflow:read",
+                "workflow:share",
+                "workflow:update"
+            ])
+        });
+        map.entry("usedCredentials".to_string()).or_insert_with(|| json!([]));
+        map.entry("projectId".to_string()).or_insert_with(|| json!("asT9jsAO0Pvbl5wZ"));
+    }
+    val
+}
+
+pub async fn get_workflow_new_name() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({ "data": { "name": "My workflow" } })),
+    )
+}
+
+pub async fn get_workflow_history() -> impl IntoResponse {
+    Json(json!({ "data": [], "count": 0 }))
+}
+
+pub async fn list_evaluations() -> impl IntoResponse {
+    Json(json!({ "data": [] }))
+}
+
 pub async fn list_workflows(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     match state.db.list_workflows() {
         Ok(list) => {
-            let count = list.len();
+            let enriched: Vec<Value> = list.iter().map(enrich_workflow).collect();
+            let count = enriched.len();
             (
                 StatusCode::OK,
-                Json(json!({ "data": list, "count": count })),
+                Json(json!({ "data": enriched, "count": count })),
             )
                 .into_response()
         }
@@ -1559,7 +1950,7 @@ pub async fn get_workflow(
                     meta_obj.insert("renderedNodes".to_string(), json!(rendered));
                 }
             }
-            (StatusCode::OK, Json(json!({ "data": wf }))).into_response()
+            (StatusCode::OK, Json(json!({ "data": enrich_workflow(&wf) }))).into_response()
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,
@@ -1572,6 +1963,55 @@ pub async fn get_workflow(
         )
             .into_response(),
     }
+}
+
+pub async fn check_workflow_exists(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let exists = matches!(state.db.get_workflow(&id), Ok(Some(_)));
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": {
+                "exists": exists
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub async fn ai_build_credits() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": {
+                "creditsQuota": 100,
+                "creditsClaimed": 0
+            }
+        })),
+    )
+        .into_response()
+}
+
+pub async fn community_node_types() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": []
+        })),
+    )
+        .into_response()
+}
+
+pub async fn project_available_types() -> impl IntoResponse {
+    (
+        StatusCode::OK,
+        Json(json!({
+            "data": []
+        })),
+    )
+        .into_response()
 }
 
 pub async fn create_workflow(
@@ -1614,7 +2054,7 @@ pub async fn create_workflow(
                 &wf.id,
                 json!({ "nodes": wf.nodes, "connections": wf.connections }),
             );
-            (StatusCode::OK, Json(json!({ "data": wf }))).into_response()
+            (StatusCode::OK, Json(json!({ "data": enrich_workflow(&wf) }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1672,7 +2112,7 @@ pub async fn update_workflow(
                 &updated.id,
                 json!({ "nodes": updated.nodes, "connections": updated.connections }),
             );
-            (StatusCode::OK, Json(json!({ "data": updated }))).into_response()
+            (StatusCode::OK, Json(json!({ "data": enrich_workflow(&updated) }))).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1794,6 +2234,9 @@ pub async fn get_credential(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if id == "for-workflow" {
+        return (StatusCode::OK, Json(json!({ "data": [] }))).into_response();
+    }
     match state.db.get_credential(&id) {
         Ok(Some(cred)) => (StatusCode::OK, Json(json!({ "data": cred }))).into_response(),
         Ok(None) => (
@@ -2228,13 +2671,145 @@ pub async fn delete_folder(
 // Executions (Zstd-compressed storage)
 // ---------------------------------------------------------------------------
 
-pub async fn list_executions(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+pub fn serde_to_flatted(v: &Value) -> flatted::Value {
+    match v {
+        Value::Null => flatted::Value::Null,
+        Value::Bool(b) => flatted::Value::Bool(*b),
+        Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                flatted::Value::Number(flatted::Number::Int(i))
+            } else if let Some(u) = n.as_u64() {
+                flatted::Value::Number(flatted::Number::UInt(u))
+            } else if let Some(f) = n.as_f64() {
+                flatted::Value::Number(flatted::Number::Float(f))
+            } else {
+                flatted::Value::Null
+            }
+        }
+        Value::String(s) => flatted::Value::Str(s.clone()),
+        Value::Array(arr) => {
+            let items: Vec<flatted::Value> = arr.iter().map(serde_to_flatted).collect();
+            flatted::Value::Array(std::rc::Rc::new(std::cell::RefCell::new(items)))
+        }
+        Value::Object(map) => {
+            let mut obj = flatted::Object::new();
+            for (k, val) in map {
+                obj.insert(k.clone(), serde_to_flatted(val));
+            }
+            flatted::Value::Object(std::rc::Rc::new(std::cell::RefCell::new(obj)))
+        }
+    }
+}
+
+pub async fn list_executions(
+    headers: axum::http::HeaderMap,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let target_workflow_id = params.get("filter").and_then(|raw| {
+        serde_json::from_str::<Value>(raw)
+            .ok()
+            .and_then(|v| v.get("workflowId").and_then(|w| w.as_str()).map(|s| s.to_string()))
+    });
+
     match state.db.list_executions() {
         Ok(list) => {
-            let count = list.len();
+            let is_browser_or_client = headers.get(header::USER_AGENT).is_some()
+                || params.contains_key("filter")
+                || params.contains_key("cursor")
+                || params.contains_key("limit");
+
+            if !is_browser_or_client {
+                let count = list.len();
+                return (
+                    StatusCode::OK,
+                    Json(json!({ "data": list, "count": count })),
+                )
+                    .into_response();
+            }
+
+            let filtered: Vec<_> = list
+                .into_iter()
+                .filter(|e| {
+                    if let Some(ref w_id) = target_workflow_id {
+                        e.workflow_id.as_deref() == Some(w_id)
+                    } else {
+                        true
+                    }
+                })
+                .collect();
+
+            let mut results = Vec::new();
+            for exec in &filtered {
+                let workflow_name = if let Some(ref w_id) = exec.workflow_id {
+                    state
+                        .db
+                        .get_workflow(w_id)
+                        .ok()
+                        .flatten()
+                        .map(|w| w.name)
+                        .unwrap_or_else(|| "My workflow".to_string())
+                } else {
+                    "My workflow".to_string()
+                };
+
+                results.push(json!({
+                    "id": exec.id,
+                    "workflowId": exec.workflow_id,
+                    "workflowVersionId": null,
+                    "jsonSizeBytes": 2714,
+                    "binaryDataSizeBytes": 0,
+                    "mode": exec.mode,
+                    "retryOf": null,
+                    "status": exec.status,
+                    "createdAt": exec.started_at,
+                    "startedAt": exec.started_at,
+                    "stoppedAt": exec.stopped_at,
+                    "usedPrivateCredentials": false,
+                    "waitTill": null,
+                    "retrySuccessId": null,
+                    "workflowName": workflow_name,
+                    "annotation": {
+                        "vote": null,
+                        "tags": []
+                    },
+                    "scopes": [
+                        "execution:delete",
+                        "execution:list",
+                        "execution:read",
+                        "execution:reveal",
+                        "workflow:create",
+                        "workflow:delete",
+                        "workflow:disableRedaction",
+                        "workflow:enableRedaction",
+                        "workflow:execute",
+                        "workflow:execute-chat",
+                        "workflow:export",
+                        "workflow:import",
+                        "workflow:list",
+                        "workflow:move",
+                        "workflow:publish",
+                        "workflow:read",
+                        "workflow:share",
+                        "workflow:unpublish",
+                        "workflow:unshare",
+                        "workflow:update"
+                    ]
+                }));
+            }
+
+            let count = results.len();
             (
                 StatusCode::OK,
-                Json(json!({ "data": list, "count": count })),
+                Json(json!({
+                    "data": {
+                        "results": results,
+                        "nextCursor": null,
+                        "count": count,
+                        "estimated": false,
+                        "concurrentExecutionsCount": 0
+                    }
+                })),
             )
                 .into_response()
         }
@@ -2247,11 +2822,110 @@ pub async fn list_executions(State(state): State<Arc<AppState>>) -> impl IntoRes
 }
 
 pub async fn get_execution(
+    headers: axum::http::HeaderMap,
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
     match state.db.get_execution(&id) {
-        Ok(Some(exec)) => (StatusCode::OK, Json(json!({ "data": exec }))).into_response(),
+        Ok(Some(exec)) => {
+            let is_browser_or_client = headers.get(header::USER_AGENT).is_some();
+            if !is_browser_or_client {
+                return (StatusCode::OK, Json(json!({ "data": exec }))).into_response();
+            }
+
+            let wf_data = if let Some(ref w_id) = exec.workflow_id {
+                state
+                    .db
+                    .get_workflow(w_id)
+                    .ok()
+                    .flatten()
+                    .map(|w| {
+                        json!({
+                            "id": w.id,
+                            "name": w.name,
+                            "nodes": w.nodes,
+                            "connections": w.connections,
+                            "settings": w.settings,
+                            "pinData": w.pin_data,
+                            "nodeGroups": []
+                        })
+                    })
+                    .unwrap_or_else(|| {
+                        json!({
+                            "id": w_id,
+                            "name": "My workflow",
+                            "nodes": [],
+                            "connections": {},
+                            "settings": {},
+                            "pinData": {},
+                            "nodeGroups": []
+                        })
+                    })
+            } else {
+                json!({
+                    "id": "",
+                    "name": "My workflow",
+                    "nodes": [],
+                    "connections": {},
+                    "settings": {},
+                    "pinData": {},
+                    "nodeGroups": []
+                })
+            };
+
+            let result_data = if let Some(rd) = exec.data.get("resultData") {
+                rd.clone()
+            } else {
+                exec.data.clone()
+            };
+
+            let full_execution_data = json!({
+                "version": 1,
+                "startData": {},
+                "resultData": result_data,
+                "executionData": {
+                    "contextData": {},
+                    "nodeExecutionStack": [],
+                    "metadata": {},
+                    "waitingExecution": {},
+                    "waitingExecutionSource": {}
+                }
+            });
+
+            let flatted_val = serde_to_flatted(&full_execution_data);
+            let flatted_data_str = flatted::stringify(&flatted_val, None, None);
+
+            (
+                StatusCode::OK,
+                Json(json!({
+                    "data": {
+                        "id": exec.id,
+                        "finished": true,
+                        "mode": exec.mode,
+                        "retryOf": null,
+                        "retrySuccessId": null,
+                        "status": exec.status,
+                        "createdAt": exec.started_at,
+                        "startedAt": exec.started_at,
+                        "stoppedAt": exec.stopped_at,
+                        "deletedAt": null,
+                        "workflowId": exec.workflow_id,
+                        "waitTill": null,
+                        "storedAt": "db",
+                        "tracingContext": null,
+                        "deduplicationKey": null,
+                        "jsonSizeBytes": flatted_data_str.len(),
+                        "binaryDataSizeBytes": 0,
+                        "workflowVersionId": null,
+                        "usedPrivateCredentials": false,
+                        "customData": {},
+                        "workflowData": wf_data,
+                        "data": flatted_data_str
+                    }
+                })),
+            )
+                .into_response()
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(json!({ "message": "Execution not found" })),
@@ -2284,6 +2958,34 @@ pub async fn delete_execution(
     }
 }
 
+pub async fn workflow_last_successful_execution(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let executions = state.db.list_executions().unwrap_or_default();
+    let last = executions
+        .into_iter()
+        .find(|e| e.workflow_id.as_deref() == Some(&id) && e.status == "success");
+    if let Some(exec) = last {
+        if let Ok(Some(detail)) = state.db.get_execution(&exec.id) {
+            return Json(json!({ "data": detail })).into_response();
+        }
+    }
+    Json(json!({ "data": null })).into_response()
+}
+
+pub async fn workflow_write_lock_stub() -> impl IntoResponse {
+    Json(json!({ "data": null }))
+}
+
+pub async fn workflow_publication_status() -> impl IntoResponse {
+    Json(json!({ "data": { "status": "published", "failures": [] } }))
+}
+
+pub async fn workflow_history_version_stub() -> impl IntoResponse {
+    Json(json!({ "data": null }))
+}
+
 // ---------------------------------------------------------------------------
 // Real-time Push WebSocket & SSE Endpoint (/rest/push)
 // ---------------------------------------------------------------------------
@@ -2300,7 +3002,10 @@ pub async fn rest_push(
         }
         Err(_) => {
             let rx = state.push_hub.subscribe();
-            let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+            let initial_stream = futures_util::stream::once(async {
+                Ok::<Event, Infallible>(Event::default().comment("ok"))
+            });
+            let broadcast_stream = futures_util::stream::unfold(rx, |mut rx| async move {
                 match rx.recv().await {
                     Ok(msg) => Some((Ok::<Event, Infallible>(Event::default().data(msg)), rx)),
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => Some((
@@ -2310,6 +3015,7 @@ pub async fn rest_push(
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
                 }
             });
+            let stream = futures_util::stream::select(initial_stream, broadcast_stream);
             Sse::new(stream)
                 .keep_alive(KeepAlive::default())
                 .into_response()
@@ -2319,9 +3025,35 @@ pub async fn rest_push(
 
 async fn handle_websocket(mut socket: WebSocket, hub: Arc<PushHub>) {
     let mut rx = hub.subscribe();
-    while let Ok(msg) = rx.recv().await {
-        if socket.send(WsMessage::Text(msg.into())).await.is_err() {
-            break;
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                match incoming {
+                    Some(Ok(WsMessage::Ping(payload))) => {
+                        if socket.send(WsMessage::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(WsMessage::Close(_))) | None | Some(Err(_)) => {
+                        break;
+                    }
+                    Some(Ok(WsMessage::Text(_))) => {
+                        // Client heartbeat / message received, keep socket alive
+                    }
+                    _ => {}
+                }
+            }
+            broadcast = rx.recv() => {
+                match broadcast {
+                    Ok(msg) => {
+                        if socket.send(WsMessage::Text(msg.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
         }
     }
 }
@@ -2480,8 +3212,14 @@ pub async fn run_workflow_direct(
                 .as_ref()
                 .and_then(|w| w.get("settings").cloned())
         });
+    let workflow_id = payload
+        .workflow_data
+        .as_ref()
+        .and_then(|w| w.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    execute_workflow_helper(state, None, nodes, connections, settings).await
+    execute_workflow_helper(state, workflow_id, nodes, connections, settings).await
 }
 
 pub async fn trigger_error_workflow_if_needed(
@@ -3000,9 +3738,24 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/logout", post(auth_logout))
         .route("/rest/me", get(auth_user_info).patch(auth_user_info))
         // Projects & Roles
-        .route("/rest/projects", get(list_projects))
+        .route("/rest/projects", get(list_projects).post(list_projects))
+        .route("/rest/projects/count", get(get_projects_count))
+        .route("/rest/projects/my-projects", get(my_projects))
         .route("/rest/projects/personal", get(get_personal_project))
+        .route("/rest/projects/sharing-candidates", get(get_sharing_candidates))
+        .route("/rest/projects/{id}", get(get_project_by_id).patch(get_project_by_id))
+        .route("/rest/projects/{id}/available-types", get(project_available_types))
         .route("/rest/roles", get(list_roles))
+        // Users, Favorites, Insights, Limits & MCP Stubs
+        .route("/rest/users", get(list_users))
+        .route("/rest/favorites", get(get_favorites).post(toggle_favorite))
+        .route("/rest/favorites/{type}/{id}", delete(toggle_favorite))
+        .route("/rest/insights/summary", get(insights_summary))
+        .route("/rest/data-tables-global", get(list_data_tables_global))
+        .route("/rest/data-tables-global/limits", get(data_tables_global_limits))
+        .route("/rest/instance-ai/threads", get(instance_ai_threads))
+        .route("/rest/mcp/settings", get(mcp_settings_stub).patch(mcp_settings_stub))
+        .route("/rest/mcp/api-key", get(mcp_api_key_stub))
         // Real-Time Push & Events
         .route("/rest/push", get(rest_push))
         // Webhooks Trigger Engine
@@ -3019,9 +3772,20 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/credential-types", get(credential_types_catalog))
         .route("/rest/module-settings", get(module_settings))
         .route("/rest/active-workflows", get(active_workflows))
+        .route("/rest/source-control/preferences", get(source_control_preferences))
+        .route("/rest/source-control/status", get(source_control_status))
+        .route("/rest/source-control/branches", get(source_control_branches))
+        .route("/rest/workflow-dependencies/counts", get(workflow_dependencies_counts).post(workflow_dependencies_counts))
+        .route("/types/nodes.json", get(types_nodes_json))
+        .route("/types/credentials.json", get(types_credentials_json))
+        .route("/types/node-versions.json", get(types_node_versions_json))
         // Workflows CRUD & Run
         .route("/rest/workflows", get(list_workflows).post(create_workflow))
         .route("/rest/workflows/run", post(run_workflow_direct))
+        .route("/rest/workflows/new", get(get_workflow_new_name))
+        .route("/rest/workflows/{id}/exists", get(check_workflow_exists))
+        .route("/rest/ai/build/credits", get(ai_build_credits))
+        .route("/rest/community-node-types", get(community_node_types))
         .route(
             "/rest/workflows/{id}",
             get(get_workflow)
@@ -3036,6 +3800,18 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         .route("/rest/workflows/{id}/run", post(run_workflow_by_id))
         .route("/rest/workflows/{id}/archive", post(archive_workflow))
         .route("/rest/workflows/{id}/unarchive", post(unarchive_workflow))
+        .route("/rest/workflows/{id}/history", get(get_workflow_history))
+        .route("/rest/workflows/{id}/executions/last-successful", get(workflow_last_successful_execution))
+        .route("/rest/workflows/{id}/collaboration/write-lock", get(workflow_write_lock_stub).post(workflow_write_lock_stub).delete(workflow_write_lock_stub))
+        .route("/rest/workflows/{id}/publication-status", get(workflow_publication_status))
+        .route("/rest/workflow-history/workflow/{id}/version/{version_id}", get(workflow_history_version_stub))
+        .route("/rest/workflows/{id}/test-runs", get(list_evaluations).post(list_evaluations))
+        .route("/rest/evaluations", get(list_evaluations))
+        .route("/rest/evaluations/runs", get(list_evaluations))
+        .route("/rest/evaluations/metrics", get(list_evaluations))
+        // SSO SAML & LDAP Config Stubs
+        .route("/rest/sso/saml/config", get(saml_config_stub).post(saml_config_stub))
+        .route("/rest/ldap/config", get(ldap_config_stub).post(ldap_config_stub))
         // Community Packages CRUD
         .route(
             "/rest/community-packages",
@@ -3054,6 +3830,10 @@ pub fn router(app_state: Arc<AppState>) -> Router {
         )
         .route("/rest/runtimes/delete", post(delete_runtime_post_handler))
         // Credentials CRUD
+        .route(
+            "/rest/credentials/for-workflow",
+            get(list_credentials).post(list_credentials),
+        )
         .route(
             "/rest/credentials",
             get(list_credentials).post(create_credential),

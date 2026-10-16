@@ -400,6 +400,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "flatted"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0ccf91b19bf6f48bb4855c938db577c0287de95d929bea5a7051911bfc56b98"
+
+[[package]]
 name = "foldhash"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -926,6 +932,7 @@ dependencies = [
  "axum",
  "chrono",
  "dashmap",
+ "flatted",
  "futures-util",
  "http-body-util",
  "rayon",

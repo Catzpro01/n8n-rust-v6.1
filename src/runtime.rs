@@ -1819,20 +1819,20 @@ mod tests {
         let input = json!({ "json": { "x": 10 } });
         let code = "item.x = item.x * 2;\nreturn item;";
 
-        let pkg = download_runtime("javascript", "es2024-v8-compat");
+        let pkg = download_runtime("javascript", "test-inval-v1");
         assert!(pkg.is_ok());
-        assert!(is_runtime_installed("javascript", "es2024-v8-compat"));
+        assert!(is_runtime_installed("javascript", "test-inval-v1"));
 
-        let res = execute_polyglot_code("javascript", "es2024-v8-compat", code, &input, &ctx);
+        let res = execute_polyglot_code("javascript", "test-inval-v1", code, &input, &ctx);
         assert!(res.is_ok());
 
         let manager = PolyglotRuntimeManager::global();
-        let code_hash = compute_program_hash("javascript", "es2024-v8-compat", code);
+        let code_hash = compute_program_hash("javascript", "test-inval-v1", code);
         assert!(manager.ast_cache.contains_key(&code_hash));
 
-        let del_res = delete_runtime("javascript", "es2024-v8-compat");
+        let del_res = delete_runtime("javascript", "test-inval-v1");
         assert!(del_res.is_ok());
-        assert!(!is_runtime_installed("javascript", "es2024-v8-compat"));
+        assert!(!is_runtime_installed("javascript", "test-inval-v1"));
 
         // AST cache for this language:version MUST be cleared
         assert!(!manager.ast_cache.contains_key(&code_hash));

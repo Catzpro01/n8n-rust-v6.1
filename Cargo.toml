@@ -23,6 +23,7 @@ rayon = "1.10"
 dashmap = "6.1"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "default-tls"] }
+flatted = "0.2.0"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

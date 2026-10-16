@@ -362,7 +362,13 @@ pub trait ExecutionNotifier: Send + Sync {
     fn notify_started(&self, execution_id: &str, workflow_id: Option<&str>);
     fn notify_node_before(&self, execution_id: &str, node_name: &str);
     fn notify_node_after(&self, execution_id: &str, node_name: &str, output: &Value);
-    fn notify_finished(&self, execution_id: &str, status: &str, duration_ms: u64);
+    fn notify_finished(
+        &self,
+        execution_id: &str,
+        status: &str,
+        duration_ms: u64,
+        workflow_id: Option<&str>,
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -417,7 +423,7 @@ impl HyperScaleEngine {
         if total_nodes == 0 {
             let duration_ms = start_time.elapsed().as_millis() as u64;
             if let Some(ref n) = notifier {
-                n.notify_finished(execution_id, "success", duration_ms);
+                n.notify_finished(execution_id, "success", duration_ms, workflow_id);
             }
             return Ok(ExecutionResult {
                 execution_id: execution_id.to_string(),
@@ -513,7 +519,7 @@ impl HyperScaleEngine {
         };
 
         if let Some(ref n) = notifier {
-            n.notify_finished(execution_id, status, duration_ms);
+            n.notify_finished(execution_id, status, duration_ms, workflow_id);
         }
 
         // Determine final output
@@ -569,6 +575,7 @@ impl HyperScaleEngine {
                         "startTime": start_time_ms,
                         "executionTime": duration_ms.max(1),
                         "executionStatus": node_status,
+                        "executionIndex": 0,
                         "source": [],
                         "data": {
                             "main": [ main_items ]
@@ -587,9 +594,11 @@ impl HyperScaleEngine {
                     );
                 }
             }
+            let last_node_name = graph.nodes.last().map(|n| n.name.clone()).unwrap_or_default();
             json!({
                 "resultData": {
-                    "runData": run_data
+                    "runData": run_data,
+                    "lastNodeExecuted": last_node_name
                 }
             })
         };
